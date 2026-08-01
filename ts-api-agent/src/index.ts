@@ -1,23 +1,20 @@
 import http from 'node:http';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { Hono } from 'hono';
 import { askBioinformaticsAgent } from './infrastructure/ai/agent.ts';
 import { duckDbRepository } from './infrastructure/database/duckdb.ts';
 
 const app = new Hono();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const defaultVcf = path.resolve(__dirname, '../../tests/fixtures/demo_user.vcf');
+const defaultTsv = path.resolve(__dirname, '../../tests/fixtures/annotations_mock.tsv');
 
 async function autoInitFixtures() {
-  const vcfPath = path.resolve(process.cwd(), '../tests/fixtures/demo_user.vcf');
-  const tsvPath = path.resolve(process.cwd(), '../tests/fixtures/annotations_mock.tsv');
-  const altVcf = path.resolve(process.cwd(), 'tests/fixtures/demo_user.vcf');
-  const altTsv = path.resolve(process.cwd(), 'tests/fixtures/annotations_mock.tsv');
-  const chosenVcf = fs.existsSync(vcfPath) ? vcfPath : altVcf;
-  const chosenTsv = fs.existsSync(tsvPath) ? tsvPath : altTsv;
-
   try {
-    if (fs.existsSync(chosenVcf) && fs.existsSync(chosenTsv)) {
-      await duckDbRepository.initFromFixtures(chosenVcf, chosenTsv);
+    if (fs.existsSync(defaultVcf) && fs.existsSync(defaultTsv)) {
+      await duckDbRepository.initFromFixtures(defaultVcf, defaultTsv);
       console.log('[Auto-Init] DuckDB fixtures initialized successfully.');
     }
   } catch (err: any) {
@@ -43,7 +40,6 @@ app.post('/ask', async (c) => {
       });
       return c.json(result);
     } catch (agentErr: any) {
-      // If table missing, attempt instant auto-recovery initialization
       if (agentErr?.message?.includes('user_variants')) {
         await autoInitFixtures();
         const retryResult = await askBioinformaticsAgent(body.question, {
@@ -61,7 +57,7 @@ app.post('/ask', async (c) => {
 
 app.post('/init-fixtures', async (c) => {
   await autoInitFixtures();
-  return c.json({ status: 'fixtures initialized' });
+  return c.json({ status: 'fixtures initialized', vcf: defaultVcf, tsv: defaultTsv });
 });
 
 const port = 3000;
