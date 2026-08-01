@@ -1,9 +1,32 @@
 import http from 'node:http';
+import fs from 'fs';
+import path from 'path';
 import { Hono } from 'hono';
 import { askBioinformaticsAgent } from './infrastructure/ai/agent.ts';
 import { duckDbRepository } from './infrastructure/database/duckdb.ts';
 
 const app = new Hono();
+
+async function autoInitFixtures() {
+  const vcfPath = path.resolve(process.cwd(), '../tests/fixtures/demo_user.vcf');
+  const tsvPath = path.resolve(process.cwd(), '../tests/fixtures/annotations_mock.tsv');
+  const altVcf = path.resolve(process.cwd(), 'tests/fixtures/demo_user.vcf');
+  const altTsv = path.resolve(process.cwd(), 'tests/fixtures/annotations_mock.tsv');
+  const chosenVcf = fs.existsSync(vcfPath) ? vcfPath : altVcf;
+  const chosenTsv = fs.existsSync(tsvPath) ? tsvPath : altTsv;
+
+  try {
+    if (fs.existsSync(chosenVcf) && fs.existsSync(chosenTsv)) {
+      await duckDbRepository.initFromFixtures(chosenVcf, chosenTsv);
+      console.log('[Auto-Init] DuckDB fixtures initialized successfully.');
+    }
+  } catch (err: any) {
+    console.warn('[Auto-Init Warning]:', err.message);
+  }
+}
+
+// Trigger auto-init on server start
+autoInitFixtures();
 
 app.get('/health', (c) => c.json({ status: 'ok', service: 'ts-api-agent' }));
 
@@ -14,10 +37,22 @@ app.post('/ask', async (c) => {
       return c.json({ error: 'Question is required' }, 400);
     }
 
-    const result = await askBioinformaticsAgent(body.question, {
-      dryRunLocal: body.dryRunLocal,
-    });
-    return c.json(result);
+    try {
+      const result = await askBioinformaticsAgent(body.question, {
+        dryRunLocal: body.dryRunLocal,
+      });
+      return c.json(result);
+    } catch (agentErr: any) {
+      // If table missing, attempt instant auto-recovery initialization
+      if (agentErr?.message?.includes('user_variants')) {
+        await autoInitFixtures();
+        const retryResult = await askBioinformaticsAgent(body.question, {
+          dryRunLocal: body.dryRunLocal,
+        });
+        return c.json(retryResult);
+      }
+      throw agentErr;
+    }
   } catch (err: any) {
     console.error('[API Server /ask Error]:', err);
     return c.json({ error: err.message || String(err) }, 500);
@@ -25,56 +60,51 @@ app.post('/ask', async (c) => {
 });
 
 app.post('/init-fixtures', async (c) => {
-  const vcfPath = path.resolve(process.cwd(), '../tests/fixtures/demo_user.vcf');
-  const tsvPath = path.resolve(process.cwd(), '../tests/fixtures/annotations_mock.tsv');
-  const altVcf = path.resolve(process.cwd(), 'tests/fixtures/demo_user.vcf');
-  const altTsv = path.resolve(process.cwd(), 'tests/fixtures/annotations_mock.tsv');
-  const chosenVcf = fs.existsSync(vcfPath) ? vcfPath : altVcf;
-  const chosenTsv = fs.existsSync(tsvPath) ? tsvPath : altTsv;
-  await duckDbRepository.initFromFixtures(chosenVcf, chosenTsv);
-  return c.json({ status: 'fixtures initialized', vcf: chosenVcf, tsv: chosenTsv });
+  await autoInitFixtures();
+  return c.json({ status: 'fixtures initialized' });
 });
 
 const port = 3000;
 
 if (import.meta.url === `file://${process.argv[1]}`) {
+  console.log(`[ts-api-agent] Starting server on port ${port}...`);
+
   const server = http.createServer(async (req, res) => {
-    try {
-      const url = `http://${req.headers.host || 'localhost'}${req.url}`;
-      const method = req.method || 'GET';
-      const headers = new Headers();
-      for (const [key, val] of Object.entries(req.headers)) {
-        if (val) headers.set(key, Array.isArray(val) ? val.join(',') : val);
-      }
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const reqMethod = req.method || 'GET';
 
-      let body: any = undefined;
-      if (method !== 'GET' && method !== 'HEAD') {
-        const buffers: Buffer[] = [];
-        for await (const chunk of req) {
-          buffers.push(chunk);
-        }
-        body = Buffer.concat(buffers);
-      }
-
-      const request = new Request(url, { method, headers, body } as any);
-      const response = await app.fetch(request);
-
-      res.statusCode = response.status;
-      response.headers.forEach((value, key) => res.setHeader(key, value));
-
-      const responseBuffer = await response.arrayBuffer();
-      res.end(Buffer.from(responseBuffer));
-    } catch (err: any) {
-      console.error('Server error:', err);
-      res.statusCode = 500;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ error: err.message }));
+    const headers: Record<string, string> = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (value) headers[key] = Array.isArray(value) ? value.join(', ') : value;
     }
+
+    let body: any = null;
+    if (['POST', 'PUT', 'PATCH'].includes(reqMethod)) {
+      const buffers = [];
+      for await (const chunk of req) {
+        buffers.push(chunk);
+      }
+      body = Buffer.concat(buffers);
+    }
+
+    const fetchReq = new Request(url.toString(), {
+      method: reqMethod,
+      headers: new Headers(headers),
+      body,
+    });
+
+    const honoRes = await app.fetch(fetchReq);
+
+    res.statusCode = honoRes.status;
+    honoRes.headers.forEach((val, key) => {
+      res.setHeader(key, val);
+    });
+
+    const resBody = await honoRes.arrayBuffer();
+    res.end(Buffer.from(resBody));
   });
 
   server.listen(port, () => {
-    console.log(`TS API Agent running natively on http://localhost:${port}`);
+    console.log(`🚀 TS API Agent HTTP Server active at http://localhost:${port}`);
   });
 }
-
-export default app;
