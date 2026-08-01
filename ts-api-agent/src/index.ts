@@ -8,15 +8,20 @@ const app = new Hono();
 app.get('/health', (c) => c.json({ status: 'ok', service: 'ts-api-agent' }));
 
 app.post('/ask', async (c) => {
-  const body = await c.req.json<{ question: string; dryRunLocal?: boolean }>();
-  if (!body.question) {
-    return c.json({ error: 'Question is required' }, 400);
-  }
+  try {
+    const body = await c.req.json<{ question: string; dryRunLocal?: boolean }>();
+    if (!body.question) {
+      return c.json({ error: 'Question is required' }, 400);
+    }
 
-  const result = await askBioinformaticsAgent(body.question, {
-    dryRunLocal: body.dryRunLocal,
-  });
-  return c.json(result);
+    const result = await askBioinformaticsAgent(body.question, {
+      dryRunLocal: body.dryRunLocal,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    console.error('[API Server /ask Error]:', err);
+    return c.json({ error: err.message || String(err) }, 500);
+  }
 });
 
 app.post('/init-fixtures', async (c) => {
