@@ -37,6 +37,27 @@ export class DuckDbRepository {
         );
       `);
 
+      const uRes = await db.all('SELECT COUNT(*) as count FROM user_variants;');
+      if (uRes[0].count === 0 || uRes[0].count === 0n) {
+        const absVcf = path.resolve(vcfPath);
+        if (fs.existsSync(absVcf)) {
+          const vcfLines = fs.readFileSync(absVcf, 'utf-8').split('\n');
+          for (const line of vcfLines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            const parts = trimmed.split('\t');
+            if (parts.length < 10) continue;
+            const gtIdx = parts[8].split(':').indexOf('GT');
+            if (gtIdx === -1) continue;
+            const gt = parts[9].split(':')[gtIdx];
+            await db.run(
+              'INSERT INTO user_variants VALUES (?, ?, ?, ?, ?, ?);',
+              parts[0], parseInt(parts[1], 10), parts[2], parts[3], parts[4], gt
+            );
+          }
+        }
+      }
+
       const res = await db.all('SELECT COUNT(*) as count FROM clinvar_annotations;');
       if (res[0].count === 0 || res[0].count === 0n) {
         const absTsv = path.resolve(annotationsTsvPath);
