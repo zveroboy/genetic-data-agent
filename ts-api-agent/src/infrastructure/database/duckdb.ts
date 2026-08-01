@@ -95,7 +95,12 @@ export class DuckDbRepository {
       await db.close();
       return rows as SynthesizedVariant[];
     } catch (err: any) {
-      if (err?.code === 'MODULE_NOT_FOUND' || err?.message?.includes('duckdb.node')) {
+      if (
+        err?.code === 'MODULE_NOT_FOUND' ||
+        err?.message?.includes('duckdb.node') ||
+        err?.message?.includes('user_variants') ||
+        err?.message?.includes('Catalog Error')
+      ) {
         return this.synthesizeVariantFallback(targetId);
       }
       throw err;
