@@ -1,17 +1,19 @@
 version: '3.8'
 
 services:
-  temporal:
-    image: temporalio/auto-setup:latest
-    container_name: temporal
-    ports:
-      - "7233:7233"
-      - "8233:8233"
-    environment:
-      - DB=sqlite
-      - DB_FILENAME=/root/temporal.sqlite
-    volumes:
-      - temporal-data:/root
+  # NOTE: If you run Temporal locally via Homebrew ('make temporal-dev'), keep this commented out
+  # to avoid port 7233 / 8233 collision. Uncomment only if you do NOT have local Temporal CLI installed.
+  # temporal:
+  #   image: temporalio/auto-setup:latest
+  #   container_name: temporal
+  #   ports:
+  #     - "7233:7233"
+  #     - "8233:8233"
+  #   environment:
+  #     - DB=sqlite
+  #     - DB_FILENAME=/root/temporal.sqlite
+  #   volumes:
+  #     - temporal-data:/root
 
   qdrant:
     image: qdrant/qdrant:latest

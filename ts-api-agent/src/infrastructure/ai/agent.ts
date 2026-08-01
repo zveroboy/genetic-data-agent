@@ -16,6 +16,7 @@ export interface AgentResponse {
   toolResults?: any[];
   evidence?: any[];
   literatureHits?: any[];
+  toolsUsed?: string[];
 }
 
 export async function askBioinformaticsAgent(
@@ -59,6 +60,7 @@ export async function askBioinformaticsAgent(
       answer,
       evidence,
       literatureHits,
+      toolsUsed: ['query_genotype', ...(literatureHits.length > 0 ? ['search_medical_literature'] : [])],
     };
   }
 
@@ -182,6 +184,7 @@ export async function askBioinformaticsAgent(
         toolResults: [{ tool: fnName, result: toolOutput }],
         evidence: fnName === 'query_genotype' ? toolOutput : undefined,
         literatureHits: fnName === 'search_medical_literature' ? toolOutput : undefined,
+        toolsUsed: [fnName],
       };
     }
 

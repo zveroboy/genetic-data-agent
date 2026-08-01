@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>🧬 Genomic AI Insight Engine & Ingestion Monitor</title>
+  
+  <!-- Pico.css v2 for clean, modern dark/light styling without build step -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
+  
+  <!-- Alpine.js 3.x for reactive State Machine -->
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  
+  <!-- Marked.js for rendering AI response Markdown -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  
+  <style>
+    :root {
+      --pico-font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    }
+    header.hero {
+      padding: 1.5rem 0;
+      border-bottom: 1px solid var(--pico-muted-border-color);
+      margin-bottom: 2rem;
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.25rem 0.6rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      border-radius: 9999px;
+      margin-right: 0.4rem;
+      margin-bottom: 0.4rem;
+    }
+    .badge-tool {
+      background-color: #1e3a8a;
+      color: #93c5fd;
+      border: 1px solid #3b82f6;
+    }
+    .badge-rag {
+      background-color: #14532d;
+      color: #86efac;
+      border: 1px solid #22c55e;
+    }
+    .badge-evidence {
+      background-color: #4c1d95;
+      color: #ddd6fe;
+      border: 1px solid #8b5cf6;
+    }
+    .step-indicator {
+      display: flex;
+      gap: 0.5rem;
+      margin: 1rem 0;
+      flex-wrap: wrap;
+    }
+    .step-item {
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-muted-border-color);
+      flex: 1;
+      text-align: center;
+      min-width: 130px;
+    }
+    .step-item.active {
+      border-color: #3b82f6;
+      background: rgba(59, 130, 246, 0.15);
+      font-weight: bold;
+    }
+    .step-item.completed {
+      border-color: #10b981;
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+    }
+    .chat-container {
+      max-height: 550px;
+      overflow-y: auto;
+      padding: 1rem;
+      border-radius: 8px;
+      background: var(--pico-card-background-color);
+      border: 1px solid var(--pico-muted-border-color);
+      margin-bottom: 1.5rem;
+    }
+    .chat-msg {
+      margin-bottom: 1.2rem;
+      padding: 1rem;
+      border-radius: 8px;
+    }
+    .chat-msg.user {
+      background: rgba(59, 130, 246, 0.15);
+      border-left: 4px solid #3b82f6;
+    }
+    .chat-msg.agent {
+      background: rgba(16, 185, 129, 0.1);
+      border-left: 4px solid #10b981;
+    }
+    .quick-btn {
+      font-size: 0.8rem;
+      padding: 0.3rem 0.7rem;
+      margin-right: 0.5rem;
+      margin-bottom: 0.5rem;
+    }
+  </style>
+</head>
+<body x-data="genomicApp()">
+  
+  <header class="hero">
+    <div class="container">
+      <nav>
+        <ul>
+          <li><h2 style="margin: 0;">🧬 <strong>Genomic AI Insight Engine</strong></h2></li>
+        </ul>
+        <ul>
+          <li><span class="badge" style="background:#065f46; color:#a7f3d0;">Rust Rayon Engine</span></li>
+          <li><span class="badge" style="background:#1e3a8a; color:#bfdbfe;">Temporal Orchestrated</span></li>
+          <li><span class="badge" style="background:#4c1d95; color:#e9d5ff;">DuckDB + Qdrant</span></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+
+    <!-- =========================
+         STATE 1: UPLOAD (UPLOAD FORM & SIMULATOR)
+         ========================= -->
+    <section x-show="state === 'upload'" x-transition>
+      <article>
+        <header>
+          <h3>📥 Загрузка геномного датасета (VCF/TSV)</h3>
+          <p class="muted">Выберите эталонный VCF-файл или загрузите собственный геном для высокопроизводительной многопоточной обработки в Rust & DuckDB.</p>
+        </header>
+
+        <form @submit.prevent="startUploadSimulation()">
+          <label for="fileSelect">
+            <strong>Геномный образец (VCF / TSV)</strong>
+            <select id="fileSelect" x-model="selectedFileKey" :disabled="uploading">
+              <option value="tests/fixtures/demo_user.vcf">⚡ demo_user.vcf — Быстрый демо-геном (CYP1A2, LCT, SLCO1B1, VKORC1)</option>
+              <option value="na12878_hg001.vcf.gz">🌐 na12878_hg001.vcf.gz — Полный геном человека NIST GIAB (3.89 млн вариантов из S3)</option>
+            </select>
+          </label>
+
+          <!-- Simulated Upload Progress Bar (3 seconds) -->
+          <div x-show="uploading" style="margin-top: 1.5rem;">
+            <label>
+              <small x-text="uploadStatusText"></small>
+              <progress :value="uploadPercentage" max="100"></progress>
+            </label>
+          </div>
+
+          <button type="submit" class="contrast" :aria-busy="uploading" :disabled="uploading" style="margin-top: 1rem;">
+            <span x-text="uploading ? 'Загрузка...' : '🚀 Загрузить и обработать в Temporal'"></span>
+          </button>
+        </form>
+      </article>
+    </section>
+
+    <!-- =========================
+         STATE 2: PROCESSING (TEMPORAL WORKFLOW MONITORING)
+         ========================= -->
+    <section x-show="state === 'processing'" x-transition x-cloak>
+      <article>
+        <header>
+          <h3>⚙️ Обработка геномных данных в Temporal & Rust Rayon Engine</h3>
+          <p class="muted">Выполняется оркестрация Workflow, многопоточный парсинг VCF и ACMG валидация вариантов.</p>
+        </header>
+
+        <!-- Step Indicator Grid -->
+        <div class="step-indicator">
+          <div class="step-item" 
+               :class="{'active': progress.step === 'DOWNLOADING_S3', 'completed': percentage >= 25}">
+            📥 1. S3 Download
+          </div>
+          <div class="step-item" 
+               :class="{'active': progress.step === 'PARSING_VCF', 'completed': percentage >= 55}">
+            ⚙️ 2. Rust Rayon Indexing
+          </div>
+          <div class="step-item" 
+               :class="{'active': progress.step === 'VALIDATING', 'completed': percentage >= 85}">
+            🔍 3. ACMG Validation
+          </div>
+          <div class="step-item" 
+               :class="{'active': progress.step === 'COMPLETED', 'completed': progress.step === 'COMPLETED'}">
+            ✔ 4. DuckDB Ready
+          </div>
+        </div>
+
+        <!-- Real Progress Bar from Temporal Query -->
+        <div style="margin: 2rem 0;">
+          <label>
+            <strong x-text="progress.message"></strong>
+            <progress :value="progress.percentage" max="100" style="height: 14px; margin-top: 0.5rem;"></progress>
+          </label>
+          <div style="display: flex; justify-content: space-between; font-size: 0.85rem; color: #94a3b8;">
+            <span>Статус: <strong x-text="progress.step"></strong></span>
+            <span><strong x-text="progress.percentage + '%'"></strong></span>
+          </div>
+        </div>
+
+        <!-- Error Handling State -->
+        <div x-show="progress.step === 'ERROR'" class="card" style="background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; padding: 1rem; border-radius: 8px;">
+          <h4>❌ Ошибка ингестии в Temporal</h4>
+          <p x-text="progress.message"></p>
+          <button class="secondary" @click="resetToUpload()">Попробовать снова</button>
+        </div>
+      </article>
+    </section>
+
+    <!-- =========================
+         STATE 3: CHAT (GENOMIC AI INSIGHT INTERFACE)
+         ========================= -->
+    <section x-show="state === 'chat'" x-transition x-cloak>
+      
+      <!-- Green Completion Alert Banner -->
+      <article style="background: rgba(16, 185, 129, 0.15); border: 1px solid #10b981; padding: 1rem; margin-bottom: 1.5rem;">
+        <h4 style="margin: 0; color: #34d399;">
+          🎉 Данные успешно проиндексированы в DuckDB! Задайте вопрос вашему геному.
+        </h4>
+        <small style="color: #cbd5e1;">База DuckDB оптимизирована. Доступен детерминированный инструмент <code>query_genotype</code> и векторный RAG поиск по статьям PubMed.</small>
+      </article>
+
+      <article>
+        <header style="display: flex; justify-content: space-between; align-items: center;">
+          <h3 style="margin: 0;">💬 Биоинформатический Чат-Агент (Llama-3.3-70B)</h3>
+          <button class="outline secondary" style="padding: 0.3rem 0.8rem; font-size: 0.8rem;" @click="resetToUpload()">
+            🔄 Загрузить другой геном
+          </button>
+        </header>
+
+        <!-- Quick Question Examples -->
+        <div style="margin: 1rem 0;">
+          <small style="display: block; margin-bottom: 0.5rem; color: #94a3b8;">Примеры вопросов:</small>
+          <button class="secondary quick-btn" @click="askQuickQuestion('Can I drink coffee? Check my CYP1A2 genetic variant and explain what it means.')">
+            ☕ Кофе и CYP1A2
+          </button>
+          <button class="secondary quick-btn" @click="askQuickQuestion('Am I at risk for muscle toxicity from statins? Check my SLCO1B1 genotype.')">
+            💊 Статины и SLCO1B1
+          </button>
+          <button class="secondary quick-btn" @click="askQuickQuestion('Am I lactose intolerant? What is my LCT genotype?')">
+            🥛 Лактоза и LCT
+          </button>
+          <button class="secondary quick-btn" @click="askQuickQuestion('What is my warfarin sensitivity risk (VKORC1)?')">
+            💉 Варфарин и VKORC1
+          </button>
+        </div>
+
+        <!-- Chat History List -->
+        <div class="chat-container" id="chatWindow">
+          <template x-for="(msg, index) in messages" :key="index">
+            <div class="chat-msg" :class="msg.sender">
+              <!-- Sender Header -->
+              <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem;">
+                <strong x-text="msg.sender === 'user' ? '🧑 Вы' : '🤖 AI Геномный Агент'"></strong>
+                <small class="muted" x-text="msg.time"></small>
+              </div>
+
+              <!-- Tool Call Badges -->
+              <div x-show="msg.toolsUsed && msg.toolsUsed.length > 0" style="margin-bottom: 0.5rem;">
+                <template x-for="tool in msg.toolsUsed" :key="tool">
+                  <span class="badge badge-tool" x-text="'⚙️ Инструмент: ' + tool"></span>
+                </template>
+              </div>
+
+              <!-- Evidence Badges -->
+              <div x-show="msg.evidence && msg.evidence.length > 0" style="margin-bottom: 0.5rem;">
+                <template x-for="ev in msg.evidence" :key="ev.rsid">
+                  <span class="badge badge-evidence" 
+                        x-text="'🧬 Genotype: ' + ev.user_genotype + ' (' + ev.rsid + ' / ' + ev.gene + ') — ' + ev.clinical_significance">
+                  </span>
+                </template>
+              </div>
+
+              <!-- Markdown Text Content -->
+              <div class="markdown-body" x-html="renderMarkdown(msg.text)"></div>
+            </div>
+          </template>
+
+          <!-- Agent Loading State -->
+          <div x-show="chatLoading" class="chat-msg agent">
+            <strong>🤖 AI Геномный Агент</strong>
+            <p style="margin: 0.5rem 0 0 0;">
+              <em>⚡ Анализ генотипа в DuckDB и семантический поиск PubMed RAG...</em>
+            </p>
+          </div>
+        </div>
+
+        <!-- Question Input Form -->
+        <form @submit.prevent="sendQuestion()" style="display: flex; gap: 0.8rem;">
+          <input 
+            type="text" 
+            x-model="currentInput" 
+            placeholder="Задайте клинический или нутригеномный вопрос..." 
+            :disabled="chatLoading"
+            style="flex: 1; margin: 0;"
+          />
+          <button type="submit" class="contrast" :aria-busy="chatLoading" :disabled="chatLoading || !currentInput.trim()" style="margin: 0; width: 150px;">
+            Отправить
+          </button>
+        </form>
+      </article>
+    </section>
+
+  </main>
+
+  <script>
+    function genomicApp() {
+      return {
+        // State Machine: 'upload' | 'processing' | 'chat'
+        state: 'upload',
+        
+        // State 1: Upload Form & Simulation
+        selectedFileKey: 'tests/fixtures/demo_user.vcf',
+        uploading: false,
+        uploadPercentage: 0,
+        uploadStatusText: 'Подготовка к загрузке...',
+
+        // State 2: Processing (Temporal)
+        workflowId: null,
+        progress: {
+          step: 'DOWNLOADING_S3',
+          fileKey: '',
+          percentage: 0,
+          message: 'Подключение к оркестратору Temporal...'
+        },
+        percentage: 0,
+        pollInterval: null,
+
+        // State 3: Chat
+        messages: [
+          {
+            sender: 'agent',
+            text: 'Здравствуйте! Ваш геном успешно загружен и проиндексирован в DuckDB. Вы можете спросить о метаболизме кофеина (**CYP1A2**), чувствительности к статинам (**SLCO1B1**), переносимости лактозы (**LCT**) и других биоинформатических маркерах.',
+            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            toolsUsed: []
+          }
+        ],
+        currentInput: '',
+        chatLoading: false,
+
+        // --- Methods ---
+
+        // 1. Start 3-second Upload Simulation -> Transition to State 2
+        startUploadSimulation() {
+          this.uploading = true;
+          this.uploadPercentage = 0;
+          this.uploadStatusText = 'Отправка файла на сервер... 0%';
+
+          const start = Date.now();
+          const duration = 2800;
+
+          const interval = setInterval(() => {
+            const elapsed = Date.now() - start;
+            this.uploadPercentage = Math.min(100, Math.floor((elapsed / duration) * 100));
+            this.uploadStatusText = `Загрузка файла на сервер... ${this.uploadPercentage}%`;
+
+            if (this.uploadPercentage >= 100) {
+              clearInterval(interval);
+              this.uploading = false;
+              this.startTemporalIngestion();
+            }
+          }, 100);
+        },
+
+        // 2. Start Temporal Workflow via POST /api/ingestion/start
+        async startTemporalIngestion() {
+          this.state = 'processing';
+          this.progress = {
+            step: 'DOWNLOADING_S3',
+            fileKey: this.selectedFileKey,
+            percentage: 10,
+            message: 'Инициализация Temporal Workflow...'
+          };
+
+          try {
+            const res = await fetch('/api/ingestion/start', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ fileKey: this.selectedFileKey })
+            });
+            const data = await res.json();
+            
+            if (data.workflowId) {
+              this.workflowId = data.workflowId;
+              this.startPollingStatus();
+            } else {
+              throw new Error(data.error || 'Не удалось запустить Workflow');
+            }
+          } catch (err) {
+            this.progress = {
+              step: 'ERROR',
+              fileKey: this.selectedFileKey,
+              percentage: 0,
+              message: err.message
+            };
+          }
+        },
+
+        // 3. Poll Temporal Query GET /api/ingestion/status/:workflowId
+        startPollingStatus() {
+          if (this.pollInterval) clearInterval(this.pollInterval);
+
+          this.pollInterval = setInterval(async () => {
+            if (!this.workflowId) return;
+
+            try {
+              const res = await fetch(`/api/ingestion/status/${this.workflowId}`);
+              if (res.ok) {
+                const data = await res.json();
+                this.progress = data;
+                this.percentage = data.percentage || 0;
+
+                // When COMPLETED -> Wait 1 second -> Switch to State 3
+                if (data.step === 'COMPLETED') {
+                  clearInterval(this.pollInterval);
+                  setTimeout(() => {
+                    this.state = 'chat';
+                    this.scrollToBottom();
+                  }, 1000);
+                } else if (data.step === 'ERROR') {
+                  clearInterval(this.pollInterval);
+                }
+              }
+            } catch (err) {
+              console.error('Ошибка опроса статуса:', err);
+            }
+          }, 1500);
+        },
+
+        // 4. Reset Back to State 1
+        resetToUpload() {
+          if (this.pollInterval) clearInterval(this.pollInterval);
+          this.state = 'upload';
+          this.uploading = false;
+          this.uploadPercentage = 0;
+          this.workflowId = null;
+        },
+
+        // 5. Ask Quick Question Button
+        askQuickQuestion(questionText) {
+          this.currentInput = questionText;
+          this.sendQuestion();
+        },
+
+        // 6. Send Question to POST /ask
+        async sendQuestion() {
+          const question = this.currentInput.trim();
+          if (!question || this.chatLoading) return;
+
+          // Add User Message
+          this.messages.push({
+            sender: 'user',
+            text: question,
+            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            toolsUsed: []
+          });
+
+          this.currentInput = '';
+          this.chatLoading = true;
+          this.scrollToBottom();
+
+          try {
+            const res = await fetch('/ask', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ question, dryRunLocal: false })
+            });
+            const data = await res.json();
+
+            // Add Agent Response with Tool Badges & Evidence
+            this.messages.push({
+              sender: 'agent',
+              text: data.answer || 'Не удалось получить ответ.',
+              time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              toolsUsed: data.toolsUsed || [],
+              evidence: data.evidence || []
+            });
+          } catch (err) {
+            this.messages.push({
+              sender: 'agent',
+              text: `**Ошибка соединения:** ${err.message}`,
+              time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              toolsUsed: []
+            });
+          } finally {
+            this.chatLoading = false;
+            this.scrollToBottom();
+          }
+        },
+
+        // 7. Render Markdown via Marked.js CDN
+        renderMarkdown(text) {
+          if (!text) return '';
+          try {
+            return marked.parse(text);
+          } catch {
+            return text;
+          }
+        },
+
+        // 8. Auto-scroll chat to bottom
+        scrollToBottom() {
+          setTimeout(() => {
+            const win = document.getElementById('chatWindow');
+            if (win) win.scrollTop = win.scrollHeight;
+          }, 100);
+        }
+      };
+    }
+  </script>
+</body>
+</html>

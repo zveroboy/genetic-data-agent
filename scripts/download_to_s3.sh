@@ -19,12 +19,12 @@ if command -v aws &> /dev/null; then
   aws --endpoint-url "$S3_ENDPOINT" s3 mb "s3://${S3_BUCKET}" 2>/dev/null || true
 
   echo "[1/2] Streaming NCBI ClinVar VCF directly into S3..."
-  curl -L "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz" | \
+  curl -L -# "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz" | \
     aws --endpoint-url "$S3_ENDPOINT" s3 cp - "s3://${S3_BUCKET}/clinvar.vcf.gz"
   echo "✔ Streamed NCBI ClinVar VCF to s3://${S3_BUCKET}/clinvar.vcf.gz"
 
   echo "[2/2] Streaming NIST GIAB NA12878 VCF directly into S3..."
-  curl -L "https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/NA12878_HG001/latest/GRCh38/HG001_GRCh38_1_22_v4.2.1_benchmark.vcf.gz" | \
+  curl -L -# "https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/NA12878_HG001/latest/GRCh38/HG001_GRCh38_1_22_v4.2.1_benchmark.vcf.gz" | \
     aws --endpoint-url "$S3_ENDPOINT" s3 cp - "s3://${S3_BUCKET}/na12878_hg001.vcf.gz"
   echo "✔ Streamed NIST NA12878 VCF to s3://${S3_BUCKET}/na12878_hg001.vcf.gz"
 
