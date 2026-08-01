@@ -1,0 +1,27 @@
+name: Deploy to DigitalOcean Droplet
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DROPLET_IP }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd genetic-data-agent || git clone https://github.com/${{ github.repository }}.git genetic-data-agent
+            cd genetic-data-agent
+            git pull origin main
+            docker compose -f docker-compose.prod.yml up -d --build
+            docker system prune -f

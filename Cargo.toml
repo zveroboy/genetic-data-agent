@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "rust-ingestion-worker"
+]
+resolver = "2"

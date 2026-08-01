@@ -1,0 +1,16 @@
+{
+  "name": "genomic-vcf-ingestion-engine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Genomic VCF Ingestion & AI Insight Engine monorepo",
+  "workspaces": [
+    "ts-api-agent"
+  ],
+  "scripts": {
+    "build:rust": "cargo build --release --manifest-path rust-ingestion-worker/Cargo.toml",
+    "build:ts": "npm run build --workspace=ts-api-agent",
+    "dev:ts": "npm run dev --workspace=ts-api-agent",
+    "test": "npm run test --workspace=ts-api-agent && cargo test --manifest-path rust-ingestion-worker/Cargo.toml"
+  }
+}
