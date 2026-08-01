@@ -25,10 +25,14 @@ app.post('/ask', async (c) => {
 });
 
 app.post('/init-fixtures', async (c) => {
-  const vcfPath = '../tests/fixtures/demo_user.vcf';
-  const tsvPath = '../tests/fixtures/annotations_mock.tsv';
-  await duckDbRepository.initFromFixtures(vcfPath, tsvPath);
-  return c.json({ status: 'fixtures initialized' });
+  const vcfPath = path.resolve(process.cwd(), '../tests/fixtures/demo_user.vcf');
+  const tsvPath = path.resolve(process.cwd(), '../tests/fixtures/annotations_mock.tsv');
+  const altVcf = path.resolve(process.cwd(), 'tests/fixtures/demo_user.vcf');
+  const altTsv = path.resolve(process.cwd(), 'tests/fixtures/annotations_mock.tsv');
+  const chosenVcf = fs.existsSync(vcfPath) ? vcfPath : altVcf;
+  const chosenTsv = fs.existsSync(tsvPath) ? tsvPath : altTsv;
+  await duckDbRepository.initFromFixtures(chosenVcf, chosenTsv);
+  return c.json({ status: 'fixtures initialized', vcf: chosenVcf, tsv: chosenTsv });
 });
 
 const port = 3000;
