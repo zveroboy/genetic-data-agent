@@ -25,6 +25,9 @@ init-db:
 download-real-data:
 	./scripts/download_na12878.sh
 
+download-to-s3:
+	./scripts/download_to_s3.sh
+
 test-e2e:
 	node ts-api-agent/src/test_e2e.ts
 
