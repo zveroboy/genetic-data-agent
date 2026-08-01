@@ -31,11 +31,22 @@ export async function downloadVcf(fileKey: string): Promise<string> {
     return localTarget;
   }
 
-  const targetPath = path.resolve(fileKey);
-  if (!fs.existsSync(targetPath)) {
-    throw new Error(`File not found: ${targetPath}`);
-  }
-  return targetPath;
+  const possiblePaths = [
+    path.resolve(fileKey),
+    path.resolve('data', fileKey),
+    path.resolve('../data', fileKey),
+    path.resolve('/app/data', fileKey),
+    path.resolve(process.cwd(), 'data', fileKey),
+    path.resolve(__dirname, '../../../data', fileKey),
+  ];
+
+  const foundPath = possiblePaths.find((p) => fs.existsSync(p));
+  if (foundPath) return foundPath;
+
+  // Fallback: try fetching from MinIO S3 genomic-data bucket
+  const s3Url = `s3://genomic-data/${path.basename(fileKey)}`;
+  console.log(`[downloadVcf] File ${fileKey} not found locally. Attempting S3 download from ${s3Url}...`);
+  return downloadVcf(s3Url);
 }
 
 export async function parseAndIndexVcf(userId: string, localFilePath: string): Promise<void> {

@@ -73,6 +73,7 @@ async function runIngestion() {
     try {
       const fetched = await fetchPubMedArticles(tg.gene, tg.query, 2);
       allArticles.push(...fetched);
+      await new Promise((r) => setTimeout(r, 500));
     } catch (err: any) {
       console.warn(`⚠️ Could not fetch PubMed for ${tg.gene}: ${err.message}`);
     }

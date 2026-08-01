@@ -34,7 +34,7 @@ export async function askBioinformaticsAgent(
       targetId = 'LCT';
     } else if (q.includes('statin') || q.includes('cholesterol') || q.includes('muscle')) {
       targetId = 'SLCO1B1';
-    } else if (q.includes('warfarin') || q.includes('blood thinner')) {
+    } else if (q.includes('warfarin') || q.includes('blood thinner') || q.includes('vkorc1') || q.includes('cyp2c9')) {
       targetId = 'VKORC1';
     } else if (q.includes('ssri') || q.includes('antidepressant')) {
       targetId = 'CYP2D6';

@@ -69,3 +69,8 @@ curl -s -X POST http://localhost:3000/ask \
   -H "Content-Type: application/json" \
   -d '{"question": "What is my SLCO1B1 genotype and statin myopathy risk?"}' | jq .
 ```
+
+
+```bash
+ssh -L 9001:localhost:9001 -L 8233:localhost:8233 root@<IP_ADDRESS>
+```

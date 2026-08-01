@@ -42,6 +42,11 @@ if command -v aws &> /dev/null; then
 
   echo "🎉 Direct S3 Streaming Check Completed with 0 Local Disk Usage!"
 else
-  echo "Note: aws CLI tool not installed. Fallback: Downloading to local data/ directory first..."
+  echo "⚠️ Note: aws CLI tool is not installed on this host."
+  echo "   To upload directly into MinIO S3 bucket, please install awscli:"
+  echo "   👉 Ubuntu/Debian: apt-get update && apt-get install -y awscli"
+  echo "   👉 macOS: brew install awscli"
+  echo ""
+  echo "   Fallback: Downloading to local data/ directory first..."
   ./scripts/download_na12878.sh
 fi

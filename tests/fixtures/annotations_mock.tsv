@@ -2,3 +2,4 @@ rsid	gene	phenotype	clinical_significance	evidence_note
 rs762551	CYP1A2	Slow caffeine metabolizer	Risk Factor	Decreased CYP1A2 enzyme activity.
 rs4988235	LCT	Primary Lactase Deficiency	Pathogenic	Absence of lactase persistence allele.
 rs4149056	SLCO1B1	Statins myopathy risk	Risk Factor	Intermediate OATP1B1 function.
+rs9923231	VKORC1	Warfarin sensitivity	Risk Factor	Decreased VKORC1 expression; increased sensitivity requiring lower warfarin starting dose.

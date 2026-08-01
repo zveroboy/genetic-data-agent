@@ -16,6 +16,22 @@ export async function generateOllamaEmbedding(
 
     if (!res.ok) {
       const errText = await res.text();
+      
+      // Auto-pull model if missing in Ollama
+      if (res.status === 404 || errText.includes('not found')) {
+        console.log(`[Ollama Auto-Pull] Model '${model}' missing. Triggering automatic download...`);
+        const pullRes = await fetch(`${ollamaUrl}/api/pull`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: model, stream: false }),
+        });
+        
+        if (pullRes.ok) {
+          console.log(`✔ [Ollama Auto-Pull] Model '${model}' downloaded successfully. Retrying embedding...`);
+          return generateOllamaEmbedding(text, model);
+        }
+      }
+
       throw new Error(`Ollama API error (${res.status}): ${errText}`);
     }
 

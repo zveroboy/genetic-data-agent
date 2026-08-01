@@ -13,11 +13,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultVcf = path.resolve(__dirname, '../../tests/fixtures/demo_user.vcf');
 const defaultTsv = path.resolve(__dirname, '../../tests/fixtures/annotations_mock.tsv');
 
-async function autoInitFixtures() {
+async function autoInitFixtures(targetVcf?: string) {
   try {
-    if (fs.existsSync(defaultVcf) && fs.existsSync(defaultTsv)) {
-      await duckDbRepository.initFromFixtures(defaultVcf, defaultTsv);
-      console.log('[Auto-Init] DuckDB fixtures initialized successfully.');
+    const chosenVcf = targetVcf && fs.existsSync(targetVcf) ? targetVcf : defaultVcf;
+    if (fs.existsSync(chosenVcf) && fs.existsSync(defaultTsv)) {
+      await duckDbRepository.initFromFixtures(chosenVcf, defaultTsv);
+      console.log(`[Auto-Init] DuckDB initialized successfully from ${chosenVcf}.`);
     }
   } catch (err: any) {
     console.warn('[Auto-Init Warning]:', err.message);
@@ -107,7 +108,8 @@ app.post('/api/ingestion/start', async (c) => {
       setTimeout(async () => {
         const wf = fallbackWorkflows.get(simId);
         if (!wf) return;
-        await autoInitFixtures();
+        const realNa12878Path = ['data/na12878_hg001.vcf.gz', '/app/data/na12878_hg001.vcf.gz', '../data/na12878_hg001.vcf.gz'].find((p) => fs.existsSync(p));
+        await autoInitFixtures(fileKey.includes('na12878') ? realNa12878Path : undefined);
         wf.progress = {
           step: 'COMPLETED',
           fileKey,
