@@ -1,0 +1,34 @@
+{
+  "attemptPrefix": "datasets/ds-test-001/versions/iv-test-001/attempt-1/",
+  "datasetChecksumSha256": "524e46eeee672654250c94b3f316937fbc6311fe41829f431b9897fea8d0e923",
+  "variantCount": 1500,
+  "rejectedRecordCount": 2,
+  "referenceBuild": "GRCh38",
+  "processorVersion": "rust-ingestion-worker/0.1.0",
+  "parquetObjects": [
+    {
+      "bucket": "genomic-artifacts",
+      "key": "datasets/ds-test-001/versions/iv-test-001/attempt-1/chrom=1/part-000.parquet",
+      "etag": "fixture-parquet-etag-chrom-1",
+      "versionId": null,
+      "chrom": "1",
+      "checksumSha256": "a9c0c80616a32401981426fc9ff39d835437416eaec480f755cf90eac0fac442",
+      "byteSize": 20480,
+      "rowCount": 900,
+      "minPos": 12345,
+      "maxPos": 248900000
+    },
+    {
+      "bucket": "genomic-artifacts",
+      "key": "datasets/ds-test-001/versions/iv-test-001/attempt-1/chrom=12/part-000.parquet",
+      "etag": "fixture-parquet-etag-chrom-12",
+      "versionId": "fixture-version-chrom-12",
+      "chrom": "12",
+      "checksumSha256": "a63f7af57491ba32774f0743f951b0b4d79094215013643caf41520013510464",
+      "byteSize": 15360,
+      "rowCount": 600,
+      "minPos": 21178615,
+      "maxPos": 133200000
+    }
+  ]
+}

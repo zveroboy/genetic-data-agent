@@ -1,0 +1,21 @@
+{
+  "contractVersion": 1,
+  "datasetId": "ds-test-001",
+  "datasetKey": "demo-small",
+  "source": {
+    "bucket": "genomic-data",
+    "key": "samples/demo_user.vcf",
+    "etag": "fixture-etag",
+    "versionId": null,
+    "contentLength": 1024
+  },
+  "reference": {
+    "build": "GRCh38",
+    "version": "demo-clinvar-grch38-v1"
+  },
+  "target": {
+    "bucket": "genomic-artifacts",
+    "artifactVersion": "iv-test-001",
+    "allowedPrefix": "datasets/ds-test-001/versions/iv-test-001/"
+  }
+}
