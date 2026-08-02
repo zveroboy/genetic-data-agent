@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a truthful end-to-end path in which a TypeScript Temporal Workflow ingests an allowlisted S3 VCF through a real Rust Temporal Activity Worker, publishes an immutable DuckDB artifact, and queries that exact dataset from the agent API.
+**Goal:** Build a truthful end-to-end path in which a TypeScript Temporal Workflow ingests an allowlisted S3 VCF through a real Rust Temporal Activity Worker, publishes immutable chromosome-partitioned Parquet in S3, and queries only the required remote partitions and row groups through DuckDB from the agent API.
 
-**Architecture:** TypeScript owns the control plane and schedules a Rust-only Activity queue through Temporal. Rust streams the selected S3 object into an attempt-local DuckDB file, validates it, and uploads a staging artifact; TypeScript publishes the artifact by writing its manifest last. Query requests resolve the manifest by `datasetId`, verify and cache the immutable artifact, and open a request-scoped read-only DuckDB repository.
+**Architecture:** TypeScript owns the control plane and schedules a Rust-only Activity queue through Temporal. Rust streams the selected S3 object into an attempt-local DuckDB staging database, validates it, exports rows sorted by genomic coordinates to partitioned Parquet, and uploads directly to an attempt-unique immutable version prefix; TypeScript verifies the complete inventory and writes the manifest last without copying the payload again. Query requests resolve the manifest by `datasetId`, use the global reference database to resolve gene/rsID to coordinates, and run request-scoped in-memory DuckDB queries against the selected Parquet objects through S3 range reads.
 
-**Tech Stack:** Node.js 25, TypeScript 5.7, Hono, Temporal TypeScript SDK 1.11, Rust 2021, Temporal Rust SDK 0.5.0 Public Preview, Tokio, Rayon, DuckDB, AWS SDK for JavaScript/Rust, MinIO/S3, Qdrant, Node test runner.
+**Tech Stack:** Node.js 25, TypeScript 5.7, Hono, Temporal TypeScript SDK 1.11, Rust 2021, Temporal Rust SDK 0.5.0 Public Preview, Tokio, Rayon, DuckDB with Parquet/httpfs, AWS SDK for JavaScript/Rust, MinIO/S3, Qdrant, Node test runner.
 
 ## Global Constraints
 
@@ -15,8 +15,12 @@
 - `genomic-control-plane` is the TypeScript Workflow/Activity queue; `genomic-ingestion-rust` is activity-only.
 - S3 object references, not local paths or shared volumes, cross the language boundary.
 - `temporalio-sdk`, `temporalio-client`, `temporalio-common`, and `temporalio-macros` are pinned to `0.5.0`; the Public Preview status is documented.
-- Published DuckDB artifacts are immutable and queryable only when a matching manifest exists.
-- Rust retries never append to an existing DuckDB file.
+- Published Parquet objects are immutable and queryable only when a matching manifest exists.
+- Rust retries never append to an existing local DuckDB staging database or published Parquet prefix.
+- Parquet is partitioned by chromosome and sorted within each partition by `(pos, ref, alt)` with approximately 100,000 rows per row group.
+- `/ask` reads the explicit Parquet inventory from the manifest; it never builds an S3 path from user input and never globs an unpublished prefix.
+- The serving path must not download the complete user dataset; DuckDB uses `httpfs`, projection pushdown, partition pruning, and row-group pruning.
+- Gene/rsID targets are resolved through a versioned ClinVar reference to `(referenceBuild, chrom, pos, ref, alt)` before remote scan; build mismatch or unresolved targets never trigger a full scan.
 - Qdrant stores global literature only; no user genotype is written to Qdrant.
 - Fixture fallback is allowed in automated tests only and is never silent in runtime paths.
 
@@ -29,7 +33,7 @@
 - `contracts/ingestion-v1.md` — canonical wire names, payload examples, failure taxonomy.
 - `contracts/fixtures/build-dataset-artifact.input.json` — golden input consumed by TS and Rust tests.
 - `contracts/fixtures/build-dataset-artifact.result.json` — golden output consumed by TS and Rust tests.
-- `contracts/fixtures/dataset-manifest.json` — golden published manifest.
+- `contracts/fixtures/dataset-manifest.json` — golden published manifest with an ordered Parquet object inventory.
 
 ### TypeScript control plane
 
@@ -40,8 +44,8 @@
 - `ts-api-agent/src/application/control-plane-activities.ts` — S3 inspect and manifest-last publish activities.
 - `ts-api-agent/src/application/worker.ts` — TS Workflow plus control-plane Activity Worker.
 - `ts-api-agent/src/infrastructure/object-store/s3-object-store.ts` — S3 adapter.
-- `ts-api-agent/src/infrastructure/database/dataset-artifact-resolver.ts` — manifest resolution, checksum cache.
-- `ts-api-agent/src/infrastructure/database/duckdb.ts` — dataset-scoped read-only repository only.
+- `ts-api-agent/src/infrastructure/database/parquet-dataset-resolver.ts` — manifest validation and safe explicit Parquet URI selection.
+- `ts-api-agent/src/infrastructure/database/duckdb.ts` — request-scoped in-memory DuckDB-over-Parquet repository.
 - `ts-api-agent/src/infrastructure/ai/tools.ts` — request-scoped genotype tool.
 - `ts-api-agent/src/infrastructure/ai/agent.ts` — receives `datasetId`/repository dependencies.
 - `ts-api-agent/src/index.ts` — catalog, ingestion/status, and dataset-scoped ask endpoints.
@@ -51,7 +55,7 @@
 - `rust-ingestion-worker/src/contracts.rs` — serde wire structs and stable failure names.
 - `rust-ingestion-worker/src/object_store.rs` — S3/MinIO download and upload adapter.
 - `rust-ingestion-worker/src/vcf.rs` — streaming plain/gzip VCF reader and record parser.
-- `rust-ingestion-worker/src/artifact.rs` — attempt-local DuckDB builder and validator.
+- `rust-ingestion-worker/src/artifact.rs` — attempt-local DuckDB staging, sorted Parquet export, and validator.
 - `rust-ingestion-worker/src/temporal_activities.rs` — thin Activity wrapper, heartbeat, cancellation, failure mapping.
 - `rust-ingestion-worker/src/bin/temporal_worker.rs` — activity-only Worker bootstrap.
 - `rust-ingestion-worker/src/main.rs` — retain only explicit CLI/debug behavior; do not masquerade as a Temporal worker.
@@ -59,7 +63,8 @@
 ### Integration and operations
 
 - `tests/integration/cross_language_ingestion.test.ts` — TS Workflow to Rust Activity proof.
-- `tests/integration/dataset_isolation.test.ts` — two datasets produce isolated query results.
+- `tests/integration/dataset_isolation.test.ts` — two Parquet datasets produce isolated query results.
+- `tests/integration/remote_parquet_pruning.test.ts` — unrelated chromosome partitions and complete-dataset downloads are not used by a targeted query.
 - `docker-compose.yml` — local Temporal, MinIO, Qdrant, TS Worker, and Rust Worker topology.
 - `docker-compose.prod.yml` — same worker separation without runtime Cargo compilation.
 - `rust-ingestion-worker/Dockerfile` — multi-stage release image.
@@ -68,7 +73,7 @@
 
 ---
 
-### Task 1: Feasibility Gate — TypeScript Workflow Calls a Real Rust Activity
+### Task 1: Feasibility Gates — Cross-Language Temporal and Remote Parquet
 
 **Files:**
 - Modify: `rust-ingestion-worker/Cargo.toml`
@@ -76,11 +81,14 @@
 - Create: `ts-api-agent/src/application/temporal_probe_workflow.ts`
 - Create: `ts-api-agent/src/application/temporal_probe_worker.ts`
 - Create: `tests/integration/temporal_rust_probe.test.ts`
+- Create: `tests/integration/remote_parquet_probe.test.ts`
 - Modify: `ts-api-agent/package.json`
 
 **Interfaces:**
 - Consumes: Temporal at `TEMPORAL_ADDRESS`, namespace `default`.
+- Consumes: authenticated MinIO at `S3_ENDPOINT` through DuckDB `httpfs`.
 - Produces: Activity Type `rustActivityProbe` on `genomic-ingestion-rust`; payload `{ message: string, iterations: number }`; result `{ echoed: string, workerLanguage: "rust" }`.
+- Proves: an in-memory Node/DuckDB session can query an explicit S3 Parquet URI with `chrom` and `pos` predicates without downloading a complete dataset or reading an unrelated chromosome object.
 
 - [ ] **Step 1: Add the pinned Public Preview Rust SDK dependencies**
 
@@ -139,21 +147,42 @@ const rustProbe = proxyActivities<{
 
 The test starts the TS Workflow Worker and Rust probe Worker, executes `temporalRustProbeWorkflow({ message: "hello", iterations: 20 })`, asserts the returned language, then starts a second execution and cancels it. Query Temporal history and assert Activity Type `rustActivityProbe` used task queue `genomic-ingestion-rust`.
 
-- [ ] **Step 7: Run the feasibility gate**
+- [ ] **Step 7: Run the Temporal feasibility gate**
 
 Run: `node --test tests/integration/temporal_rust_probe.test.ts`
 
 Expected: PASS; the Temporal UI pending Activity shows a Rust worker identity and heartbeat detail.
 
-- [ ] **Step 8: Apply the gate decision**
+- [ ] **Step 8: Write the remote Parquet feasibility test**
 
-Proceed to Task 2 only when payload compatibility, heartbeat, cancellation, and retry all pass. If any is unsupported by SDK 0.5.0, stop this plan and retain the production fallback `TS Activity -> spawn(shell: false) -> Rust processor`; do not build a partial custom Temporal Core integration.
+Create a chromosome-1 object plus a chromosome-12 Zstandard Parquet object containing at least 300,000 ordered rows in three approximately 100,000-row groups. Put target and non-target chromosome-12 positions in different row groups. Open DuckDB in memory through the current Node binding, load `httpfs`, configure path-style MinIO credentials from test environment, and query only the manifest-selected chromosome-12 URI:
 
-- [ ] **Step 9: Commit the gate**
+```sql
+SELECT rsid, gt_raw
+FROM read_parquet(
+  ['s3://probe/variants/chrom=12/part-000.parquet'],
+  hive_partitioning = true
+)
+WHERE chrom = '12' AND pos = 21178615;
+```
+
+Assert the result, capture `EXPLAIN ANALYZE`, and use MinIO request logs or an instrumented S3 proxy to prove no GET/range request targets the chromosome-1 object after counters are reset. For chromosome 12, distinguish footer reads from data reads and assert bytes read are materially below the full object size and exclude nonmatching row-group data. Repeat with both URIs to document the cost of passing an unpruned file list; application-side manifest pruning remains mandatory.
+
+- [ ] **Step 9: Run the remote-query feasibility gate**
+
+Run: `node --test tests/integration/remote_parquet_probe.test.ts`
+
+Expected: PASS without downloading the complete chromosome-12 object and without any read from the unrelated chromosome partition. Record the DuckDB binding version, loaded `httpfs` extension version, selected files, footer/data byte ranges, total bytes read, object sizes, and query profile in the test report.
+
+- [ ] **Step 10: Apply both gate decisions**
+
+Proceed to Task 2 only when payload compatibility, heartbeat, cancellation, retry, authenticated MinIO Parquet access, explicit-file selection, and targeted remote reads all pass. If Temporal behavior is unsupported by SDK 0.5.0, stop this plan and retain the production fallback `TS Activity -> spawn(shell: false) -> Rust processor`; do not build a partial custom Temporal Core integration. If the current Node DuckDB binding cannot reliably query remote Parquet, stop and select a supported binding/version before freezing contracts.
+
+- [ ] **Step 11: Commit both gates**
 
 ```bash
-git add rust-ingestion-worker/Cargo.toml Cargo.lock rust-ingestion-worker/src/bin/temporal_probe_worker.rs ts-api-agent/src/application/temporal_probe_workflow.ts ts-api-agent/src/application/temporal_probe_worker.ts ts-api-agent/package.json tests/integration/temporal_rust_probe.test.ts
-git commit -m "spike: prove TypeScript workflow to Rust activity"
+git add rust-ingestion-worker/Cargo.toml Cargo.lock rust-ingestion-worker/src/bin/temporal_probe_worker.rs ts-api-agent/src/application/temporal_probe_workflow.ts ts-api-agent/src/application/temporal_probe_worker.ts ts-api-agent/package.json tests/integration/temporal_rust_probe.test.ts tests/integration/remote_parquet_probe.test.ts
+git commit -m "spike: prove Rust activities and remote Parquet queries"
 ```
 
 ### Task 2: Freeze Cross-Language Contracts and Seeded Dataset Catalog
@@ -187,16 +216,24 @@ Use this exact input shape:
     "bucket": "genomic-data",
     "key": "samples/demo_user.vcf",
     "etag": "fixture-etag",
+    "versionId": null,
     "contentLength": 1024
   },
-  "staging": {
+  "reference": {
+    "build": "GRCh38",
+    "version": "demo-clinvar-grch38-v1"
+  },
+  "target": {
     "bucket": "genomic-artifacts",
-    "key": "staging/ds-test-001/attempt-1.duckdb"
+    "artifactVersion": "iv-test-001",
+    "allowedPrefix": "datasets/ds-test-001/versions/iv-test-001/"
   }
 }
 ```
 
-The result fixture contains `stagingArtifactUri`, `checksumSha256`, `variantCount`, `rejectedRecordCount`, `referenceBuild`, and `processorVersion`.
+The result fixture contains `attemptPrefix`, `datasetChecksumSha256`, `variantCount`, `rejectedRecordCount`, `referenceBuild`, `processorVersion`, and an ordered `parquetObjects` array. Each object contains required `bucket`, `key`, and `etag`, nullable `versionId`, `chrom`, `checksumSha256`, `byteSize`, `rowCount`, `minPos`, and `maxPos`.
+
+The manifest fixture additionally fixes `artifactFormat: "parquet-dataset"`, `layoutVersion: 1`, `schemaVersion: 1`, `schemaFingerprint`, `artifactVersion`, `referenceVersion`, `partitionSpec: ["chrom"]`, and `sortOrder: ["chrom", "pos", "ref", "alt"]`. Contract tests reject noncanonical file ordering, duplicate keys, keys outside the allowed dataset/version prefix, mismatched chromosome partition values, and a dataset checksum that does not match the canonical descriptor list.
 
 - [ ] **Step 2: Write failing TypeScript contract and catalog tests**
 
@@ -219,6 +256,7 @@ Expected: FAIL because the schemas and catalog do not exist.
 - [ ] **Step 4: Implement strict Zod schemas and catalog**
 
 Define `DatasetKeySchema = z.enum(['demo-small', 'na12878-full'])`. Use `.strict()` on wire objects. Keep display names separate from S3 identity so API input cannot override bucket or key.
+Each catalog entry also fixes `expectedReferenceBuild: 'GRCh38'` and `referenceVersion: 'demo-clinvar-grch38-v1'`; source headers that contradict the expected build fail ingestion.
 
 - [ ] **Step 5: Write failing Rust golden-fixture tests**
 
@@ -253,7 +291,7 @@ git add contracts ts-api-agent/src/domain/datasets.ts ts-api-agent/src/applicati
 git commit -m "feat: define versioned ingestion contracts"
 ```
 
-### Task 3: Build and Test the Pure Rust Artifact Processor
+### Task 3: Build and Test the Pure Rust Parquet Dataset Processor
 
 **Files:**
 - Create: `rust-ingestion-worker/src/vcf.rs`
@@ -265,8 +303,8 @@ git commit -m "feat: define versioned ingestion contracts"
 - Delete after migration: `rust-ingestion-worker/src/activities/mod.rs`
 
 **Interfaces:**
-- Consumes: `ArtifactBuildRequest { source_path, output_path, dataset_id, source_etag }`.
-- Produces: `ArtifactStats { checksum_sha256, variant_count, rejected_record_count, reference_build }`.
+- Consumes: `ArtifactBuildRequest { source_path, staging_db_path, parquet_output_dir, dataset_id, source_etag }`.
+- Produces: `ArtifactStats { dataset_checksum_sha256, local_parquet_files, variant_count, rejected_record_count, reference_build }`, where each local descriptor has `relative_path`, `chrom`, checksum, size, row count, min/max positions, and schema fingerprint but no S3 key or ETag.
 - Produces progress through a `ProgressSink` trait independent of Temporal.
 
 - [ ] **Step 1: Add processor dependencies**
@@ -275,17 +313,17 @@ Add `sha2 = "=0.11.0"`, `hex = "=0.4.3"`, and `tempfile = "=3.27.0"`; retain `fl
 
 - [ ] **Step 2: Write failing parser tests**
 
-Test the existing `demo_user.vcf`, a gzipped copy created in a test temp directory, header-only input, a missing `GT` field, invalid POS, phased `0|1`, and a multiallelic `1/2` record. Assert malformed records increment `rejectedRecordCount` instead of panicking.
+Test the existing `demo_user.vcf`, a gzipped copy created in a test temp directory, header-only input, a missing `GT` field, invalid POS, phased `0|1`, and a multiallelic `1/2` record. Assert malformed records increment `rejectedRecordCount` instead of panicking. Test canonical chromosome normalization and reject an unsafe/unexpected contig before it can become a partition path.
 
 - [ ] **Step 3: Write the bounded-memory acceptance test**
 
-Generate 100,000 VCF records through a buffered writer, run the processor with `batch_size = 1_000`, and use an instrumented `ProgressSink` to assert no reported in-memory batch exceeds 1,000 records.
+Generate 100,000 VCF records through a buffered writer, run the processor with `batch_size = 1_000`, and use an instrumented `ProgressSink` to assert no reported in-memory batch exceeds 1,000 records. Assert the exact Parquet column types/nullability, Zstandard compression, chromosome directories, position order, row-group size near 100,000, record conservation across files, and canonical file-descriptor ordering.
 
 - [ ] **Step 4: Run tests and observe the current all-in-memory design fail**
 
 Run: `cargo test --manifest-path rust-ingestion-worker/Cargo.toml --test artifact_builder_test`
 
-Expected: FAIL because the streaming reader, progress trait, metadata table, and overwrite-safe builder do not exist.
+Expected: FAIL because the streaming reader, progress trait, staging tables, sorted Parquet export, and overwrite-safe builder do not exist.
 
 - [ ] **Step 5: Implement plain/gzip streaming input**
 
@@ -312,10 +350,27 @@ CREATE TABLE dataset_metadata (
   rejected_record_count UBIGINT NOT NULL,
   processor_version VARCHAR NOT NULL
 );
-CREATE INDEX user_variants_rsid_idx ON user_variants(rsid);
 ```
 
-Append bounded batches, commit metadata after parsing, close the connection, reopen read-only, validate schema/counts, then calculate SHA-256.
+Append bounded batches and commit metadata after parsing. Use the local DuckDB only as a staging/processing engine. Export with the equivalent of:
+
+```sql
+COPY (
+  SELECT chrom, pos, rsid, ref, alt, gt_raw
+  FROM user_variants
+  ORDER BY chrom, pos, ref, alt
+)
+TO '<attempt-parquet-directory>' (
+  FORMAT PARQUET,
+  PARTITION_BY (chrom),
+  COMPRESSION ZSTD,
+  ROW_GROUP_SIZE 100000
+);
+```
+
+Close the staging database, enumerate every generated Parquet file, validate its schema and statistics through DuckDB, and calculate per-file SHA-256 plus a deterministic dataset content checksum over local descriptors sorted by `(chrom, relativePath)`. S3 keys, ETags, and version IDs do not exist at this layer and are added only after upload in Task 5.
+
+The physical file schema contains `pos`, `rsid`, `ref`, `alt`, and `gt_raw`; `chrom` is encoded by `chrom=<value>` directories and restored as a logical column only through `read_parquet(..., hive_partitioning = true)`. Attempt/version directory segments must not contain `=`.
 
 - [ ] **Step 7: Replace fake Temporal context with `ProgressSink`**
 
@@ -327,13 +382,13 @@ Run: `cargo test --manifest-path rust-ingestion-worker/Cargo.toml artifact_build
 
 Run: `cargo test --manifest-path rust-ingestion-worker/Cargo.toml vcf`
 
-Expected: PASS, including gzip and bounded-batch cases.
+Expected: PASS, including gzip, bounded-batch, chromosome partitioning, position ordering, row-group sizing, and deterministic inventory cases.
 
 - [ ] **Step 9: Commit the pure data plane**
 
 ```bash
 git add rust-ingestion-worker/Cargo.toml Cargo.lock rust-ingestion-worker/src rust-ingestion-worker/tests/artifact_builder_test.rs
-git commit -m "feat: stream VCF into immutable DuckDB artifacts"
+git commit -m "feat: stream VCF into partitioned Parquet datasets"
 ```
 
 ### Task 4: Implement S3 Adapters and Manifest-Last Publication
@@ -350,7 +405,7 @@ git commit -m "feat: stream VCF into immutable DuckDB artifacts"
 - Modify: `scripts/seed_demo_s3.sh`
 
 **Interfaces:**
-- Produces TS `ObjectStore` methods `head`, `copy`, `putJson`, `getJson`, `downloadToFile`.
+- Produces TS `ObjectStore` methods `head`, `headMany`, `putJsonConditional`, `getJson`, `listPrefix`, and `downloadToFile`.
 - Produces `inspectDatasetSource(datasetId, datasetKey)` and `publishDataset(input, result)`.
 - Produces Rust `ObjectStore` methods `download_exact` and `upload_file`.
 
@@ -360,20 +415,19 @@ Add `@aws-sdk/client-s3` to TypeScript. Add `aws-config = "=1.10.0"` and `aws-sd
 
 - [ ] **Step 2: Write fake-object-store tests for source inspection**
 
-Assert that catalog mapping controls bucket/key, the returned input includes ETag and content length, missing ETag fails, and the caller cannot inject a URL or alternate bucket.
+Assert that catalog mapping controls bucket/key, the returned input includes ETag, nullable S3 version ID, and content length, missing ETag fails, and the caller cannot inject a URL or alternate bucket.
 
 - [ ] **Step 3: Write publication idempotency tests**
 
 Use an in-memory `ObjectStore` fake and verify call order:
 
 ```text
-HEAD staging artifact
-COPY staging -> datasets/{datasetId}/variants.duckdb
-HEAD final artifact
-PUT datasets/{datasetId}/manifest.json
+HEAD every declared Parquet object below the successful immutable attempt prefix
+VERIFY ETag/version, size, checksum metadata, partition, and canonical order
+CONDITIONAL PUT datasets/{datasetId}/manifest.json
 ```
 
-Assert a second identical call succeeds without changing identity; a conflicting existing manifest raises `DatasetPublicationConflict`; no manifest is written when copy/checksum verification fails.
+Assert objects are verified with bounded concurrency in canonical manifest order and no Parquet copy operation occurs. A second identical call succeeds without changing identity; a conflicting existing manifest raises `DatasetPublicationConflict`; no manifest is written when any HEAD, size, checksum metadata, prefix, or inventory verification fails. Queryability begins only after the final conditional manifest write.
 
 - [ ] **Step 4: Implement TypeScript S3 adapter and activities**
 
@@ -381,11 +435,11 @@ Configure endpoint, region, credentials, and path-style mode from explicit envir
 
 - [ ] **Step 5: Write Rust MinIO tests**
 
-Test exact ETag matching, wrong ETag rejection as `SourceObjectChanged`, streaming download to a temp file, upload metadata containing SHA-256, and retrying an identical upload.
+Test exact ETag matching, wrong ETag rejection as `SourceObjectChanged`, streaming download to a temp file, uploading multiple Parquet files with SHA-256 metadata, and retrying an identical attempt prefix.
 
 - [ ] **Step 6: Implement Rust S3 adapter**
 
-Use the AWS SDK client configured for MinIO path-style access. Verify source ETag before and after download. Upload to the exact attempt staging key supplied by the Workflow.
+Use the AWS SDK client configured for MinIO path-style access. Verify source ETag/version before and after download. Derive an `attempt-{attempt}` prefix below the exact allowed version prefix from Temporal Activity metadata and upload only the locally enumerated Parquet inventory there; never accept an arbitrary destination key from VCF content. Configure production bucket policy to deny overwrite of published version-prefix objects; listing is for cleanup/audit only and never drives query selection.
 
 - [ ] **Step 7: Make demo seeding idempotent and explicit**
 
@@ -440,17 +494,20 @@ Drive a fake processor through all phases and assert heartbeat payloads follow:
 {
   "phase": "PARSING",
   "processedBytes": 4096,
-  "processedVariants": 2500
+  "processedVariants": 2500,
+  "currentPartition": "12",
+  "completedFiles": 3,
+  "uploadedBytes": 1048576
 }
 ```
 
 - [ ] **Step 3: Implement the thin Temporal Activity**
 
-The wrapper creates attempt-scoped temporary paths using Workflow ID, Activity ID, and attempt number; constructs the S3 adapter; calls the pure artifact processor; uploads the artifact; returns the wire result; and removes local temporary files on success, failure, or cancellation.
+The wrapper creates attempt-scoped local DuckDB/Parquet paths and derives an `attempt-{attempt}` S3 prefix below the contract's allowed immutable version prefix using Workflow ID, Activity ID, and attempt number; constructs the S3 adapter; calls the pure processor; maps local descriptors to object keys, uploads them with bounded concurrency, records returned ETags/version IDs, and returns the complete wire result. It recomputes/validates the dataset content checksum from canonical relative descriptors and never mixes descriptors from different attempts. It never writes the publication manifest.
 
 - [ ] **Step 4: Implement cancellation-aware progress**
 
-At every heartbeat boundary, check Activity cancellation and stop reading/writing before cleanup. Never delete source objects, final artifacts, or another attempt's staging key during cancellation.
+At every heartbeat boundary, check Activity cancellation and stop reading/writing before cleanup. Use phases `DOWNLOADING_SOURCE`, `PARSING`, `WRITING_DUCKDB`, `EXPORTING_PARQUET`, `UPLOADING_PARTITION`, and `FINALIZING`. Never delete source objects, published objects, or another Activity attempt's prefix during cancellation.
 
 - [ ] **Step 5: Implement activity-only Worker bootstrap**
 
@@ -464,7 +521,7 @@ Expected: PASS.
 
 - [ ] **Step 7: Re-run the cross-language probe using the production Activity Type**
 
-Replace the probe integration payload with the golden `buildDatasetArtifact` fixture backed by MinIO and assert the returned checksum, variant count, heartbeat presence, and Rust worker identity.
+Replace the probe integration payload with the golden `buildDatasetArtifact` fixture backed by MinIO and assert the returned dataset checksum, complete multi-file inventory, per-file checksums/statistics, variant count, heartbeat presence, and Rust worker identity.
 
 Run: `node --test tests/integration/temporal_rust_probe.test.ts`
 
@@ -492,7 +549,7 @@ git commit -m "feat: run ingestion as a Rust Temporal activity"
 
 - [ ] **Step 1: Write Workflow tests with mocked activities**
 
-Cover the exact state sequence `RESOLVING -> BUILDING -> PUBLISHING -> COMPLETED`, Rust task queue selection, nonretryable invalid VCF behavior, retryable object-store failure, cancellation, and the invariant that `publishDataset` is never scheduled after build failure.
+Cover the exact state sequence `RESOLVING -> BUILDING -> VERIFYING_OBJECTS -> PUBLISHING_MANIFEST -> COMPLETED`, Rust task queue selection, complete ordered file-inventory verification, nonretryable invalid VCF behavior, retryable object-store failure, cancellation, and the invariant that `publishDataset` is never scheduled after build or object verification failure.
 
 - [ ] **Step 2: Run tests and observe failure against the current Workflow**
 
@@ -523,7 +580,7 @@ const rust = proxyActivities<RustActivities>({
 
 - [ ] **Step 4: Implement deterministic Workflow state**
 
-The Workflow receives a complete serializable input containing IDs and catalog key. It performs no filesystem, S3, UUID, date, DuckDB, or network operations directly. Return the published manifest as the Workflow result.
+The Workflow receives a complete serializable input containing IDs and catalog key. It performs no filesystem, S3, UUID, date, DuckDB, or network operations directly. Return the published Parquet dataset manifest as the Workflow result. Cancellation before manifest publication may leave only an orphan version/attempt prefix, which remains unqueryable.
 
 - [ ] **Step 5: Restrict the TS Worker to control-plane code**
 
@@ -548,71 +605,101 @@ git add ts-api-agent/src/application
 git commit -m "refactor: orchestrate Rust ingestion from TypeScript"
 ```
 
-### Task 7: Make DuckDB Queries Dataset-Scoped and Remove Runtime Fixture Substitution
+### Task 7: Query Published Parquet Remotely Through Dataset-Scoped DuckDB
 
 **Files:**
-- Create: `ts-api-agent/src/infrastructure/database/dataset-artifact-resolver.ts`
-- Create: `ts-api-agent/src/infrastructure/database/dataset-artifact-resolver.test.ts`
+- Create: `ts-api-agent/src/infrastructure/database/parquet-dataset-resolver.ts`
+- Create: `ts-api-agent/src/infrastructure/database/parquet-dataset-resolver.test.ts`
+- Create: `ts-api-agent/src/infrastructure/database/clinvar-coordinate-resolver.ts`
+- Create: `ts-api-agent/src/infrastructure/database/clinvar-coordinate-resolver.test.ts`
+- Create: `ts-api-agent/src/infrastructure/database/reference-bootstrap.ts`
+- Create: `ts-api-agent/src/infrastructure/database/duckdb-session-factory.ts`
+- Create: `ts-api-agent/src/infrastructure/database/duckdb-session-factory.test.ts`
 - Modify: `ts-api-agent/src/infrastructure/database/duckdb.ts`
 - Create: `ts-api-agent/src/infrastructure/database/duckdb.test.ts`
 - Modify: `ts-api-agent/src/infrastructure/ai/tools.ts`
 - Modify: `ts-api-agent/src/infrastructure/ai/agent.ts`
 - Create: `ts-api-agent/src/infrastructure/ai/tools.test.ts`
+- Create: `tests/integration/remote_parquet_pruning.test.ts`
+- Create: `tests/fixtures/clinvar_coordinates_grch38.tsv`
+- Modify: `scripts/generate_clinical_benchmark_vcf.ts`
 
 **Interfaces:**
-- Produces: `DatasetArtifactResolver.resolve(datasetId): Promise<ResolvedDatasetArtifact>`.
+- Produces: `ParquetDatasetResolver.resolve(datasetId): Promise<ResolvedParquetDataset>`.
+- Produces: `ClinVarCoordinateResolver.resolve(targetId, referenceBuild): Promise<VariantTarget[]>` where each target contains `chrom`, `pos`, `ref`, `alt`, `rsid`, and clinical metadata.
+- Produces: `DuckDbSessionFactory.open(): Promise<DuckDbSession>` configured for authenticated S3 reads.
 - Produces: `GenotypeRepositoryFactory.open(datasetId): Promise<GenotypeRepository>`.
-- Produces: `createQueryGenotypeTool(repository)`; no global repository import.
+- Produces: `createQueryGenotypeTool(repository)`; no global user-data repository import.
 
-- [ ] **Step 1: Write resolver tests**
+- [ ] **Step 1: Write manifest resolver tests**
 
-Use a fake object store and temp cache. Assert that missing manifest fails, checksum mismatch deletes the bad cache file and fails, matching checksum reuses the cache, and paths derive from checksum rather than untrusted dataset strings.
+Use a fake object store. Assert missing/unpublished manifests fail; more than 128 files or a manifest larger than 1 MiB fails; unknown layout/schema versions fail; unordered or duplicate descriptors fail; bucket/key descriptors outside `genomic-artifacts/datasets/{datasetId}/` fail; partition values must match `chrom=<value>` paths; and the canonical descriptor inventory reproduces `datasetChecksumSha256`. Assert an unknown dataset causes no Parquet S3 request.
 
-- [ ] **Step 2: Write the two-dataset isolation test first**
+- [ ] **Step 2: Write coordinate resolver tests**
 
-Create two minimal DuckDB files with opposing `rs762551` genotypes, publish fake manifests, query both repositories, and assert the results differ. Assert querying an unknown `datasetId` never returns rows from either fixture.
+Generate a deterministic reference fixture with columns `reference_version`, `reference_build`, `chrom`, `pos`, `rsid`, `ref`, `alt`, `gene`, `phenotype`, `clinical_significance`, and `evidence_note`. Cover gene and rsID resolution to exact GRCh38 `(chrom, pos, ref, alt)` targets, chromosome normalization (`chr12` to `12`), a `ReferenceBuildMismatch`, and an unknown target returning `TargetNotResolvable`. Explicitly assert an unresolved target cannot fall back to scanning all Parquet files. Liftover and complete indel left-normalization remain outside scope.
 
-- [ ] **Step 3: Run tests and observe singleton/fallback failure**
+- [ ] **Step 3: Write remote query and two-dataset isolation tests first**
 
-Run: `node --test ts-api-agent/src/infrastructure/database/dataset-artifact-resolver.test.ts ts-api-agent/src/infrastructure/database/duckdb.test.ts`
+Create two chromosome-partitioned Parquet datasets in MinIO with opposing `rs762551` genotypes and valid manifests. Query both repositories and assert different results. For a chromosome-12 target, assert only manifest files whose `chrom == "12"` and `minPos <= target.pos <= maxPos` are passed to `read_parquet`; use request accounting to assert no data read from chromosome 1 and no complete-dataset download.
 
-Expected: FAIL because the current singleton uses `genomic_data.duckdb` and silently falls back to repository fixtures.
+- [ ] **Step 4: Run tests and observe the current singleton/fallback design fail**
 
-- [ ] **Step 4: Implement manifest resolution and checksum cache**
+Run: `node --test ts-api-agent/src/infrastructure/database/*.test.ts tests/integration/remote_parquet_pruning.test.ts`
 
-Download published artifacts into `<cacheRoot>/<checksumSha256>.duckdb.part`, verify SHA-256, rename to `<cacheRoot>/<checksumSha256>.duckdb`, and open only the final path. Ensure concurrent identical downloads converge safely.
+Expected: FAIL because the current singleton uses `genomic_data.duckdb`, has no manifest/coordinate resolver, and silently falls back to fixtures.
 
-- [ ] **Step 5: Reduce `DuckDbRepository` to read-only dataset queries**
+- [ ] **Step 5: Implement strict manifest resolution and candidate-file selection**
 
-Remove fixture initialization, vector JSON storage, and exception-swallowing synthesis fallback. The constructor requires `datasetDbPath` and `referenceDbPath`; `synthesizeVariant` opens the dataset read-only, attaches the reference read-only, executes a parameterized query, and always closes connections in `finally`.
+Validate the manifest before building any SQL. Select candidates in application code by chromosome and min/max position. Return an explicit immutable URI list; never use a wildcard. Verify candidate object ETag/version, size, and checksum metadata through bounded `HEAD` calls before querying. Reject empty candidates as `TargetNotPresent` rather than broadening the scan.
 
-- [ ] **Step 6: Inject the repository into agent tools**
+- [ ] **Step 6: Implement the versioned ClinVar coordinate resolver**
+
+Build the small demo reference DuckDB once from `clinvar_coordinates_grch38.tsv`, record `demo-clinvar-grch38-v1` as its reference version, and open it read-only at serving time. Resolve targets before remote scan. The canonical match key is `(referenceBuild, normalizedChrom, pos, normalizedRef, normalizedAlt)`, with rsID retained as provenance rather than the only join key. Require the dataset manifest and ClinVar snapshot to use the same reference build and declared reference version.
+
+- [ ] **Step 7: Implement constrained in-memory DuckDB sessions**
+
+Open `:memory:`, load a DuckDB/httpfs extension version proven in Task 1, configure scoped read-only S3 credentials from trusted environment, and set:
+
+```sql
+SET memory_limit = '512MB';
+SET threads = 4;
+SET enable_http_metadata_cache = true;
+```
+
+Add a 10-second application query deadline and call the binding's interrupt/cancellation API when it expires. Always drop secrets and close the connection in `finally`. The runtime image must use a preinstalled compatible extension and must not require Internet access on the first `/ask`.
+
+- [ ] **Step 8: Implement explicit-file remote Parquet querying**
+
+Remove fixture initialization, vector JSON storage, exception-swallowing synthesis fallback, dataset-local path caching, and the global user-data repository. For each chromosome group, construct the `read_parquet([...], hive_partitioning = true)` file list exclusively from validated manifest descriptors, apply literal `chrom` plus parameterized position predicates directly above the scan, and join a small candidate relation on `pos`, `ref`, and `alt`. Do not rely on dynamic join filtering alone to prune S3 data.
+
+- [ ] **Step 9: Inject the repository into agent tools**
 
 Replace the exported singleton tool with:
 
 ```ts
 export function createQueryGenotypeTool(repository: GenotypeRepository) {
   return tool({
-    description: 'Queries the selected genomic dataset.',
+    description: 'Queries the selected published genomic dataset.',
     parameters: z.object({ targetId: z.string().min(1) }),
     execute: ({ targetId }) => repository.synthesizeVariant(targetId),
   });
 }
 ```
 
-Keep the literature repository separate and global.
+Return provenance containing dataset checksum, reference version, and files scanned. Keep the literature repository separate and global.
 
-- [ ] **Step 7: Run repository and tool tests**
+- [ ] **Step 10: Run repository, pruning, and tool tests**
 
-Run: `node --test ts-api-agent/src/infrastructure/database/*.test.ts ts-api-agent/src/infrastructure/ai/tools.test.ts`
+Run: `node --test ts-api-agent/src/infrastructure/database/*.test.ts ts-api-agent/src/infrastructure/ai/tools.test.ts tests/integration/remote_parquet_pruning.test.ts`
 
-Expected: PASS; no test creates or reads `genomic_data.duckdb` implicitly.
+Expected: PASS; no serving test creates, downloads, or reads a per-dataset `.duckdb` file, and a targeted query does not read unrelated chromosome data.
 
-- [ ] **Step 8: Commit dataset isolation**
+- [ ] **Step 11: Commit remote dataset isolation**
 
 ```bash
-git add ts-api-agent/src/infrastructure/database ts-api-agent/src/infrastructure/ai
-git commit -m "fix: scope genotype queries to published datasets"
+git add ts-api-agent/src/infrastructure/database ts-api-agent/src/infrastructure/ai tests/integration/remote_parquet_pruning.test.ts tests/fixtures/clinvar_coordinates_grch38.tsv scripts/generate_clinical_benchmark_vcf.ts
+git commit -m "feat: query partitioned genomic Parquet through DuckDB"
 ```
 
 ### Task 8: Expose the Real Dataset Lifecycle in the API and UI
@@ -631,7 +718,7 @@ git commit -m "fix: scope genotype queries to published datasets"
 
 - [ ] **Step 1: Write API validation tests**
 
-Assert the catalog returns only two seeded entries; arbitrary S3/HTTP/path keys return `400`; ingestion returns `202` with fresh `datasetId` and `workflowId`; `/ask` without `datasetId` returns `400`; `/ask` for an unpublished dataset returns `409`; a published dataset reaches the injected agent.
+Assert the catalog returns only two seeded entries; arbitrary S3/HTTP/path keys return `400`; ingestion returns `202` with fresh `datasetId` and `workflowId`; `/ask` without `datasetId` returns `400`; `/ask` for an unpublished dataset returns `409`; and API input cannot contain a Parquet URI or override manifest files. Cover `DatasetNotPublished`, `ReferenceBuildMismatch`, `TargetNotResolvable`, `RemoteDatasetUnavailable`, and `QueryBudgetExceeded` without substituting fixture results.
 
 - [ ] **Step 2: Run API tests and observe current simulation behavior fail**
 
@@ -641,7 +728,7 @@ Expected: FAIL because the current endpoint accepts `fileKey`, derives `userId` 
 
 - [ ] **Step 3: Implement explicit dependency construction**
 
-Export `createApp(dependencies)` so tests inject Temporal client, catalog, artifact resolver, and agent factory. Runtime startup builds real adapters. Remove module-load fixture initialization and global mutable fallback maps.
+Export `createApp(dependencies)` so tests inject Temporal client, catalog, Parquet dataset resolver, coordinate resolver, DuckDB session factory, and agent factory. Runtime startup builds real adapters. Remove module-load fixture initialization and global mutable fallback maps.
 
 - [ ] **Step 4: Implement catalog and ingestion endpoints**
 
@@ -649,7 +736,7 @@ Generate `datasetId` and `workflowId` in the API before Workflow start. Start on
 
 - [ ] **Step 5: Implement dataset-scoped ask endpoint**
 
-Resolve the published artifact first, construct the request-scoped genotype repository and tools, then call the agent. Return provenance containing `datasetId`, artifact checksum, and reference version.
+Resolve the published manifest first, construct the request-scoped remote-Parquet genotype repository and tools, then call the agent. Return provenance containing `datasetId`, `datasetChecksumSha256`, manifest/layout version, reference version, and the exact files scanned.
 
 - [ ] **Step 6: Update the zero-build UI**
 
@@ -679,6 +766,7 @@ git commit -m "feat: expose published dataset lifecycle"
 - Modify: `docker-compose.prod.yml`
 - Create: `tests/integration/cross_language_ingestion.test.ts`
 - Create: `tests/integration/dataset_isolation.test.ts`
+- Modify: `tests/integration/remote_parquet_pruning.test.ts`
 - Modify: `ts-api-agent/src/test_e2e.ts`
 - Modify: `ts-api-agent/package.json`
 - Modify: `package.json`
@@ -700,24 +788,29 @@ The test must:
 1. seed `demo-small`;
 2. call `POST /api/ingestions`;
 3. wait for real Temporal completion;
-4. read the manifest from MinIO;
-5. assert the artifact checksum and positive variant count;
+4. read the manifest from MinIO and assert it was written only after all declared Parquet objects existed;
+5. assert the dataset checksum, positive variant count, chromosome partition layout, sorted/canonical file inventory, and every object's ETag/size/checksum metadata;
 6. call `/ask` with the returned `datasetId` and a known gene;
-7. assert response provenance contains the same dataset ID and checksum.
+7. assert response provenance contains the same dataset ID, dataset checksum, reference version, and exact files scanned;
+8. assert no local per-dataset `.duckdb` artifact was downloaded by the API.
 
 - [ ] **Step 3: Write the dataset-isolation E2E test**
 
-Ingest two small fixtures with opposite genotypes under two allowlisted test catalog entries injected only in the test process. Query both and assert no cross-dataset row or cache reuse by dataset path.
+Ingest two small fixtures with opposite genotypes under two allowlisted test catalog entries injected only in the test process. Query both and assert no cross-dataset row or Parquet URI leakage. Corrupt or remove one declared partition and assert an explicit remote-dataset failure rather than partial evidence.
 
-- [ ] **Step 4: Create production-style Worker images**
+- [ ] **Step 4: Write the remote-pruning E2E test**
 
-The Rust Dockerfile compiles `temporal_worker` in a builder stage and copies only the release binary plus CA certificates into runtime. The TS image installs locked production dependencies and runs either API or control-plane Worker by command. No runtime container invokes Cargo.
+Ingest data containing at least chromosomes 1 and 12. Resolve a known chromosome-12 gene, then prove from the repository's selected-file provenance plus MinIO request accounting that chromosome-1 data is not read and that the full chromosome-12 object is not downloaded. Record selected files, S3 requests, bytes read, and query latency.
 
-- [ ] **Step 5: Wire explicit services and health dependencies**
+- [ ] **Step 5: Create production-style Worker images**
 
-Compose services are `temporal`, `minio`, `qdrant`, `ts-api`, `ts-control-worker`, and `rust-ingestion-worker`. Both Workers use the same Temporal namespace but different queues. Give Rust bounded CPU/memory configuration and a writable temp directory; do not mount a shared DuckDB volume between TS and Rust.
+The Rust Dockerfile compiles `temporal_worker` in a builder stage and copies only the release binary plus CA certificates into runtime. The TS image installs locked production dependencies and a DuckDB `httpfs` extension matching the binding/engine version proven in Task 1, then runs either API or control-plane Worker by command. Verify the image can query MinIO with external network disabled; no runtime container invokes Cargo or downloads an extension from the Internet.
 
-- [ ] **Step 6: Run the full verification matrix**
+- [ ] **Step 6: Wire explicit services and health dependencies**
+
+Compose services are `temporal`, `minio`, `qdrant`, `ts-api`, `ts-control-worker`, and `rust-ingestion-worker`. Both Workers use the same Temporal namespace but different queues. Give Rust bounded CPU/memory/temp-disk configuration. Give API scoped read-only access to `genomic-artifacts/datasets/`, S3 request timeouts, and query limits. Do not mount a shared user-data volume between TS and Rust. Add a lifecycle policy or documented cleanup command for orphan version/attempt prefixes.
+
+- [ ] **Step 7: Run the full verification matrix**
 
 Run: `npm test`
 
@@ -731,11 +824,15 @@ Run: `npm run build --workspace=ts-api-agent`
 
 Expected: all commands PASS; Temporal UI shows `buildDatasetArtifact` on `genomic-ingestion-rust` with Rust worker identity and heartbeat details.
 
-- [ ] **Step 7: Update documentation truthfully**
+- [ ] **Step 8: Verify serving-path invariants**
 
-Document seeded dataset simulation, per-dataset immutable DuckDB artifacts, global ClinVar/PubMed roles, Public Preview Rust SDK status, task queues, failure/retry semantics, and exact demo commands. Remove `production-ready`, fabricated throughput claims without benchmark methodology, fake Tokio/Temporal heartbeat claims, and statements that synthetic abstracts are real PubMed abstracts.
+Search production code and assert there is no per-dataset `.duckdb` download/cache, no `read_parquet` wildcard, no user-supplied S3 URI, no unresolved-target full scan, no runtime fixture fallback, and no production shell launch of Rust. Confirm metrics/log fields include selected file count, bytes read, S3 request count, query latency, dataset checksum, and reference version.
 
-- [ ] **Step 8: Commit the interview-ready vertical slice**
+- [ ] **Step 9: Update documentation truthfully**
+
+Document seeded dataset simulation, local DuckDB processing, immutable chromosome-partitioned Parquet in S3, in-memory DuckDB remote queries, global ClinVar/PubMed roles, coordinate/allele resolution, Public Preview Rust SDK status, task queues, failure/retry semantics, query limits, and exact demo commands. Remove claims about per-dataset serving DuckDB files/local checksum caches, `production-ready`, fabricated throughput without benchmark methodology, fake Temporal heartbeat behavior, and synthetic abstracts described as real abstracts.
+
+- [ ] **Step 10: Commit the interview-ready vertical slice**
 
 ```bash
 git add rust-ingestion-worker/Dockerfile ts-api-agent/Dockerfile docker-compose.yml docker-compose.prod.yml tests ts-api-agent/src/test_e2e.ts ts-api-agent/package.json package.json Makefile README.md GUIDE.md
@@ -758,12 +855,12 @@ Suggested subagent ownership:
 - API/UI agent: Task 8.
 - Integration owner: Task 9 and final verification.
 
-The recommended stopping point is Task 9. PubMed real-abstract ingestion, full ClinVar normalization, Parquet export, authentication, and multi-tenant authorization should be separate follow-up plans.
+The recommended stopping point is Task 9. PubMed real-abstract ingestion, full ClinVar normalization/liftover, a general lakehouse table format, authentication, and multi-tenant authorization should be separate follow-up plans.
 
 ## Self-Review Result
 
 - Every design requirement maps to at least one task.
 - Cross-language names, task queues, object keys, failure types, and manifest fields are consistent across tasks.
-- The main SDK risk is tested before VCF/S3 refactoring.
+- The Temporal SDK risk and remote DuckDB/Parquet pruning risk are tested before VCF/S3 refactoring.
 - Runtime fixture substitution, shell execution, global DuckDB state, and false completion are explicitly removed.
 - No Qdrant or LLM work blocks the deterministic ingestion/query vertical slice.
