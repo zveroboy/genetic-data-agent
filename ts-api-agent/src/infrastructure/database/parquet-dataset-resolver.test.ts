@@ -35,12 +35,12 @@ import {
   type ObjectStore,
   headManyBounded,
 } from '../object-store/object-store.ts';
+import { ObjectVerificationError } from '../../application/object-identity.ts';
 import {
   DatasetNotPublishedError,
   DatasetResolutionError,
   MAX_DATASET_PARQUET_OBJECTS,
   MAX_MANIFEST_BYTES,
-  ParquetObjectVerificationError,
   TargetNotPresentError,
   createParquetDatasetResolver,
   selectCandidateObjects,
@@ -550,7 +550,7 @@ describe('candidate object verification', () => {
     const error = await resolveAndVerify((store) =>
       store.objects.delete(`${ARTIFACT_BUCKET}/${CHROM_12.key}`),
     );
-    assert.ok(error instanceof ParquetObjectVerificationError, `unexpected error: ${error}`);
+    assert.ok(error instanceof ObjectVerificationError, `unexpected error: ${error}`);
     assert.equal(error.code, 'OBJECT_MISSING');
   });
 
@@ -559,8 +559,11 @@ describe('candidate object verification', () => {
       const id = `${ARTIFACT_BUCKET}/${CHROM_12.key}`;
       store.objects.set(id, { ...store.objects.get(id)!, etag: 'replaced' });
     });
-    assert.ok(error instanceof ParquetObjectVerificationError, `unexpected error: ${error}`);
+    assert.ok(error instanceof ObjectVerificationError, `unexpected error: ${error}`);
     assert.equal(error.code, 'ETAG_MISMATCH');
+    // Serving verifies against the published manifest, and says so — the same shared verifier
+    // publication uses, told which document made the claim it is contradicting.
+    assert.match(error.message, /the manifest declares/);
   });
 
   it('refuses to query an object whose size drifted from the manifest', async () => {
@@ -568,7 +571,7 @@ describe('candidate object verification', () => {
       const id = `${ARTIFACT_BUCKET}/${CHROM_12.key}`;
       store.objects.set(id, { ...store.objects.get(id)!, body: 'truncated' });
     });
-    assert.ok(error instanceof ParquetObjectVerificationError, `unexpected error: ${error}`);
+    assert.ok(error instanceof ObjectVerificationError, `unexpected error: ${error}`);
     assert.equal(error.code, 'SIZE_MISMATCH');
   });
 
@@ -577,14 +580,14 @@ describe('candidate object verification', () => {
       const id = `${ARTIFACT_BUCKET}/${CHROM_12.key}`;
       store.objects.set(id, { ...store.objects.get(id)!, checksumSha256: null });
     });
-    assert.ok(missing instanceof ParquetObjectVerificationError, `unexpected error: ${missing}`);
+    assert.ok(missing instanceof ObjectVerificationError, `unexpected error: ${missing}`);
     assert.equal(missing.code, 'CHECKSUM_METADATA_MISSING');
 
     const wrong = await resolveAndVerify((store) => {
       const id = `${ARTIFACT_BUCKET}/${CHROM_12.key}`;
       store.objects.set(id, { ...store.objects.get(id)!, checksumSha256: sha256Hex('other') });
     });
-    assert.ok(wrong instanceof ParquetObjectVerificationError, `unexpected error: ${wrong}`);
+    assert.ok(wrong instanceof ObjectVerificationError, `unexpected error: ${wrong}`);
     assert.equal(wrong.code, 'CHECKSUM_METADATA_MISMATCH');
   });
 

@@ -50,10 +50,10 @@ import {
 
 import { UnknownDatasetKeyError } from './dataset-catalog.ts';
 import {
-  DatasetObjectVerificationError,
   DatasetPublicationConflict,
   DatasetSourceUnavailableError,
 } from './control-plane-activities.ts';
+import { ObjectVerificationError } from './object-identity.ts';
 import {
   BuildDatasetArtifactInputSchema,
   BuildDatasetArtifactResultSchema,
@@ -458,7 +458,7 @@ describe('retry classification', () => {
     const deterministic: Error[] = [
       new UnknownDatasetKeyError('s3://attacker/file.vcf'),
       new ContractValidationError('BUCKET_MISMATCH', 'wrong bucket'),
-      new DatasetObjectVerificationError('ETAG_MISMATCH', 'a/b.parquet', 'differs'),
+      new ObjectVerificationError('ETAG_MISMATCH', 'a/b.parquet', 'differs'),
       new DatasetPublicationConflict('datasets/ds/manifest.json', 'already published'),
       BuildDatasetArtifactInputSchema.safeParse({}).error!,
     ];
@@ -472,7 +472,7 @@ describe('retry classification', () => {
       }
       // The verification error's constructor name is what Temporal matches, but the frozen wire
       // name differs; both spellings must be classified the same way.
-      assert.ok(activity.nonRetryableErrorTypes.includes('DatasetObjectVerificationFailed'));
+      assert.ok(activity.nonRetryableErrorTypes.includes('ObjectVerificationFailed'));
     }
   });
 
@@ -598,7 +598,7 @@ describe('object verification failure leaves the dataset unpublished', () => {
     await env.complete(2, GOLDEN_RESULT);
     await env.fail(
       3,
-      new DatasetObjectVerificationError(
+      new ObjectVerificationError(
         'CHECKSUM_METADATA_MISMATCH',
         GOLDEN_RESULT.parquetObjects[1]!.key,
         'content changed after upload',

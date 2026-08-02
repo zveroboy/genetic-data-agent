@@ -67,12 +67,12 @@ export const NON_RETRYABLE_CONTROL_PLANE_ERROR_TYPES = [
   'ContractValidationError',
   /**
    * A published object does not match the identity the inventory declares. Listed under both
-   * spellings: Temporal matches the constructor name, while `contracts/ingestion-v1.md` and the
-   * error's own `name` use `DatasetObjectVerificationFailed`, so an `ApplicationFailure` raised
-   * with the frozen wire name is classified the same way.
+   * spellings: Temporal matches the constructor name, while the error's own `name` — the
+   * spelling that reaches an operator and the HTTP layer — is `ObjectVerificationFailed`, so an
+   * `ApplicationFailure` raised with that name is classified the same way.
    */
-  'DatasetObjectVerificationError',
-  'DatasetObjectVerificationFailed',
+  'ObjectVerificationError',
+  'ObjectVerificationFailed',
   /** A different, already published manifest owns this dataset id. */
   'DatasetPublicationConflict',
   /** A payload does not match the frozen wire schema. */

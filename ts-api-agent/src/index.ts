@@ -98,7 +98,7 @@ const ERROR_STATUS: Readonly<Record<string, ContentfulStatusCode>> = Object.free
   IngestionRunNotFound: 404,
 
   DatasetNotPublished: 409,
-  ParquetObjectVerificationFailed: 409,
+  ObjectVerificationFailed: 409,
   ReferenceSnapshotMismatch: 409,
   ReferenceBuildMismatch: 409,
   DatasetPublicationConflict: 409,

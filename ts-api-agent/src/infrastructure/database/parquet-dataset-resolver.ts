@@ -29,11 +29,8 @@ import {
   type ParquetObject,
 } from '../../application/ingestion-contracts.ts';
 import { manifestKeyFor } from '../../application/control-plane-activities.ts';
-import {
-  DEFAULT_HEAD_CONCURRENCY,
-  type ObjectHead,
-  type ObjectStore,
-} from '../object-store/object-store.ts';
+import { verifyObjectIdentities } from '../../application/object-identity.ts';
+import { DEFAULT_HEAD_CONCURRENCY, type ObjectStore } from '../object-store/object-store.ts';
 
 /**
  * Upper bound on the inventory a single query may consider. A human dataset partitioned by
@@ -116,33 +113,6 @@ export class TargetNotPresentError extends Error {
   }
 }
 
-/**
- * Codes mirrored from the control plane's publication-time verification
- * (`ObjectVerificationCode` in `application/control-plane-activities.ts`). Serving re-checks
- * the same identity because a manifest can outlive the objects it describes.
- */
-export type ParquetObjectVerificationCode =
-  | 'OBJECT_MISSING'
-  | 'ETAG_MISSING'
-  | 'ETAG_MISMATCH'
-  | 'VERSION_ID_MISMATCH'
-  | 'SIZE_MISMATCH'
-  | 'CHECKSUM_METADATA_MISSING'
-  | 'CHECKSUM_METADATA_MISMATCH';
-
-/** Raised when a candidate object no longer matches the identity its manifest declares. */
-export class ParquetObjectVerificationError extends Error {
-  readonly code: ParquetObjectVerificationCode;
-  readonly key: string;
-
-  constructor(code: ParquetObjectVerificationCode, key: string, detail: string) {
-    super(`${code}: object '${key}' ${detail}`);
-    this.name = 'ParquetObjectVerificationFailed';
-    this.code = code;
-    this.key = key;
-  }
-}
-
 /** A validated, queryable dataset. Nothing outside this shape may reach a SQL string. */
 export interface ResolvedParquetDataset {
   readonly datasetId: string;
@@ -211,63 +181,6 @@ export function selectCandidateObjects(
         target.pos <= object.maxPos,
     ),
   );
-}
-
-/**
- * Checks one candidate against the identity its descriptor declares, immediately before the
- * scan. Everything the query trusts — ETag, version, size and content checksum — is compared,
- * so an object silently replaced or truncated after publication is refused rather than read.
- *
- * This deliberately repeats the control plane's publication-time check
- * (`verifyPublishedObject`): publication proves the objects were right *then*, and a manifest
- * is long lived.
- */
-function verifyCandidateObject(object: ParquetObject, head: ObjectHead | null): void {
-  if (head === null) {
-    throw new ParquetObjectVerificationError(
-      'OBJECT_MISSING',
-      object.key,
-      'is declared by the manifest but does not exist',
-    );
-  }
-  if (head.etag === null) {
-    throw new ParquetObjectVerificationError('ETAG_MISSING', object.key, 'is stored without an ETag');
-  }
-  if (head.etag !== object.etag) {
-    throw new ParquetObjectVerificationError(
-      'ETAG_MISMATCH',
-      object.key,
-      `has ETag '${head.etag}', the manifest declares '${object.etag}'`,
-    );
-  }
-  if (head.versionId !== object.versionId) {
-    throw new ParquetObjectVerificationError(
-      'VERSION_ID_MISMATCH',
-      object.key,
-      `has version '${head.versionId}', the manifest declares '${object.versionId}'`,
-    );
-  }
-  if (head.contentLength !== object.byteSize) {
-    throw new ParquetObjectVerificationError(
-      'SIZE_MISMATCH',
-      object.key,
-      `is ${head.contentLength} bytes, the manifest declares ${object.byteSize}`,
-    );
-  }
-  if (head.checksumSha256 === null) {
-    throw new ParquetObjectVerificationError(
-      'CHECKSUM_METADATA_MISSING',
-      object.key,
-      'carries no SHA-256 content metadata',
-    );
-  }
-  if (head.checksumSha256 !== object.checksumSha256) {
-    throw new ParquetObjectVerificationError(
-      'CHECKSUM_METADATA_MISMATCH',
-      object.key,
-      `has content checksum '${head.checksumSha256}', the manifest declares '${object.checksumSha256}'`,
-    );
-  }
 }
 
 export function createParquetDatasetResolver(
@@ -391,13 +304,12 @@ export function createParquetDatasetResolver(
         }
       }
 
-      const heads = await objectStore.headMany(
-        candidates.map((object) => ({ bucket: object.bucket, key: object.key })),
-        { concurrency: headConcurrency },
-      );
-      for (const [index, candidate] of candidates.entries()) {
-        verifyCandidateObject(candidate, heads[index] ?? null);
-      }
+      // The same checks publication ran, re-run immediately before the scan: publication proves
+      // the objects were right *then*, and a manifest is long lived.
+      await verifyObjectIdentities(objectStore, candidates, {
+        declaredBy: 'manifest',
+        concurrency: headConcurrency,
+      });
 
       return candidates.map(parquetObjectUri);
     },

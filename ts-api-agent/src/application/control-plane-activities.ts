@@ -31,14 +31,13 @@ import {
   LAYOUT_VERSION,
   PARQUET_SCHEMA_FINGERPRINT,
   PARTITION_SPEC,
-  type ParquetObject,
   SCHEMA_VERSION,
   SORT_ORDER,
   allowedPrefixFor,
 } from './ingestion-contracts.ts';
+import { verifyObjectIdentities } from './object-identity.ts';
 import {
   DEFAULT_HEAD_CONCURRENCY,
-  type ObjectHead,
   type ObjectLocation,
   type ObjectStore,
 } from '../infrastructure/object-store/object-store.ts';
@@ -67,28 +66,6 @@ export class DatasetSourceUnavailableError extends Error {
   }
 }
 
-export type ObjectVerificationCode =
-  | 'OBJECT_MISSING'
-  | 'ETAG_MISSING'
-  | 'ETAG_MISMATCH'
-  | 'VERSION_ID_MISMATCH'
-  | 'SIZE_MISMATCH'
-  | 'CHECKSUM_METADATA_MISSING'
-  | 'CHECKSUM_METADATA_MISMATCH';
-
-/** Raised when a published object does not match the identity the inventory declares. */
-export class DatasetObjectVerificationError extends Error {
-  readonly code: ObjectVerificationCode;
-  readonly key: string;
-
-  constructor(code: ObjectVerificationCode, key: string, detail: string) {
-    super(`${code}: object '${key}' ${detail}`);
-    this.name = 'DatasetObjectVerificationFailed';
-    this.code = code;
-    this.key = key;
-  }
-}
-
 /** Raised when a different manifest is already published for the same dataset. */
 export class DatasetPublicationConflict extends Error {
   readonly key: string;
@@ -114,59 +91,6 @@ export interface ControlPlaneActivities {
     input: BuildDatasetArtifactInput,
     result: BuildDatasetArtifactResult,
   ): Promise<DatasetManifest>;
-}
-
-/**
- * Checks one published object against the identity its descriptor declares. Every field the
- * later query path trusts — ETag, version, size and content checksum — is compared, so a
- * silently replaced or truncated object cannot reach a manifest.
- */
-function verifyPublishedObject(object: ParquetObject, head: ObjectHead | null): void {
-  if (head === null) {
-    throw new DatasetObjectVerificationError(
-      'OBJECT_MISSING',
-      object.key,
-      'is declared by the inventory but does not exist',
-    );
-  }
-  if (head.etag === null) {
-    throw new DatasetObjectVerificationError('ETAG_MISSING', object.key, 'was stored without an ETag');
-  }
-  if (head.etag !== object.etag) {
-    throw new DatasetObjectVerificationError(
-      'ETAG_MISMATCH',
-      object.key,
-      `has ETag '${head.etag}', the inventory declares '${object.etag}'`,
-    );
-  }
-  if (head.versionId !== object.versionId) {
-    throw new DatasetObjectVerificationError(
-      'VERSION_ID_MISMATCH',
-      object.key,
-      `has version '${head.versionId}', the inventory declares '${object.versionId}'`,
-    );
-  }
-  if (head.contentLength !== object.byteSize) {
-    throw new DatasetObjectVerificationError(
-      'SIZE_MISMATCH',
-      object.key,
-      `is ${head.contentLength} bytes, the inventory declares ${object.byteSize}`,
-    );
-  }
-  if (head.checksumSha256 === null) {
-    throw new DatasetObjectVerificationError(
-      'CHECKSUM_METADATA_MISSING',
-      object.key,
-      'carries no SHA-256 content metadata',
-    );
-  }
-  if (head.checksumSha256 !== object.checksumSha256) {
-    throw new DatasetObjectVerificationError(
-      'CHECKSUM_METADATA_MISMATCH',
-      object.key,
-      `has content checksum '${head.checksumSha256}', the inventory declares '${object.checksumSha256}'`,
-    );
-  }
 }
 
 /** Assembles the manifest from the validated input/result pair. Nothing is taken on trust. */
@@ -287,13 +211,12 @@ export function createControlPlaneActivities(
       const manifest = buildManifest(parsedInput, parsedResult);
       assertValidDatasetManifest(manifest, { expectedBucket: parsedInput.target.bucket });
 
-      const heads = await objectStore.headMany(
-        manifest.parquetObjects.map((object) => ({ bucket: object.bucket, key: object.key })),
-        { concurrency: headConcurrency },
-      );
-      for (const [index, object] of manifest.parquetObjects.entries()) {
-        verifyPublishedObject(object, heads[index] ?? null);
-      }
+      // Same checks the serving path re-runs before every scan; publication proves them once
+      // for the whole inventory, in canonical order, before the manifest exists.
+      await verifyObjectIdentities(objectStore, manifest.parquetObjects, {
+        declaredBy: 'inventory',
+        concurrency: headConcurrency,
+      });
 
       const manifestLocation: ObjectLocation = {
         bucket: parsedInput.target.bucket,

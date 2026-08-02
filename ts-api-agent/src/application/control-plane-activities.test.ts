@@ -42,9 +42,9 @@ import {
   type ObjectStore,
   headManyBounded,
 } from '../infrastructure/object-store/object-store.ts';
+import { ObjectVerificationError } from './object-identity.ts';
 import {
   DEFAULT_ARTIFACT_VERSION,
-  DatasetObjectVerificationError,
   DatasetPublicationConflict,
   DatasetSourceUnavailableError,
   createControlPlaneActivities,
@@ -518,7 +518,7 @@ describe('publishDataset writes no manifest when verification fails', () => {
         }),
       );
       return pair;
-    }, DatasetObjectVerificationError);
+    }, ObjectVerificationError);
   });
 
   it('when a HEAD request fails outright', async () => {
@@ -548,7 +548,7 @@ describe('publishDataset writes no manifest when verification fails', () => {
     await assert.rejects(
       () => publishDataset(pair.input, pair.result),
       (error: unknown) => {
-        assert.ok(error instanceof DatasetObjectVerificationError);
+        assert.ok(error instanceof ObjectVerificationError);
         assert.equal(error.code, 'ETAG_MISSING');
         return true;
       },
@@ -558,11 +558,21 @@ describe('publishDataset writes no manifest when verification fails', () => {
   });
 
   it('when a declared ETag does not match the stored object', async () => {
-    await expectNoPublication((store) => {
-      const pair = goldenPair(store);
-      pair.result.parquetObjects[0]!.etag = 'an-etag-from-another-upload';
-      return pair;
-    }, DatasetObjectVerificationError);
+    await expectNoPublication(
+      (store) => {
+        const pair = goldenPair(store);
+        pair.result.parquetObjects[0]!.etag = 'an-etag-from-another-upload';
+        return pair;
+      },
+      (error: unknown) => {
+        assert.ok(error instanceof ObjectVerificationError);
+        assert.equal(error.code, 'ETAG_MISMATCH');
+        // Publication verifies against the uploaded inventory, and says so: the shared verifier
+        // is told which document made the claim it is contradicting.
+        assert.match(error.message, /the inventory declares/);
+        return true;
+      },
+    );
   });
 
   it('when a declared version ID does not match the stored object', async () => {
@@ -570,7 +580,7 @@ describe('publishDataset writes no manifest when verification fails', () => {
       const pair = goldenPair(store);
       pair.result.parquetObjects[1]!.versionId = 'some-other-version';
       return pair;
-    }, DatasetObjectVerificationError);
+    }, ObjectVerificationError);
   });
 
   it('when the stored size contradicts the declared byte size', async () => {
@@ -583,7 +593,7 @@ describe('publishDataset writes no manifest when verification fails', () => {
         checksumSha256: object.checksumSha256,
       });
       return pair;
-    }, DatasetObjectVerificationError);
+    }, ObjectVerificationError);
   });
 
   it('when the stored object carries no checksum metadata', async () => {
@@ -596,7 +606,7 @@ describe('publishDataset writes no manifest when verification fails', () => {
         checksumSha256: null,
       });
       return pair;
-    }, DatasetObjectVerificationError);
+    }, ObjectVerificationError);
   });
 
   it('when the checksum metadata contradicts the declared content checksum', async () => {
@@ -609,7 +619,7 @@ describe('publishDataset writes no manifest when verification fails', () => {
         checksumSha256: 'f'.repeat(64),
       });
       return pair;
-    }, DatasetObjectVerificationError);
+    }, ObjectVerificationError);
   });
 
   it('when the attempt prefix escapes the dataset version prefix', async () => {
