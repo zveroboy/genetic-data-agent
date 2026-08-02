@@ -231,7 +231,16 @@ fn load_annotation_fixture(conn: &Connection) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Serialises the two tests below that touch the process's current directory.
+    ///
+    /// `std::env::set_current_dir` mutates global process state, and this test binary runs
+    /// tests on multiple threads by default. Every test that reads or writes the process cwd
+    /// takes this lock first, so the mutating test below can never interleave with the test
+    /// that reads `env::current_dir()`.
+    static CURRENT_DIRECTORY_MUTEX: Mutex<()> = Mutex::new(());
 
     /// The regression this guard exists for: `rust-ingestion-worker in.vcf out.duckdb .` must
     /// not recursively delete the operator's working directory.
@@ -273,15 +282,23 @@ mod tests {
         assert!(!supplied.exists());
     }
 
-    /// Even `--force-clean` does not license deleting the directory the process is running in.
+    /// Checks the pure predicate `clear_previous_run` relies on against the real process cwd,
+    /// rather than calling `clear_previous_run` itself against `env::current_dir()`: a
+    /// `clear_previous_run` call against the actual current directory (or its parent) would
+    /// recursively `remove_dir_all` the crate — or the repository's parent — the day this guard
+    /// regresses. See `clear_previous_run_refuses_to_delete_an_ancestor_of_the_process_cwd`
+    /// below for the test that exercises `clear_previous_run`'s guard branch itself, safely,
+    /// against a temp directory instead.
     ///
-    /// This asserts the pure predicate `clear_previous_run` relies on, rather than calling
-    /// `clear_previous_run` itself against the real `env::current_dir()`: a `clear_previous_run`
-    /// call against the actual current directory (or its parent) would recursively
-    /// `remove_dir_all` the crate — or the repository's parent — the day this guard regresses.
-    /// Every `clear_previous_run` call in this module's tests stays pointed at `TempDir` paths.
+    /// Takes `CURRENT_DIRECTORY_MUTEX` because it reads the live process cwd, and the test below
+    /// mutates it; without the lock the two could interleave and this test could observe a cwd
+    /// that is mid-move.
     #[test]
-    fn never_clears_the_current_directory_even_with_the_flag() {
+    fn contains_current_directory_recognises_the_current_directory_and_its_ancestors() {
+        let _serialize_cwd_access = CURRENT_DIRECTORY_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let current = env::current_dir().expect("current directory");
         assert!(
             contains_current_directory(&current),
@@ -293,6 +310,62 @@ mod tests {
             contains_current_directory(&parent),
             "an ancestor of the current directory must also be recognised"
         );
+    }
+
+    /// Exercises `clear_previous_run`'s guard branch itself — not just the pure predicate —
+    /// without ever pointing a deletion at a real path outside a `TempDir`.
+    ///
+    /// `std::env::set_current_dir` is process-global and this test binary runs tests in
+    /// parallel by default, so a test that moves the cwd could corrupt any concurrently running
+    /// test that resolves a relative path. Two things make this safe:
+    /// 1. `CURRENT_DIRECTORY_MUTEX` is held for the whole test, and the only other test in this
+    ///    module that reads the process cwd (`contains_current_directory_recognises_the_current_directory_and_its_ancestors`)
+    ///    takes the same lock, so the two can never interleave. No other test in this module
+    ///    reads or writes the process cwd.
+    /// 2. The original cwd is restored on every exit path: explicitly right after the call under
+    ///    test (so the temp directory's own `Drop` never runs while the cwd still points inside
+    ///    it), and via an RAII guard whose `Drop` restores it too, in case anything above panics
+    ///    first.
+    #[test]
+    fn clear_previous_run_refuses_to_delete_an_ancestor_of_the_process_cwd() {
+        let _serialize_cwd_access = CURRENT_DIRECTORY_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        struct RestoreCurrentDirectory(PathBuf);
+        impl Drop for RestoreCurrentDirectory {
+            fn drop(&mut self) {
+                // Best-effort: if this fails during an unwind there is nothing more to do, and
+                // panicking again from a `Drop` during a panic would abort the process.
+                let _ = env::set_current_dir(&self.0);
+            }
+        }
+
+        let original_cwd = env::current_dir().expect("read the current directory");
+        // Held for the rest of the test so a panic before the explicit restore below still
+        // restores the cwd on unwind.
+        let _restore_on_unwind = RestoreCurrentDirectory(original_cwd.clone());
+
+        let root = TempDir::new().expect("temp dir");
+        let nested = root.path().join("nested").join("deeper");
+        fs::create_dir_all(&nested).expect("create nested directories");
+
+        env::set_current_dir(&nested).expect("move the process cwd into the temp tree");
+
+        // `root` is an ancestor of the new cwd — entirely inside this temp tree, never a real
+        // checkout — so this proves the guard fires even with `force_clean = true`.
+        let result = clear_previous_run(root.path(), true, true);
+
+        env::set_current_dir(&original_cwd).expect("restore the current directory");
+
+        let error = result.expect_err(
+            "clear_previous_run must refuse to delete an ancestor of the current directory",
+        );
+        assert!(
+            error.to_string().contains("current directory"),
+            "the error must name the current-directory guard: {error}"
+        );
+        assert!(root.path().exists(), "nothing may have been deleted");
     }
 
     #[test]
