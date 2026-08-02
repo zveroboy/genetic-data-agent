@@ -462,12 +462,15 @@ async fn the_store_enforces_if_match_on_a_get() {
     .await;
 }
 
-/// A full-genome VCF does not fit in memory, so the body is streamed to disk. This uses an
-/// object far larger than any single read buffer and checks the bytes arrive intact and in
-/// order — a chunked writer that dropped or reordered a chunk changes the digest.
+/// The download writes in fixed-size chunks (see `download_exact`'s `DOWNLOAD_BUFFER_BYTES`
+/// write-behind buffer), so a large object must still land byte-for-byte and in order: a
+/// chunked writer that dropped or reordered a chunk changes the digest. This test proves chunk
+/// ordering and integrity over a 12 MiB object; it does not — and cannot, from outside the
+/// process — observe memory usage, so it is not evidence that the transfer avoids buffering the
+/// whole object in memory. That property is verified by code inspection of `stream_to_file`.
 #[tokio::test]
 #[ignore = "requires MinIO: docker compose up -d minio"]
-async fn streams_a_large_source_to_a_temp_file_without_buffering_it() {
+async fn downloads_a_large_source_intact_and_in_order() {
     with_bucket("dl-stream", |client, config, bucket| async move {
         const SIZE: usize = 12 * 1024 * 1024;
         let body = pseudo_random_bytes(SIZE, 0x5eed_1234);

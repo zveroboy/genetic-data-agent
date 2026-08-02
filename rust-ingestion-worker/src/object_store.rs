@@ -40,7 +40,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use tokio::io::AsyncWriteExt;
 
-use crate::contracts::{FailureType, SourceObject};
+use crate::contracts::{FailureType, SourceObject, VARIANTS_SEGMENT};
 
 /// S3 user metadata entry carrying the lowercase hex SHA-256 of an object's content.
 /// Mirrors `CHECKSUM_METADATA_KEY` in `object-store.ts`; the wire header is
@@ -210,7 +210,8 @@ pub struct UploadRequest<'a> {
     pub attempt_prefix: &'a str,
     /// The full destination key. Must be strictly below `attempt_prefix`. The caller composes
     /// it as `{attempt_prefix}variants/{relative_path}`; this adapter does not add or remove a
-    /// segment, it only refuses a key that escapes the prefix.
+    /// segment — Task 5 still owns composing the key — it only refuses one that escapes the
+    /// prefix or never enters the `variants/` segment (defence in depth).
     pub key: &'a str,
     pub local_path: &'a Path,
     /// Lowercase hex SHA-256 of the file's bytes, published as the `sha256` user metadata entry.
@@ -334,7 +335,13 @@ impl S3ObjectStore {
         }
         let written = outcome?;
 
-        let after = self.head_source(source).await?;
+        let after = match self.head_source(source).await {
+            Ok(after) => after,
+            Err(error) => {
+                remove_partial(destination);
+                return Err(error);
+            }
+        };
         if let Err(error) = assert_source_identity(source, &after, "after the download") {
             remove_partial(destination);
             return Err(error);
@@ -430,8 +437,15 @@ impl S3ObjectStore {
                 )
             })?;
 
+        let etag = canonical_etag(response.e_tag()).ok_or_else(|| {
+            ObjectStoreError::Unavailable(format!(
+                "'{}/{}' was HEADed without an ETag; its identity cannot be verified",
+                source.bucket, source.key
+            ))
+        })?;
+
         Ok(ObservedSource {
-            etag: canonical_etag(response.e_tag()).unwrap_or_default(),
+            etag,
             version_id: response.version_id().map(str::to_string),
             content_length: response.content_length().unwrap_or(-1),
         })
@@ -568,6 +582,12 @@ fn validate_bucket(bucket: &str) -> Result<(), ObjectStoreError> {
 /// so the check is textual and rejects anything whose segments are not plain names: a `..`
 /// segment, an empty segment, a bare `.`, a backslash or a control character. A destination
 /// derived from file content rather than from Temporal metadata fails here.
+///
+/// It also requires the relative path to begin with the `variants/` segment
+/// ([`VARIANTS_SEGMENT`]) — defence in depth. Task 5 still owns composing
+/// `{attemptPrefix}variants/{relativePath}`; this only means a key that omits the segment fails
+/// at upload time instead of surfacing later as the TypeScript verifier's
+/// `KEY_OUTSIDE_ALLOWED_PREFIX`.
 fn validate_destination(attempt_prefix: &str, key: &str) -> Result<(), ObjectStoreError> {
     let reject = |reason: String| Err(ObjectStoreError::ValidationFailed(reason));
 
@@ -600,6 +620,16 @@ fn validate_destination(attempt_prefix: &str, key: &str) -> Result<(), ObjectSto
              relative key path"
         ));
     }
+    // Defence in depth: Task 5 still owns composing `{attemptPrefix}variants/{relativePath}`,
+    // but a key that never enters the `variants/` segment fails here rather than surfacing only
+    // at publish time, matching the TypeScript verifier's `KEY_OUTSIDE_ALLOWED_PREFIX`.
+    if !relative.starts_with(VARIANTS_SEGMENT) {
+        return reject(format!(
+            "'{key}' does not sit under the '{VARIANTS_SEGMENT}' segment below \
+             '{attempt_prefix}'; an upload must be composed as \
+             '{{attemptPrefix}}{VARIANTS_SEGMENT}{{relativePath}}'"
+        ));
+    }
     Ok(())
 }
 
@@ -617,16 +647,25 @@ fn is_plain_key(path: &str) -> bool {
 /// The digest is published verbatim as metadata and compared verbatim by the verifier, so it is
 /// refused here unless it is exactly the frozen encoding: 64 lowercase hex characters.
 fn validate_checksum(checksum: &str, key: &str) -> Result<(), ObjectStoreError> {
-    let canonical = checksum.len() == SHA256_HEX_LENGTH
-        && checksum
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    let is_lowercase_hex =
+        |byte: &u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte);
+    let canonical = checksum.len() == SHA256_HEX_LENGTH && checksum.bytes().all(|byte| is_lowercase_hex(&byte));
     if canonical {
         return Ok(());
     }
+    // Named explicitly enough to debug a Task 5 wiring bug: the length and the first
+    // out-of-place byte, not just "invalid".
+    let first_bad = checksum
+        .bytes()
+        .enumerate()
+        .find(|(_, byte)| !is_lowercase_hex(byte))
+        .map(|(index, byte)| format!(", first invalid character '{}' at index {index}", byte as char))
+        .unwrap_or_default();
     Err(ObjectStoreError::ValidationFailed(format!(
         "the checksum declared for '{key}' is not a {SHA256_HEX_LENGTH}-character lowercase hex \
-         SHA-256; publishing it would fail cross-language verification"
+         SHA-256 (got {} characters{first_bad}); publishing it would fail cross-language \
+         verification",
+        checksum.len(),
     )))
 }
 
@@ -791,6 +830,18 @@ mod tests {
             );
             assert!(!error.failure_type().is_retryable());
         }
+    }
+
+    /// `validate_destination` must refuse a key that never entered the `variants/` segment at
+    /// all, matching the TypeScript verifier's `KEY_OUTSIDE_ALLOWED_PREFIX` — defence in depth,
+    /// since a bug that dropped the segment would otherwise only surface at publish time.
+    #[test]
+    fn refuses_a_destination_key_that_omits_the_variants_segment() {
+        let key = format!("{PREFIX}part-000.parquet");
+        let error = validate_destination(PREFIX, &key)
+            .expect_err("a key that never enters 'variants/' must be refused");
+        assert_eq!(error.failure_type(), FailureType::ArtifactValidationFailed);
+        assert!(!error.failure_type().is_retryable());
     }
 
     #[test]
