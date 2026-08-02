@@ -782,6 +782,22 @@ describe('rust buildDatasetArtifact activity (cross-language ingestion gate)', (
         'FINALIZING is terminal and published exactly once',
       );
 
+      // The counters describe cumulative work, so a consumer polling heartbeats is entitled to
+      // read them as progress — the same entitlement `assertPhasesNeverRegress` protects for the
+      // phase. The regression this catches: a stage that builds its event from
+      // `ProgressEvent::phase(...)`, which zeroes every counter, does not leave the published
+      // picture alone — the projection *assigns* these fields, so it resets them. The export did
+      // exactly that, and the published sequence went true totals → zero for the whole export
+      // phase → true totals again. A set comparison of phases cannot see it, and neither can a
+      // Rust-side test that stops at the `ProgressEvent`.
+      for (const field of ['processedBytes', 'processedVariants', 'completedFiles'] as const) {
+        assert.ok(
+          logged.every((beat, index) => index === 0 || beat[field] >= logged[index - 1]![field]),
+          `${field} must never regress across the published heartbeats, got ` +
+            JSON.stringify(logged.map((beat) => ({ phase: beat.phase, [field]: beat[field] }))),
+        );
+      }
+
       const uploading = logged.filter((beat) => beat.phase === 'UPLOADING_PARTITION');
       assert.equal(uploading.length, CHROMOSOMES.length, 'one heartbeat per uploaded partition');
       assert.deepEqual(

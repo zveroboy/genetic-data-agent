@@ -222,6 +222,7 @@ fn build_or_stop(
         export_parquet(
             &staging,
             &request.parquet_output_dir,
+            &counts,
             progress,
             request.concurrency,
         )

@@ -82,7 +82,7 @@ fn main() -> Result<()> {
         source_etag: "local-debug".to_string(),
         reference_build: "GRCh38".to_string(),
         batch_size: DEFAULT_BATCH_SIZE,
-        concurrency: cli_concurrency_limits(),
+        concurrency: cli_concurrency_limits()?,
     };
 
     // `NoopProgressSink` never asks the build to stop, so `None` is unreachable here; the debug
@@ -119,23 +119,44 @@ fn main() -> Result<()> {
 ///
 /// Deliberately confined to this binary: the library takes its bounds as a parameter and reads no
 /// environment of its own, so the worker's behaviour cannot be changed by an ambient variable.
-fn cli_concurrency_limits() -> ConcurrencyLimits {
-    let flag = |name: &str| env::var(name).ok().and_then(|value| value.parse::<usize>().ok());
-
-    let mut limits = match flag("INGEST_SEQUENTIAL") {
-        Some(1) => ConcurrencyLimits::SEQUENTIAL,
-        _ => ConcurrencyLimits::default(),
+///
+/// **Every one of these variables fails loudly on a value it does not understand.** They exist to
+/// select the configuration a measurement is attributed to, so a typo that silently selects the
+/// *other* configuration does not produce a slower run, it produces a wrong number in a report —
+/// the one failure mode that cannot be caught by looking at the output. `INGEST_SEQUENTIAL=2`
+/// used to mean "parallel"; it is now an error.
+fn cli_concurrency_limits() -> Result<ConcurrencyLimits> {
+    let flag = |name: &str| -> Result<Option<usize>> {
+        match env::var(name) {
+            Err(_) => Ok(None),
+            Ok(value) => value
+                .trim()
+                .parse::<usize>()
+                .map(Some)
+                .with_context(|| format!("{name} is set to '{value}', which is not a whole number")),
+        }
     };
-    if let Some(value) = flag("INGEST_VALIDATE_FILES") {
+
+    let mut limits = match flag("INGEST_SEQUENTIAL")? {
+        Some(1) => ConcurrencyLimits::SEQUENTIAL,
+        None | Some(0) => ConcurrencyLimits::default(),
+        Some(other) => bail!(
+            "INGEST_SEQUENTIAL is set to '{other}'. It selects the fully sequential baseline and \
+             takes 1 (sequential) or 0 (the default bounds) only — a value it ignored would mean \
+             the opposite of what was typed. Use INGEST_VALIDATE_FILES, INGEST_EXPORT_PARTITIONS \
+             or INGEST_BGZF_BLOCKS to set a bound."
+        ),
+    };
+    if let Some(value) = flag("INGEST_VALIDATE_FILES")? {
         limits.validate_files = value;
     }
-    if let Some(value) = flag("INGEST_EXPORT_PARTITIONS") {
+    if let Some(value) = flag("INGEST_EXPORT_PARTITIONS")? {
         limits.export_partitions = value;
     }
-    if let Some(value) = flag("INGEST_BGZF_BLOCKS") {
+    if let Some(value) = flag("INGEST_BGZF_BLOCKS")? {
         limits.bgzf_blocks = value;
     }
-    limits
+    Ok(limits)
 }
 
 /// Clears one output path from a previous debug run.

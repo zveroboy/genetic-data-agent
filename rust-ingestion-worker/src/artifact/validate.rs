@@ -14,7 +14,6 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use duckdb::Connection;
 use sha2::{Digest, Sha256};
@@ -63,8 +62,19 @@ struct ExportedFile {
 ///   error found afterwards by a still-running worker must not be reported as the reason the
 ///   build ended — the caller is discarding the attempt either way, and re-labelling its own
 ///   cancellation as a failure would make it look retryable.
+/// - **The published `completedFiles` count.** Assigned by the gate, inside the same lock that
+///   publishes the event, so the sequence a heartbeat consumer reads is 1, 2, 3, … and not a
+///   permutation of it. See [`CancelGate::report_completion`].
 /// - **Worker lifetime.** [`map_bounded_with`] blocks until every task has finished and drops the
 ///   pool, so no thread outlives this call and the activity cannot return with work still going.
+///
+/// **One change in error precedence, deliberate and worth naming.** The shape walk
+/// ([`enumerate_exported_files`]) now runs to completion before any file is inspected, where the
+/// old sequential loop interleaved the two. So a malformed partition name *later* in the
+/// directory order now outranks a corrupt-file error *earlier* in it, which is the opposite of
+/// what the loop reported. This is the better order — the shape of the export is a stronger
+/// statement about it than one file's contents, and it is the order that is stable across bounds
+/// — but it is a change, not a preservation.
 pub(super) fn validate_export(
     output_dir: &Path,
     counts: &StagingCounts,
@@ -80,7 +90,6 @@ pub(super) fn validate_export(
     }
 
     let gate = CancelGate::new(progress);
-    let completed = AtomicU64::new(0);
     let workers = workers_for(limits.validate_files, exported.len());
 
     let outcomes = map_bounded_with(
@@ -106,13 +115,15 @@ pub(super) fn validate_export(
                 file.relative_path.clone(),
             )?;
 
-            gate.report(ProgressEvent {
+            gate.report_completion(|completed_files| ProgressEvent {
                 processed_bytes: counts.bytes,
                 processed_variants: counts.accepted,
                 current_partition: Some(file.chrom.clone()),
                 // A count of files finished, not this file's index: with several workers in
-                // flight the two differ, and only the count is monotonic.
-                completed_files: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                // flight the two differ. The gate assigns it inside the same lock that
+                // publishes the event, so the sequence a consumer reads really is 1, 2, 3, …
+                // — see `CancelGate::report_completion` for why doing it here would not be.
+                completed_files,
                 ..ProgressEvent::phase(IngestionPhase::ExportingParquet)
             })?;
             Ok(described)
@@ -437,7 +448,7 @@ mod tests {
 
     use std::io::Write;
     use std::ops::ControlFlow;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use tempfile::TempDir;

@@ -32,15 +32,24 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 pub struct ConcurrencyLimits {
     /// Exported Parquet files hashed and validated at once. Each worker holds its own DuckDB
     /// connection and one 64 KiB read buffer.
+    ///
+    /// Capped below the core count, for the same reason as `export_partitions` and on the same
+    /// evidence: each file's validation is itself a DuckDB query that already uses several
+    /// cores, and in the per-item sweep sixteen workers on 22 files came out *slower* than
+    /// eight. The interleaved session measured the stage at 0.16 s sequential → 0.10 s; it is 3%
+    /// of the run either way, so the cap is about not provisioning threads that measurably do
+    /// not help rather than about wall clock. Measurements in
+    /// `.superpowers/sdd/parallelism-report.md`.
     pub validate_files: usize,
     /// Partitions whose `COPY … ORDER BY` may be in flight at once, each on its own connection
     /// to the same staging database.
     ///
     /// Capped below the core count. These statements share DuckDB's own thread pool rather than
     /// getting one each, and on a 22-partition genome the stage stopped improving at eight
-    /// workers (0.31 s sequential, 0.09 s at four, 0.06 s at eight, 0.06 s at sixteen). Past the
-    /// plateau the only thing more workers add is more concurrent sort buffers inside DuckDB,
-    /// which is what the cap is protecting. Measurements in
+    /// workers: the interleaved session measured 0.30 s sequential → 0.06 s at eight, and the
+    /// per-item sweep — shape only, not comparable in absolute terms across sessions — put the
+    /// plateau at that same eight. Past it the only thing more workers add is more concurrent
+    /// sort buffers inside DuckDB, which is what the cap is protecting. Measurements in
     /// `.superpowers/sdd/parallelism-report.md`.
     pub export_partitions: usize,
     /// BGZF blocks inflated at once, when the source is `bgzip` output.
@@ -61,13 +70,14 @@ impl ConcurrencyLimits {
         bgzf_blocks: 1,
     };
 
-    /// Capped low on purpose. Measured on a 2 GB-uncompressed genome the staging stage went
-    /// 4.43 s at one worker to 3.38 s at *two*, and then did not move at four, eight or sixteen.
-    /// Most of that win is pipelining rather than parallelism: inflating 2 GB costs ~1.3 s and
-    /// the parse-and-append it feeds costs ~3.3 s, so one dedicated inflate thread already stays
-    /// ahead of the consumer. This leaves a little headroom above the measured knee for hardware
-    /// where inflation is slower relative to parsing, without provisioning threads that would
-    /// only ever block.
+    /// Capped low on purpose. On a 2 GB-uncompressed genome the interleaved session measured the
+    /// staging stage at 4.34 s sequential → 3.27 s at four workers, and the per-item sweep — shape
+    /// only — put the knee at *two*, with four, eight and sixteen indistinguishable from it. Most
+    /// of that win is pipelining rather than parallelism: inflating 2 GB costs ~1.3 s and the
+    /// parse-and-append it feeds costs ~3.3 s, so one dedicated inflate thread already stays ahead
+    /// of the consumer. Four leaves a little headroom above the measured knee for hardware where
+    /// inflation is slower relative to parsing, without provisioning threads that would only ever
+    /// block.
     const MAX_BGZF_BLOCKS: usize = 4;
 
     /// Where concurrent `COPY` statements stopped paying when measured: they subdivide DuckDB's
@@ -75,13 +85,20 @@ impl ConcurrencyLimits {
     /// faster and only the number of simultaneous sort buffers grows.
     const MAX_EXPORT_PARTITIONS: usize = 8;
 
-    /// One worker per core the process may actually use. `available_parallelism` respects
-    /// cgroup CPU limits, so a container with a fractional CPU quota does not get a pool sized
-    /// for the host.
+    /// Where per-file validation stopped paying when measured, and the same number for the same
+    /// underlying reason: each file's checks are a DuckDB query that is already internally
+    /// parallel, so past this the workers contend with the engine instead of adding to it. The
+    /// sweep had sixteen workers behind eight on 22 files, so the core count is not the honest
+    /// default even though nothing about this stage is unsafe at it.
+    const MAX_VALIDATE_FILES: usize = 8;
+
+    /// One worker per core the process may actually use, capped per stage at that stage's
+    /// measured knee. `available_parallelism` respects cgroup CPU limits, so a container with a
+    /// fractional CPU quota does not get a pool sized for the host.
     pub fn from_available_parallelism() -> Self {
         let cores = available_parallelism().map_or(1, NonZeroUsize::get);
         Self {
-            validate_files: cores,
+            validate_files: cores.min(Self::MAX_VALIDATE_FILES),
             export_partitions: cores.min(Self::MAX_EXPORT_PARTITIONS),
             bgzf_blocks: cores.min(Self::MAX_BGZF_BLOCKS),
         }

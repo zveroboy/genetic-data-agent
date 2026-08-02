@@ -10,10 +10,14 @@
 //! every block can then be inflated by a different core.
 //!
 //! ```text
-//!  0      2  3  4        8   9  10    12     14  15  16    18
-//! | 1f 8b | 08 | 04 | MTIME | XFL | OS | XLEN | 42 43 | 02 | BSIZE |  ...deflate...  | CRC32 | ISIZE |
-//!   magic   CM  FLG=FEXTRA         extra len   'B''C'  len  size-1                     trailer
+//!   0       2   3    4       8     9    10     12      14      16      18
+//! | 1f 8b | 08 | 04 | MTIME | XFL | OS | XLEN | 42 43 | 02 00 | BSIZE | …deflate… | CRC32 | ISIZE |
 //! ```
+//!
+//! The number above each field is that field's byte offset from the start of the member. `CM` is
+//! deflate and `FLG` sets `FEXTRA`; `XLEN` is the byte length of the extra area, and inside it the
+//! `BC` subfield (id `42 43`, `SLEN` = 2) carries `BSIZE`, the whole block's on-disk size minus
+//! one. The trailer's `ISIZE` is the block's exact uncompressed length.
 //!
 //! **What it does not change.** Plain gzip and uncompressed input never reach this module:
 //! [`is_bgzf`] is a positive test on the first member's header, and anything that fails it keeps
@@ -23,8 +27,9 @@
 //!
 //! **Bounded, not eager.** The reader is a pipeline with a hard read-ahead bound: at most
 //! [`BgzfReader::max_blocks_in_flight`] blocks exist at once, anywhere — queued, inflating, or
-//! waiting to be consumed. A whole-genome VCF is 2 GB uncompressed and 24 000 blocks; without a
-//! bound "decompress the blocks in parallel" would mean holding all of it.
+//! waiting to be consumed. A whole-genome VCF is 2 GB uncompressed, which against the format's
+//! 64 KiB-per-block ceiling is at least 31 000 blocks; without a bound "decompress the blocks in
+//! parallel" would mean holding all of it.
 //!
 //! No Temporal, no S3, no DuckDB.
 
@@ -476,6 +481,9 @@ fn read_exact_or_eof(source: &mut impl Read, buffer: &mut [u8]) -> io::Result<us
 /// believed, and against the bytes actually produced afterwards — [`GzDecoder`] already verifies
 /// the CRC, and this catches the remaining way a block can lie about itself.
 fn inflate_block(block: &[u8]) -> BlockResult {
+    // Cannot underflow: `read_block` rejects any block shorter than header + extra + trailer
+    // before one is ever handed here, and this function staying panic-free is what the `Drop`
+    // liveness argument rests on — a worker that panicked would never answer its channel.
     let trailer_at = block.len() - 4;
     let declared = u32::from_le_bytes([
         block[trailer_at],
@@ -490,8 +498,16 @@ fn inflate_block(block: &[u8]) -> BlockResult {
         ));
     }
 
+    // Bounded, not just checked afterwards. `declared` has already been rejected above if it
+    // exceeds the 64 KiB ceiling, so it is a legitimate bound on the read — and the source
+    // object is user-supplied from S3, where deflate's ~1032:1 ceiling on a 64 KiB member means
+    // an unbounded `read_to_end` would transiently allocate ~67 MB per worker before the length
+    // check below rejected it. `declared + 1` rather than `declared`, so a block that produces
+    // *more* than it promised still fails that check instead of being silently truncated to fit.
     let mut inflated = Vec::with_capacity(declared);
-    GzDecoder::new(block).read_to_end(&mut inflated)?;
+    GzDecoder::new(block)
+        .take(declared as u64 + 1)
+        .read_to_end(&mut inflated)?;
     if inflated.len() != declared {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

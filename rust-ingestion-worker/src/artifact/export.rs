@@ -14,6 +14,7 @@ use super::layout::{
     part_file_name, read_sorted_dir, sql_string_literal, sql_text_literal, trailing_index,
     PARTITION_PREFIX,
 };
+use super::staging::StagingCounts;
 use super::{ArtifactError, Stopped, ROW_GROUP_SIZE};
 use crate::concurrency::{map_bounded_with, workers_for, ConcurrencyLimits};
 use crate::contracts::IngestionPhase;
@@ -48,19 +49,28 @@ struct PartitionCopy {
 /// table and writes one file nobody else touches, so the outputs cannot interfere. What they do
 /// share is DuckDB's *internal* thread pool, which belongs to the database instance rather than
 /// to a connection: `limits.export_partitions` concurrent statements do not get a scheduler each,
-/// they subdivide the one that already exists. Measured on a 22-partition genome the stage went
-/// 0.31 s sequential -> 0.09 s at four workers -> 0.06 s at eight, and then stopped moving, so the
-/// default is capped below the core count: past the plateau the only thing more workers add is
-/// more simultaneous sort buffers inside DuckDB. The feared collapse from oversubscription did
-/// not appear at any bound up to one worker per partition — see
-/// `.superpowers/sdd/parallelism-report.md`.
+/// they subdivide the one that already exists. Measured on a 22-partition genome, in the report's
+/// interleaved session, the stage went 0.30 s sequential -> 0.06 s at eight workers and then
+/// stopped moving, so the default is capped below the core count: past the plateau the only thing
+/// more workers add is more simultaneous sort buffers inside DuckDB. The feared collapse from
+/// oversubscription did not appear at any bound up to one worker per partition. Only the
+/// interleaved figures are quoted here; the per-item sweep in
+/// `.superpowers/sdd/parallelism-report.md` shows the shape but was taken in its own session and
+/// drifts against this one.
 ///
 /// A `Connection` is `Send` but not `Sync`, so the concurrency model is one cloned connection per
 /// worker — [`Connection::try_clone`], which attaches another connection to the *same* in-process
 /// database rather than opening the file twice — created on this thread before any worker starts.
+///
+/// `counts` is carried into every event this stage publishes rather than left at zero. The
+/// heartbeat projection assigns `processedBytes` and `processedVariants` from each event
+/// unconditionally, so an event built from a bare [`ProgressEvent::phase`] does not "leave them
+/// alone" — it publishes zeros. An operator watching the Temporal UI would see the true totals,
+/// then zero for the whole export, then the totals again once validation reports.
 pub(super) fn export_parquet(
     staging: &Connection,
     output_dir: &Path,
+    counts: &StagingCounts,
     progress: &dyn ProgressSink,
     limits: ConcurrencyLimits,
 ) -> Result<(), Stopped> {
@@ -101,7 +111,14 @@ pub(super) fn export_parquet(
 
             // The export's only interruption point. Without it a cancelled whole-genome build
             // would still copy all 22 partitions before anyone asked whether it should.
+            //
+            // The staged counts ride along because the heartbeat projection *assigns* these
+            // fields from every event rather than merging them; omitting them publishes zeros.
+            // `completed_files` is deliberately left at zero: it counts files written *and
+            // validated*, which is the next stage's to report.
             gate.report(ProgressEvent {
+                processed_bytes: counts.bytes,
+                processed_variants: counts.accepted,
                 current_partition: Some(partition.chrom.clone()),
                 ..ProgressEvent::phase(IngestionPhase::ExportingParquet)
             })
@@ -245,6 +262,17 @@ mod tests {
         }
     }
 
+    /// The staged totals every event of this stage must carry. Non-zero on purpose: an event
+    /// that dropped them would publish zeros, which is the regression
+    /// `the_export_never_publishes_a_zeroed_counter_through_the_heartbeat` exists for.
+    fn counts_for(chroms: &[&str], rows: u32) -> StagingCounts {
+        StagingCounts {
+            accepted: u64::from(rows) * chroms.len() as u64,
+            rejected: 0,
+            bytes: 1_234_567,
+        }
+    }
+
     /// A staging database holding `rows` rows for each of `chroms`, deliberately inserted in an
     /// order that is *not* the sort order, so an export that failed to sort would be visible.
     fn staged(chroms: &[&str], rows: u32) -> Connection {
@@ -324,8 +352,14 @@ mod tests {
             let root = directory.path().join("export");
             let staging = staged(&chroms, ROWS);
 
-            export_parquet(&staging, &root, &Collecting::default(), limits(workers))
-                .unwrap_or_else(|error| panic!("export at {workers} workers failed: {error:?}"));
+            export_parquet(
+                &staging,
+                &root,
+                &counts_for(&chroms, ROWS),
+                &Collecting::default(),
+                limits(workers),
+            )
+            .unwrap_or_else(|error| panic!("export at {workers} workers failed: {error:?}"));
 
             for chrom in chroms {
                 let file = root
@@ -364,6 +398,7 @@ mod tests {
         export_parquet(
             &staged(&chroms, 5_000),
             &baseline_root,
+            &counts_for(&chroms, 5_000),
             &Collecting::default(),
             limits(1),
         )
@@ -376,6 +411,7 @@ mod tests {
             export_parquet(
                 &staged(&chroms, 5_000),
                 &root,
+                &counts_for(&chroms, 5_000),
                 &Collecting::default(),
                 limits(workers),
             )
@@ -398,6 +434,7 @@ mod tests {
             export_parquet(
                 &staged(&chroms, 100),
                 &directory.path().join("export"),
+                &counts_for(&chroms, 100),
                 &sink,
                 limits(workers),
             )
@@ -419,8 +456,19 @@ mod tests {
         }
     }
 
-    /// A cancelled export stops, reports nothing further, and does not run to completion — the
-    /// property the per-partition report was added for.
+    /// A cancelled export stops and reports nothing further, and the work it had already
+    /// dispatched is bounded by the concurrency bound.
+    ///
+    /// **What this does and does not promise.** The guarantee the per-partition report buys is
+    /// over *reporting*, not over work: the break arrives at the first report, and rayon has by
+    /// then handed an item to every worker, each of which is inside a `COPY` that will run to
+    /// completion. The top-of-task `is_cancelled` check stops items that have not *started*, so
+    /// the number of `COPY`s that execute is at most the number of workers — one apiece, since
+    /// no worker can reach a second item without first reporting and being refused. At bound 1
+    /// that is one partition of twelve; at a bound at or above the partition count it is all of
+    /// them, and the assertion below is honestly vacuous there. It is asserted anyway because it
+    /// is the real bound, and because "a cancelled export does not copy the whole genome" is
+    /// true exactly to the extent that the bound is below the partition count.
     #[test]
     fn a_break_stops_the_export_and_ends_the_sink_s_events() {
         let chroms = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"];
@@ -432,7 +480,13 @@ mod tests {
                 seen: AtomicUsize::new(0),
             };
 
-            let outcome = export_parquet(&staged(&chroms, 2_000), &root, &sink, limits(workers));
+            let outcome = export_parquet(
+                &staged(&chroms, 2_000),
+                &root,
+                &counts_for(&chroms, 2_000),
+                &sink,
+                limits(workers),
+            );
 
             assert!(
                 matches!(outcome, Err(Stopped::Interrupted)),
@@ -442,6 +496,24 @@ mod tests {
                 sink.seen.load(Ordering::SeqCst),
                 1,
                 "at {workers} workers the sink was handed events after it asked to stop"
+            );
+
+            // `plan_partitions` creates every partition *directory* before anything is copied,
+            // so it is the files that say how many `COPY`s ran.
+            let copied = chroms
+                .iter()
+                .filter(|chrom| {
+                    root.join(format!("{PARTITION_PREFIX}{chrom}"))
+                        .join("part-000.parquet")
+                        .exists()
+                })
+                .count();
+            let dispatched = workers_for(workers, chroms.len());
+            assert!(
+                (1..=dispatched).contains(&copied),
+                "at {workers} workers a cancelled export wrote {copied} of {} partitions, \
+                 outside the 1..={dispatched} a bound of {dispatched} concurrent workers allows",
+                chroms.len()
             );
         }
     }
@@ -460,7 +532,13 @@ mod tests {
                 .expect("occupy the output path");
 
             let Err(Stopped::Failed(error)) =
-                export_parquet(&staged(&chroms, 100), &root, &Collecting::default(), limits(workers))
+                export_parquet(
+                    &staged(&chroms, 100),
+                    &root,
+                    &counts_for(&chroms, 100),
+                    &Collecting::default(),
+                    limits(workers),
+                )
             else {
                 panic!("an unwritable partition must fail the export at {workers} workers");
             };
@@ -490,7 +568,13 @@ mod tests {
                 .expect("stage");
 
             let Err(Stopped::Failed(error)) =
-                export_parquet(&staging, &root, &Collecting::default(), limits(workers))
+                export_parquet(
+                    &staging,
+                    &root,
+                    &StagingCounts::default(),
+                    &Collecting::default(),
+                    limits(workers),
+                )
             else {
                 panic!("a non-canonical chromosome must fail the export at {workers} workers");
             };

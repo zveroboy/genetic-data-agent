@@ -1356,6 +1356,160 @@ mod artifact_builder {
         }
     }
 
+    /// The parallel stages, driven through the *real* `HeartbeatReporter` rather than a test
+    /// sink, must never publish a counter that goes backwards — and in particular must never
+    /// publish zero for a total they have already reported.
+    ///
+    /// This is the seam the stage-level tests miss. `HeartbeatReporter::report` *assigns*
+    /// `processedBytes`, `processedVariants` and `completedFiles` from each event; it does not
+    /// merge them. So a stage that builds its event from a bare `ProgressEvent::phase(…)` — which
+    /// zeroes every counter — does not leave the published picture alone, it resets it. The
+    /// export did exactly that, and an operator watching the Temporal UI saw the true totals,
+    /// then `processedVariants: 0` for the whole export phase, then the totals again.
+    ///
+    /// A local sink cannot catch this: the event genuinely does carry zeros, and it is only the
+    /// projection onto the frozen heartbeat that makes them a regression. So the assertion has to
+    /// live on this side of the projection.
+    #[test]
+    fn the_parallel_stages_never_publish_a_counter_that_goes_backwards() {
+        use std::sync::Arc;
+
+        use rust_ingestion_worker::contracts::IngestionHeartbeat;
+        use rust_ingestion_worker::temporal_activities::{HeartbeatChannel, HeartbeatReporter};
+
+        /// Records every heartbeat the reporter hands to the wire.
+        #[derive(Default)]
+        struct Recording(Mutex<Vec<IngestionHeartbeat>>);
+
+        impl HeartbeatChannel for Recording {
+            fn record(&self, heartbeat: &IngestionHeartbeat) {
+                self.0.lock().expect("channel lock").push(heartbeat.clone());
+            }
+
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+        }
+
+        const PER_CHROM: u32 = 500;
+        const CHROMS: [&str; 6] = ["1", "12", "2", "22", "X", "MT"];
+
+        let source_directory = TempDir::new().expect("temp dir");
+        let source = source_directory.path().join("heartbeat.vcf");
+        {
+            let mut writer = BufWriter::new(File::create(&source).expect("create"));
+            writer.write_all(VCF_HEADER.as_bytes()).expect("header");
+            for chrom in CHROMS {
+                for index in 0..PER_CHROM {
+                    writer
+                        .write_all(
+                            data_line(chrom, 10_000 + index * 100, ".", "A", "C", "0/1").as_bytes(),
+                        )
+                        .expect("record");
+                }
+            }
+        }
+
+        // Bound 1 is the sequential path; the others put both parallel stages under real
+        // contention, with more workers than partitions at the top bound.
+        for workers in [1, 4, 16] {
+            let channel = Arc::new(Recording::default());
+            let reporter = HeartbeatReporter::new(channel.clone());
+
+            let directory = TempDir::new().expect("temp dir");
+            let (stats, _) = build_with(
+                &directory,
+                &source,
+                &reporter,
+                1_000,
+                ConcurrencyLimits {
+                    validate_files: workers,
+                    export_partitions: workers,
+                    bgzf_blocks: 1,
+                },
+            )
+            .expect("build succeeds");
+
+            let published = channel.0.lock().expect("channel lock").clone();
+            assert!(
+                published.len() > CHROMS.len(),
+                "at {workers} workers only {} heartbeats were published, too few to say \
+                 anything about the parallel stages",
+                published.len()
+            );
+
+            for (index, pair) in published.windows(2).enumerate() {
+                let (previous, current) = (&pair[0], &pair[1]);
+                assert!(
+                    current.processed_bytes >= previous.processed_bytes,
+                    "at {workers} workers heartbeat {} dropped processedBytes from {} to {} \
+                     (phase {:?})",
+                    index + 1,
+                    previous.processed_bytes,
+                    current.processed_bytes,
+                    current.phase
+                );
+                assert!(
+                    current.processed_variants >= previous.processed_variants,
+                    "at {workers} workers heartbeat {} dropped processedVariants from {} to {} \
+                     (phase {:?})",
+                    index + 1,
+                    previous.processed_variants,
+                    current.processed_variants,
+                    current.phase
+                );
+                // The property Finding 1 was about, asserted here through the real projection:
+                // the count a consumer reads advances, and never jumps back.
+                assert!(
+                    current.completed_files >= previous.completed_files,
+                    "at {workers} workers heartbeat {} dropped completedFiles from {} to {}",
+                    index + 1,
+                    previous.completed_files,
+                    current.completed_files
+                );
+            }
+
+            // Anti-vacuity: the counters must actually have reached the build's real totals, or
+            // "never went backwards" would be satisfied by a run that published zeros throughout.
+            let last = published.last().expect("at least one heartbeat");
+            assert_eq!(
+                last.processed_variants, stats.variant_count,
+                "at {workers} workers the last heartbeat did not carry the true variant count"
+            );
+            assert_eq!(
+                last.completed_files,
+                stats.local_parquet_files.len() as u64,
+                "at {workers} workers the last heartbeat did not carry the true file count"
+            );
+            assert!(last.processed_bytes > 0);
+
+            // And the export phase specifically — the stage that was publishing zeros — must
+            // have carried the staged totals while it was running.
+            let exporting: Vec<&IngestionHeartbeat> = published
+                .iter()
+                .filter(|heartbeat| heartbeat.current_partition.is_some())
+                .collect();
+            assert!(
+                exporting.len() >= CHROMS.len(),
+                "at {workers} workers no per-partition heartbeats were published"
+            );
+            for heartbeat in exporting {
+                assert_eq!(
+                    heartbeat.processed_variants, stats.variant_count,
+                    "at {workers} workers a per-partition heartbeat for {:?} published \
+                     processedVariants = {} instead of the staged total",
+                    heartbeat.current_partition, heartbeat.processed_variants
+                );
+                assert!(
+                    heartbeat.processed_bytes > 0,
+                    "at {workers} workers a per-partition heartbeat for {:?} zeroed \
+                     processedBytes",
+                    heartbeat.current_partition
+                );
+            }
+        }
+    }
+
     /// Parallel BGZF decompression must not turn "one bounded batch in memory" into "as many
     /// blocks as the pipeline can read ahead of the parser".
     ///
