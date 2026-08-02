@@ -1,9 +1,7 @@
-import { generateOllamaEmbedding } from '../vector/embeddings.ts';
-import { qdrantRepository } from '../vector/qdrant.ts';
 import { TargetNotResolvableError } from '../database/clinvar-coordinate-resolver.ts';
 import type { GenotypeProvenance, GenotypeRepository } from '../database/duckdb.ts';
 import { TargetNotPresentError } from '../database/parquet-dataset-resolver.ts';
-import { createQueryGenotypeTool } from './tools.ts';
+import { createQueryGenotypeTool, searchMedicalLiteratureTool } from './tools.ts';
 
 export const SYSTEM_PROMPT = `You are an expert bioinformatics AI assistant.
 Your primary directive is accuracy. You must NOT invent or hallucinate genetic variants.
@@ -70,6 +68,31 @@ async function queryGenotype(
   }
 }
 
+/**
+ * Runs the literature tool and reports whether it actually found anything.
+ *
+ * Routed through `searchMedicalLiteratureTool` (`tools.ts`) — the same tool `tools.test.ts`
+ * exercises — rather than re-inlining the `generateOllamaEmbedding` + `qdrantRepository`
+ * pair here, which used to be duplicated once per call site with no production caller ever
+ * running the tested tool at all.
+ *
+ * The tool already turns a Qdrant/embedding failure into an `{ error }` sentinel instead of
+ * throwing, so a failed search and an empty search both come back as non-empty-shaped results;
+ * this unwraps that sentinel so callers only ever see real hits, and logs the failure rather
+ * than silently discarding it.
+ */
+async function searchLiterature(query: string, toolCallId: string): Promise<any[]> {
+  const result = await searchMedicalLiteratureTool.execute!(
+    { query },
+    { toolCallId, messages: [] },
+  );
+  if (Array.isArray(result) && result.length > 0 && result[0] && 'error' in result[0]) {
+    console.warn(`[agent] literature search unavailable: ${result[0].error}`);
+    return [];
+  }
+  return Array.isArray(result) ? result : [];
+}
+
 export async function askBioinformaticsAgent(
   question: string,
   options: AskBioinformaticsAgentOptions
@@ -80,8 +103,16 @@ export async function askBioinformaticsAgent(
   // repository directly.
   const genotypeTool = createQueryGenotypeTool(repository);
 
-  // 1. Dry run / local offline mode for instant E2E verification
-  if (options.dryRunLocal || (!process.env.CEREBRAS_API_KEY && !process.env.ANTHROPIC_API_KEY)) {
+  // 1. Dry run / local offline mode for instant E2E verification.
+  //
+  // Gated on `CEREBRAS_API_KEY` alone — the only provider actually implemented below.
+  // `ANTHROPIC_API_KEY` is deliberately NOT treated as a provider signal: there is no Anthropic
+  // branch, so if it counted here, setting it (an entirely plausible ambient env var) without
+  // also setting `CEREBRAS_API_KEY` would fall through every branch below to the
+  // 'No AI provider configured.' response — a 200 with no evidence and no provenance, and the
+  // published dataset never read. Falling back to the deterministic local path instead means an
+  // unrelated ambient variable degrades to a fully evidenced answer, not a silent non-answer.
+  if (options.dryRunLocal || !process.env.CEREBRAS_API_KEY) {
     let targetId = 'rs762551';
     const q = question.toLowerCase();
 
@@ -98,15 +129,7 @@ export async function askBioinformaticsAgent(
     }
 
     const { evidence, provenance, note } = await queryGenotype(genotypeTool, targetId);
-    let literatureHits: any[] = [];
-    try {
-      const qVector = await generateOllamaEmbedding(question, 'nomic-embed-text');
-      literatureHits = await qdrantRepository.searchVector(qVector, 2);
-    } catch (err: any) {
-      // Literature is optional context; the genotype answer stands without it. The reason is
-      // logged rather than discarded so an outage is visible.
-      console.warn(`[agent] literature search unavailable: ${err?.message ?? String(err)}`);
-    }
+    const literatureHits = await searchLiterature(question, 'agent-internal');
 
     let answer = note ?? 'No clinical variant data found.';
     if (evidence.length > 0) {
@@ -211,12 +234,13 @@ export async function askBioinformaticsAgent(
       if (fnName === 'search_medical_literature') {
         const args = parseArguments();
         const queryStr = typeof args.query === 'string' && args.query.length > 0 ? args.query : question;
-        try {
-          const vector = await generateOllamaEmbedding(queryStr, 'nomic-embed-text');
-          toolOutput = await qdrantRepository.searchVector(vector, 2);
-        } catch (err: any) {
-          toolOutput = [{ error: err.message }];
-        }
+        // The model gets the tool's own result verbatim, including its `{ error }` sentinel on
+        // an embedding/Qdrant failure — unlike the dry-run path above, it is the model (not this
+        // code) deciding how to phrase an answer around a degraded tool result.
+        toolOutput = await searchMedicalLiteratureTool.execute!(
+          { query: queryStr },
+          { toolCallId: call.id, messages: [] },
+        );
       } else {
         const args = parseArguments();
         if (typeof args.targetId !== 'string' || args.targetId.length === 0) {

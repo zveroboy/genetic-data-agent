@@ -12,8 +12,8 @@
 #   export PATH="$$(rustup which cargo | xargs dirname):$$PATH"
 
 .PHONY: all up down ps logs seed demo reference-snapshot temporal-dev worker api trigger \
-        build build-rust build-ts test test-ts test-rust test-integration test-e2e \
-        download-real-data cleanup-orphans clean
+        build build-rust build-ts test test-ts test-rust test-integration test-rust-integration \
+        test-e2e download-real-data cleanup-orphans clean
 
 API ?= http://localhost:3000
 DATASET_KEY ?= demo-small
@@ -104,7 +104,9 @@ build-ts:
 
 build: build-rust build-ts
 
-# Unit tests, both languages. No Docker, no Temporal, no MinIO.
+# Unit tests, both languages, plus typechecking tests/integration/** (tsconfig.integration.json)
+# so a contract rename there fails here rather than only at runtime under Docker+Temporal+MinIO.
+# No Docker, no Temporal, no MinIO.
 test:
 	npm test
 
@@ -116,8 +118,17 @@ test-rust:
 
 # End-to-end. Needs Docker (MinIO), the `temporal` CLI and a Rust toolchain; each suite starts
 # its own Temporal dev server and creates its own buckets.
-test-integration:
+test-integration: test-rust-integration
 	npm run test:integration
+
+# The MinIO object-store adapter tests (rust-ingestion-worker/tests/minio_object_store_test.rs).
+# They are `#[ignore]`d in the default `cargo test` run for hermeticity, so they only run here —
+# against a real MinIO this target brings up itself. Each test owns and deletes its own uniquely
+# named bucket; the shared dev MinIO is never dropped.
+test-rust-integration:
+	docker compose up -d minio
+	cargo test --manifest-path rust-ingestion-worker/Cargo.toml \
+	  --test minio_object_store_test -- --ignored
 
 # A single question against an already published dataset.
 test-e2e:
@@ -126,5 +137,5 @@ test-e2e:
 # Removes only build output and the derived reference snapshot — never a bucket, a container or
 # a volume, and never the downloaded source genomes under data/.
 clean:
-	rm -rf target ts-api-agent/dist
+	rm -rf target
 	rm -rf data/reference

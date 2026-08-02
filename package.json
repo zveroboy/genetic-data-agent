@@ -13,7 +13,9 @@
     "dev:ts": "npm run dev --workspace=ts-api-agent",
     "test:ts": "npm run test --workspace=ts-api-agent",
     "test:rust": "cargo test --manifest-path rust-ingestion-worker/Cargo.toml",
-    "test": "npm run test:ts && npm run test:rust",
-    "test:integration": "npm run test:integration --workspace=ts-api-agent"
+    "typecheck:integration": "tsc -p tsconfig.integration.json",
+    "test": "npm run test:ts && npm run test:rust && npm run typecheck:integration",
+    "test:integration": "npm run test:integration --workspace=ts-api-agent",
+    "test:integration:rust": "cargo test --manifest-path rust-ingestion-worker/Cargo.toml --test minio_object_store_test -- --ignored"
   }
 }

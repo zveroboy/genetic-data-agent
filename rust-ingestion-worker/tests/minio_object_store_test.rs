@@ -4,9 +4,18 @@
 //! `#[ignore]`d: the default `cargo test` run stays hermetic and fast. Run them with
 //!
 //! ```text
+//! make test-rust-integration
+//! ```
+//!
+//! which brings up MinIO itself, or directly (with MinIO already running) via
+//!
+//! ```text
 //! cargo test --manifest-path rust-ingestion-worker/Cargo.toml \
 //!     --test minio_object_store_test -- --ignored
 //! ```
+//!
+//! `make test-integration` runs this target before the TypeScript integration suite, so this
+//! file is no longer reachable only by hand-typing the command above.
 //!
 //! Each test owns a freshly created, uniquely named bucket and deletes it again — including
 //! when the test body panics — so a shared developer MinIO is never clobbered and nothing is
