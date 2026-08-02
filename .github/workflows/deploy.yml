@@ -24,5 +24,9 @@ jobs:
             cd genetic-data-agent || git clone https://github.com/${{ github.repository }}.git genetic-data-agent
             cd genetic-data-agent
             git pull origin main
-            docker compose -f docker-compose.prod.yml up -d --build
+            # `docker-compose.prod.yml` is an overlay, not a standalone stack: the six services,
+            # their queues and their resource bounds are defined once in `docker-compose.yml`
+            # and the overlay only changes what differs away from a laptop. Both files are
+            # required, in this order.
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
             docker system prune -f

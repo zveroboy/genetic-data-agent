@@ -11,6 +11,9 @@
     "build:rust": "cargo build --release --manifest-path rust-ingestion-worker/Cargo.toml",
     "build:ts": "npm run build --workspace=ts-api-agent",
     "dev:ts": "npm run dev --workspace=ts-api-agent",
-    "test": "npm run test --workspace=ts-api-agent && cargo test --manifest-path rust-ingestion-worker/Cargo.toml"
+    "test:ts": "npm run test --workspace=ts-api-agent",
+    "test:rust": "cargo test --manifest-path rust-ingestion-worker/Cargo.toml",
+    "test": "npm run test:ts && npm run test:rust",
+    "test:integration": "npm run test:integration --workspace=ts-api-agent"
   }
 }

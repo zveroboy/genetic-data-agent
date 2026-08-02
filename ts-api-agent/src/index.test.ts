@@ -189,6 +189,9 @@ class FakeSessionFactory implements DuckDbSessionFactory {
       async query() {
         return owner.rows;
       },
+      async readTraffic() {
+        return { s3Requests: 0, bytesRead: 0 };
+      },
       async close() {},
     };
   }

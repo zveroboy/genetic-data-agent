@@ -1,12 +1,19 @@
 /**
  * End-to-end smoke check of the serving path against a real published dataset.
  *
- * It no longer initializes anything from a VCF fixture: there is no local user-data database
- * to seed. A genome is only queryable once an ingestion run has published
+ * It initializes nothing from a VCF fixture: there is no local user-data database to seed. A
+ * genome is only queryable once an ingestion run has published
  * `datasets/{datasetId}/manifest.json`, so this script requires the id of such a dataset and
  * fails loudly without one rather than answering from a stand-in.
  *
  *   DATASET_ID=demo-small-… node ts-api-agent/src/test_e2e.ts
+ *
+ * This is a developer smoke script, not a test: the committed proof of the same path is
+ * `tests/integration/cross_language_ingestion.test.ts`, which drives the whole slice from
+ * `POST /api/ingestions`. Use `make demo` against a running stack for the end-to-end version.
+ *
+ * `dryRunLocal` pins the deterministic answer path so the check is about the *data* — what was
+ * read, from which objects, against which reference snapshot — and not about a model's wording.
  */
 import { askBioinformaticsAgent } from './infrastructure/ai/agent.ts';
 import { openClinVarCoordinateResolver } from './infrastructure/database/clinvar-coordinate-resolver.ts';
@@ -73,9 +80,22 @@ async function runE2eTest() {
       throw new Error('E2E Test FAILED: rs762551 not found in query_genotype tool output');
     }
 
+    const provenance = response.provenance;
+    if (!provenance || provenance.datasetId !== datasetId) {
+      throw new Error(
+        `E2E Test FAILED: provenance names dataset '${provenance?.datasetId}', asked for '${datasetId}'`,
+      );
+    }
+    if (provenance.filesScanned.length === 0) {
+      throw new Error('E2E Test FAILED: an answer with no scanned object is not evidence');
+    }
+
     console.log(
       `✔ E2E Test PASSED: read ${caffeineVariant.userGenotype} for rs762551 (CYP1A2) from ` +
-        `${response.provenance?.filesScanned.length ?? 0} remote Parquet object(s).`,
+        `${provenance.filesScanned.length} remote Parquet object(s):\n` +
+        provenance.filesScanned.map((uri) => `    ${uri}`).join('\n') +
+        `\n  dataset checksum ${provenance.datasetChecksumSha256}` +
+        `\n  reference ${provenance.referenceBuild}/${provenance.referenceVersion}`,
     );
   } finally {
     await coordinateResolver.close();

@@ -1,42 +1,188 @@
-version: '3.8'
+# The local stack. Six services, and the shape of the graph is the architecture:
+#
+#   temporal ──── ts-control-worker      queue: genomic-control-plane (Workflow + S3 activities)
+#      │     └─── rust-ingestion-worker  queue: genomic-ingestion-rust (activity only)
+#   minio ─────── everything that touches objects
+#   qdrant ────── ts-api, for optional PubMed literature search
+#
+#   docker compose up -d --build
+#   ./scripts/seed_demo_s3.sh   # the two allowlisted source objects
+#   make demo                   # ingest demo-small and ask a question
+#
+# Watch it at http://localhost:8233: two languages, two task queues, one namespace.
+#
+# Deployment hardening — read-only root filesystems, CPU/memory/temp-disk quotas, the API's
+# scoped read-only S3 identity, request and query budgets — lives in `docker-compose.prod.yml`,
+# which overlays this file. One rule holds in both and is not configurable: no volume is ever
+# shared between a TypeScript container and the Rust one. Only S3 object references cross the
+# language boundary.
+
+name: genomic-ingestion
 
 services:
-  # NOTE: If you run Temporal locally via Homebrew ('make temporal-dev'), keep this commented out
-  # to avoid port 7233 / 8233 collision. Uncomment only if you do NOT have local Temporal CLI installed.
-  # temporal:
-  #   image: temporalio/auto-setup:latest
-  #   container_name: temporal
-  #   ports:
-  #     - "7233:7233"
-  #     - "8233:8233"
-  #   environment:
-  #     - DB=sqlite
-  #     - DB_FILENAME=/root/temporal.sqlite
-  #   volumes:
-  #     - temporal-data:/root
-
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: qdrant
+  temporal:
+    # The CLI image bundles server + Web UI. A development server: one node, SQLite, no TLS.
+    image: temporalio/temporal:latest
+    container_name: genomic-temporal
+    command:
+      - server
+      - start-dev
+      - --ip
+      - 0.0.0.0
+      - --ui-ip
+      - 0.0.0.0
+      - --ui-port
+      - "8233"
+      - --namespace
+      - default
+      - --db-filename
+      - /home/temporal/temporal.sqlite
+      - --log-level
+      - warn
     ports:
-      - "6333:6333"
+      - "127.0.0.1:7233:7233"
+      - "127.0.0.1:8233:8233"
     volumes:
-      - qdrant-data:/qdrant/storage
+      # At the image's own home directory, not a subdirectory of it: Docker seeds a new named
+      # volume from what the image has at the mount point, ownership included. A path the image
+      # does not create is initialised root-owned, and the non-root `temporal` user then fails to
+      # create its SQLite file with a misleading "out of memory (14)" (SQLITE_CANTOPEN).
+      - temporal-data:/home/temporal
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
 
   minio:
     image: minio/minio:latest
-    container_name: minio
+    container_name: genomic-minio
     command: server /data --console-address ":9001"
     environment:
-      - MINIO_ROOT_USER=admin
-      - MINIO_ROOT_PASSWORD=password123
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-password123}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+
+  # One-shot: the two buckets, plus the read-only identity the production overlay gives the API
+  # (`s3:GetObject` under `datasets/` and nothing else — the serving path never lists a prefix).
+  # Exits; dependents wait for `service_completed_successfully`.
+  minio-provision:
+    image: minio/minio:latest
+    container_name: genomic-minio-provision
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-password123}
+      API_READER_ACCESS_KEY: ${API_READER_ACCESS_KEY:-genomic-api-reader}
+      API_READER_SECRET_KEY: ${API_READER_SECRET_KEY:-genomic-api-reader-secret}
+    volumes:
+      - ./scripts/minio-api-reader-policy.json:/policy.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing local/genomic-data
+        mc mb --ignore-existing local/genomic-artifacts
+        mc admin policy create local genomic-artifacts-datasets-read /policy.json || true
+        mc admin user add local "$$API_READER_ACCESS_KEY" "$$API_READER_SECRET_KEY" || true
+        mc admin policy attach local genomic-artifacts-datasets-read \
+          --user "$$API_READER_ACCESS_KEY" || true
+    restart: "no"
+
+  qdrant:
+    image: qdrant/qdrant:v1.16.1
+    container_name: genomic-qdrant
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      # The image ships no curl or wget; bash's /dev/tcp proves the port is serving.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+
+  # The HTTP surface and the control-plane Worker are the same image, differing only by command.
+  ts-api: &control-plane
+    build:
+      context: .
+      dockerfile: ts-api-agent/Dockerfile
+    image: genomic-ts-api:local
+    container_name: genomic-ts-api
+    depends_on: &control-plane-deps
+      temporal:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-provision:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment: &control-plane-env
+      PORT: 3000
+      TEMPORAL_HOST: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-admin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-password123}
+      S3_REGION: us-east-1
+      S3_FORCE_PATH_STYLE: "true"
+      S3_ARTIFACT_BUCKET: genomic-artifacts
+      QDRANT_HOST: http://qdrant:6333
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+    restart: unless-stopped
+
+  ts-control-worker:
+    <<: *control-plane
+    container_name: genomic-ts-control-worker
+    command: ["node", "src/application/worker.ts"]
+    depends_on: *control-plane-deps
+    ports: []
+    environment:
+      <<: *control-plane-env
+    # The image's health check probes the HTTP port, which a Worker does not open.
+    healthcheck:
+      disable: true
+
+  rust-ingestion-worker:
+    build:
+      context: .
+      dockerfile: rust-ingestion-worker/Dockerfile
+    image: genomic-rust-worker:local
+    container_name: genomic-rust-ingestion-worker
+    depends_on: *control-plane-deps
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-admin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-password123}
+      S3_REGION: us-east-1
+      S3_FORCE_PATH_STYLE: "true"
+      # Ingestion stages a whole genome locally before exporting Parquet. Unbounded here; the
+      # size-capped tmpfs and the CPU/memory quotas are in `docker-compose.prod.yml`.
+      INGESTION_STAGING_ROOT: /var/lib/ingestion
+      RUST_LOG: info
+    restart: unless-stopped
 
 volumes:
   temporal-data:
-  qdrant-data:
   minio-data:
+  qdrant-data:

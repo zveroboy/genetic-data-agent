@@ -1,0 +1,45 @@
+# Build context hygiene. Without this the context is tens of gigabytes — `target/` alone is a
+# full debug build tree — and every image build pays for uploading it.
+#
+# Nothing excluded here is needed by either Dockerfile: the Rust image compiles from
+# `rust-ingestion-worker/src` inside the builder stage, and the TypeScript image installs from
+# the lockfile and builds its reference snapshot from `tests/fixtures/`.
+
+# Rust build output (47 GB of debug artifacts on a developer machine).
+target/
+**/*.rs.bk
+
+# Node: reinstalled inside the image from package-lock.json.
+node_modules/
+**/node_modules/
+dist/
+build/
+.turbo/
+.cache/
+
+# Raw genomes, downloaded reference dumps and derived databases. Multi-hundred-megabyte files
+# that no image needs: sources are read from S3, and the reference snapshot is rebuilt in-image.
+data/
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.parquet
+*.vcf.gz
+tmp/
+
+# Secrets never belong in a build context, whatever a Dockerfile does or does not COPY.
+.env
+.env.*
+!.env.example
+
+# Repository and tooling metadata.
+.git/
+.github/
+.codegraph/
+.opencode/
+.superpowers/
+.claude/
+docs/
+specs/
+*.log
+.DS_Store

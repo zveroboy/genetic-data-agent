@@ -26,7 +26,11 @@
  */
 import type { SynthesizedVariant } from '../../domain/types.ts';
 import type { ClinVarCoordinateResolver, VariantTarget } from './clinvar-coordinate-resolver.ts';
-import type { DuckDbParam, DuckDbSessionFactory } from './duckdb-session-factory.ts';
+import type {
+  DuckDbParam,
+  DuckDbSessionFactory,
+  DuckDbSessionTraffic,
+} from './duckdb-session-factory.ts';
 import {
   type ParquetDatasetResolver,
   type ResolvedParquetDataset,
@@ -314,6 +318,8 @@ export function createGenotypeRepositoryFactory(
           const filesScanned = await datasetResolver.verifyCandidates(dataset, candidates);
 
           const rows: Record<string, unknown>[] = [];
+          const startedAt = performance.now();
+          let traffic: DuckDbSessionTraffic = { s3Requests: 0, bytesRead: 0 };
           const session = await sessionFactory.open();
           try {
             for (const group of groupByChromosome(candidates, targets)) {
@@ -335,9 +341,41 @@ export function createGenotypeRepositoryFactory(
                 throw error;
               }
             }
+            // Read before `close()`: the traffic counters live in the session's own in-memory
+            // log and go away with it. A failure to read them must not mask a query failure, so
+            // this sits on the success path only — and must not *become* one either, hence the
+            // catch: an answer the caller can have is not withheld because a counter would not
+            // read. The warning is what keeps that from being silent.
+            try {
+              traffic = await session.readTraffic();
+            } catch (error) {
+              console.warn(
+                `[serving-metrics] traffic counters unavailable for '${dataset.datasetId}': ` +
+                  `${(error as Error).message}`,
+              );
+            }
           } finally {
             await session.close();
           }
+          const queryLatencyMs = Math.round(performance.now() - startedAt);
+
+          // The serving path's one metrics record. Every field is measured, not estimated:
+          // `s3Requests`/`bytesRead` come from the engine's own log, the latency is wall clock
+          // around the scan, and the dataset checksum and reference version identify exactly
+          // what was read. No gene, rsID, position or genotype is recorded — a metrics stream is
+          // not a place to accumulate somebody's clinical profile.
+          console.log(
+            `[serving-metrics] ${JSON.stringify({
+              datasetId: dataset.datasetId,
+              datasetChecksumSha256: dataset.datasetChecksumSha256,
+              referenceVersion: dataset.referenceVersion,
+              selectedFileCount: filesScanned.length,
+              inventorySize: dataset.parquetObjects.length,
+              s3RequestCount: traffic.s3Requests,
+              bytesRead: traffic.bytesRead,
+              queryLatencyMs,
+            })}`,
+          );
 
           return {
             targetId,

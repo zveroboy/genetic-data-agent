@@ -295,7 +295,7 @@ async function buildRuntimeDependencies(): Promise<AppDependencies & { close(): 
     { askBioinformaticsAgent },
     { openClinVarCoordinateResolver },
     { defaultReferenceSnapshotOptions },
-    { createDuckDbSessionFactory, duckDbS3SessionConfigFromEnv },
+    { createDuckDbSessionFactory, duckDbS3SessionConfigFromEnv, queryDeadlineFromEnv },
     { createParquetDatasetResolver },
     { S3ObjectStore },
     { createTemporalIngestionClient },
@@ -324,6 +324,7 @@ async function buildRuntimeDependencies(): Promise<AppDependencies & { close(): 
     coordinateResolver,
     sessionFactory: createDuckDbSessionFactory({
       s3: duckDbS3SessionConfigFromEnv(process.env, artifactBucket),
+      queryDeadlineMs: queryDeadlineFromEnv(process.env),
       allowExtensionInstall: process.env.DUCKDB_ALLOW_EXTENSION_INSTALL === 'true',
     }),
     askAgent: (question, options) => askBioinformaticsAgent(question, options),

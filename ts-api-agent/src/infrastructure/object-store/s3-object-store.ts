@@ -29,12 +29,30 @@ import {
 /** A published manifest is small; refuse to buffer anything that claims otherwise. */
 export const MAX_JSON_BYTES = 1_048_576;
 
+/**
+ * Defaults for the request budget.
+ *
+ * An unbounded S3 client is how a single hung socket becomes a hung `/ask`: the SDK's own
+ * default is no request timeout at all, so a half-open connection to a wedged endpoint keeps the
+ * caller waiting until something upstream gives up. Every value here is a bound rather than a
+ * target, and each is overridable per deployment.
+ */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+export const DEFAULT_CONNECT_TIMEOUT_MS = 3_000;
+export const DEFAULT_MAX_ATTEMPTS = 3;
+
 export interface S3ObjectStoreConfig {
   readonly endpoint: string;
   readonly region: string;
   readonly accessKeyId: string;
   readonly secretAccessKey: string;
   readonly forcePathStyle: boolean;
+  /** Per-request wall-clock bound, including the response body. */
+  readonly requestTimeoutMs?: number;
+  /** Bound on establishing the TCP/TLS connection. */
+  readonly connectTimeoutMs?: number;
+  /** Total attempts per operation, including the first. */
+  readonly maxAttempts?: number;
 }
 
 function requireEnv(env: NodeJS.ProcessEnv, names: readonly string[]): Record<string, string> {
@@ -82,7 +100,26 @@ export function s3ObjectStoreConfigFromEnv(
     accessKeyId: required.S3_ACCESS_KEY!,
     secretAccessKey: required.S3_SECRET_KEY!,
     forcePathStyle: parseBoolean('S3_FORCE_PATH_STYLE', env.S3_FORCE_PATH_STYLE, true),
+    requestTimeoutMs: positiveIntEnv(env, 'S3_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS),
+    connectTimeoutMs: positiveIntEnv(env, 'S3_CONNECT_TIMEOUT_MS', DEFAULT_CONNECT_TIMEOUT_MS),
+    maxAttempts: positiveIntEnv(env, 'S3_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS),
   };
+}
+
+/**
+ * A positive integer from the environment, or the default.
+ *
+ * A malformed value is an error, not a silent fallback: "the timeout you configured is not the
+ * one in force" is the kind of thing nobody notices until an outage.
+ */
+function positiveIntEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw.length === 0) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer, got '${raw}'`);
+  }
+  return value;
 }
 
 /**
@@ -151,6 +188,12 @@ export class S3ObjectStore implements ObjectStore {
       credentials: {
         accessKeyId: config.accessKeyId,
         secretAccessKey: config.secretAccessKey,
+      },
+      maxAttempts: config.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
+      // Bounded rather than left to the SDK's "wait forever" default; see the constants above.
+      requestHandler: {
+        requestTimeout: config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+        connectionTimeout: config.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
       },
     });
   }

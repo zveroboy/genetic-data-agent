@@ -173,6 +173,9 @@ class FakeSessionFactory implements DuckDbSessionFactory {
         if (owner.failWith !== null) throw owner.failWith;
         return owner.rows;
       },
+      async readTraffic() {
+        return { s3Requests: 0, bytesRead: 0 };
+      },
       async close() {
         owner.closeCount += 1;
       },

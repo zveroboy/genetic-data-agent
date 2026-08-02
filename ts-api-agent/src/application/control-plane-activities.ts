@@ -36,6 +36,7 @@ import {
   allowedPrefixFor,
 } from './ingestion-contracts.ts';
 import { verifyObjectIdentities } from './object-identity.ts';
+import type { DatasetCatalogEntry } from '../domain/datasets.ts';
 import {
   DEFAULT_HEAD_CONCURRENCY,
   type ObjectLocation,
@@ -77,12 +78,25 @@ export class DatasetPublicationConflict extends Error {
   }
 }
 
+/**
+ * The read side of the seeded allowlist, as `inspectDatasetSource` needs it.
+ *
+ * Injectable so an integration test can pin the two allowlisted keys to source objects it
+ * seeded itself, inside its own process. It is Worker *configuration*, never wire input: the
+ * running Worker is constructed with `datasetCatalog`, and no request body can reach this.
+ */
+export interface DatasetSourceCatalog {
+  get(requestedKey: string): DatasetCatalogEntry;
+}
+
 export interface ControlPlaneActivitiesConfig {
   readonly objectStore: ObjectStore;
   /** Bucket every published artifact is written to. Server configuration, never wire input. */
   readonly artifactBucket: string;
   readonly artifactVersion?: string;
   readonly headConcurrency?: number;
+  /** Defaults to the production seeded allowlist. */
+  readonly catalog?: DatasetSourceCatalog;
 }
 
 export interface ControlPlaneActivities {
@@ -124,6 +138,7 @@ export function createControlPlaneActivities(
   const { objectStore, artifactBucket } = config;
   const artifactVersion = config.artifactVersion ?? DEFAULT_ARTIFACT_VERSION;
   const headConcurrency = config.headConcurrency ?? DEFAULT_HEAD_CONCURRENCY;
+  const catalog = config.catalog ?? datasetCatalog;
 
   return {
     /**
@@ -137,7 +152,7 @@ export function createControlPlaneActivities(
       datasetId: string,
       datasetKey: string,
     ): Promise<BuildDatasetArtifactInput> {
-      const entry = datasetCatalog.get(datasetKey);
+      const entry = catalog.get(datasetKey);
       const location: ObjectLocation = { bucket: entry.source.bucket, key: entry.source.key };
 
       const head = await objectStore.head(location);

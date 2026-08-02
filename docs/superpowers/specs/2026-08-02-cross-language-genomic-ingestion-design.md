@@ -69,7 +69,7 @@ The Rust Worker is activity-only and registers the exact Activity Type `buildDat
 8. Uploads the files to an attempt-scoped prefix below the allowed immutable version prefix.
 9. Returns the complete uploaded file inventory to the Workflow.
 
-The Activity sends heartbeats for `DOWNLOADING`, `PARSING`, `WRITING_DUCKDB`, `EXPORTING_PARQUET`, and `UPLOADING`. It responds to cancellation and removes the local staging database and Parquet directory during cleanup.
+The Activity sends heartbeats for `DOWNLOADING_SOURCE`, `PARSING`, `WRITING_DUCKDB`, `EXPORTING_PARQUET`, `UPLOADING_PARTITION`, and `FINALIZING`. (This design document originally named five phases, two of them under different spellings; the implemented set is these six, frozen in `contracts/ingestion-v1.md`, which governs.) It responds to cancellation and removes the local staging database and Parquet directory during cleanup.
 
 ### Parquet layout
 
@@ -85,24 +85,31 @@ datasets/{datasetId}/
     └── chrom=X/part-000.parquet
 ```
 
-Partitioning by chromosome enables file pruning. `chrom` is represented by the Hive path segment and omitted from the physical Parquet columns; `read_parquet(..., hive_partitioning = true)` restores it as a logical column. The non-partition attempt segment uses `attempt-{attempt}`, not `attempt={attempt}`, so it cannot become an accidental Hive column. Ingestion normalizes `chr1`/`1` forms to the canonical values `1`–`22`, `X`, `Y`, or `MT`; unexpected contigs are rejected or handled by an explicitly versioned policy rather than becoming arbitrary path components. Sorting within a partition by genomic position produces tight Parquet min/max statistics and enables row-group pruning for coordinate queries. The serving query must resolve gene or rsID targets to chromosome, position, reference allele, and alternate allele before scanning user Parquet.
+Partitioning by chromosome enables file pruning. `chrom` is represented by the Hive path segment and omitted from the physical Parquet columns; `read_parquet(..., hive_partitioning = true, hive_types_autocast = 0)` restores it as a logical column — both options are mandatory, because with autocast left on DuckDB infers `chrom`'s type from the partitions a scan happened to touch. See `contracts/ingestion-v1.md`, "Reading the dataset", which governs. The non-partition attempt segment uses `attempt-{attempt}`, not `attempt={attempt}`, so it cannot become an accidental Hive column. Ingestion normalizes `chr1`/`1` forms to the canonical values `1`–`22`, `X`, `Y`, or `MT`; unexpected contigs are rejected or handled by an explicitly versioned policy rather than becoming arbitrary path components. Sorting within a partition by genomic position produces tight Parquet min/max statistics and enables row-group pruning for coordinate queries. The serving query must resolve gene or rsID targets to chromosome, position, reference allele, and alternate allele before scanning user Parquet.
 
 ### Publication manifest
 
-The manifest is JSON stored at `datasets/{datasetId}/manifest.json` and contains:
+The manifest is JSON stored at `datasets/{datasetId}/manifest.json`.
 
-- contract version;
-- `artifactFormat: "parquet-dataset"`, artifact/layout/schema versions, and schema fingerprint;
-- dataset ID and catalog key;
-- artifact version, partition spec `['chrom']`, and sort order `['chrom', 'pos', 'ref', 'alt']`;
-- source bucket, key, ETag, and optional S3 version ID;
-- immutable Parquet dataset prefix and deterministic dataset checksum;
-- an ordered inventory of Parquet objects with bucket, key, ETag, nullable version ID, chromosome, SHA-256, byte size, row count, minimum position, and maximum position;
-- variant and rejected-record counts;
-- reference build;
-- reference dataset version;
-- creation timestamp generated outside Workflow replay-sensitive code;
-- processor version.
+> **This list was the design's intent and is no longer the contract.** The manifest schema is
+> frozen and `.strict()` — an unknown field is a rejection, not a warning — so the authoritative
+> field list is `DatasetManifestSchema` in
+> `ts-api-agent/src/application/ingestion-contracts.ts`, documented in
+> `contracts/ingestion-v1.md`. Three fields sketched here are **not** in it: a contract version
+> (that field belongs to the activity *input* envelope, not the manifest), the catalog key and
+> the source object identity (a manifest describes the artifact, not how it was requested), and a
+> creation timestamp (nothing in the serving path reads one, and a manifest that is otherwise a
+> pure function of its content would stop being byte-identical across a re-publish of the same
+> dataset). What the frozen manifest actually contains:
+
+- `artifactFormat: "parquet-dataset"`, `layoutVersion`, `schemaVersion`, and `schemaFingerprint`;
+- `datasetId` and `artifactVersion`;
+- `partitionSpec: ['chrom']` and `sortOrder: ['chrom', 'pos', 'ref', 'alt']`;
+- `attemptPrefix` — the immutable prefix the objects live under — and `datasetChecksumSha256`;
+- `parquetObjects`: an ordered inventory with bucket, key, ETag, nullable version ID, chromosome, SHA-256, byte size, row count, minimum position, and maximum position;
+- `variantCount` and `rejectedRecordCount`;
+- `referenceBuild` and `referenceVersion`;
+- `processorVersion`.
 
 Rust uploads directly to an attempt-unique immutable prefix. `publishDataset` performs bounded `HEAD` verification of the complete inventory, then writes `manifest.json`; it never copies the potentially large Parquet payload a second time. It is idempotent: the same manifest may be written again only when its dataset checksum, file inventory, and source identity match. Query code uses the manifest inventory rather than an S3 glob so it never reads an unpublished or foreign object.
 

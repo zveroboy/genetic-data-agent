@@ -1,23 +1,27 @@
 /**
- * Serving-path integration test: two published datasets in MinIO, queried through the real
- * manifest resolver, the real versioned ClinVar reference and real remote DuckDB sessions.
+ * Partition and row-group pruning, measured on datasets the **real pipeline** produced.
  *
- * Two things are proven here that a unit test cannot:
+ * Two source VCFs carrying chromosomes 1, 12, 15 and X are seeded into this run's own bucket and
+ * ingested through `POST /api/ingestions` → `GenomicIngestionWorkflow` → the Rust
+ * `buildDatasetArtifact` Activity. Nothing here hand-writes a Parquet file or hand-assembles a
+ * manifest: the objects under test are the ones the producer wrote, with the producer's own
+ * `ROW_GROUP_SIZE`, compression and sort order.
  *
- * 1. **Isolation.** Two datasets carrying opposing `rs762551` genotypes answer differently,
- *    and neither repository can see the other's objects — selection comes from each dataset's
- *    own manifest, never from a prefix listing or a glob.
- * 2. **Pruning, by request accounting.** For a chromosome-12 target, every S3 request DuckDB
- *    issues is routed through an instrumented proxy that forwards verbatim to MinIO (Host
- *    preserved, so SigV4 still validates) and records method, decoded path, Range header and
- *    response byte count. Not one request may touch the chromosome-1 or chromosome-15 objects,
+ * Two things are then proven that a unit test cannot:
+ *
+ * 1. **Pruning, by request accounting.** Every S3 request DuckDB issues is routed through an
+ *    instrumented proxy that forwards verbatim to MinIO (Host preserved, so SigV4 still
+ *    validates) and records method, decoded path, Range header and response byte count. For a
+ *    chromosome-12 target, not one request may touch the chromosome-1 or chromosome-15 objects,
  *    and the chromosome-12 object must not be downloaded whole.
+ * 2. **Isolation.** Two datasets carrying opposing genotypes answer differently, and neither
+ *    repository can see the other's objects — selection comes from each dataset's own manifest,
+ *    never from a prefix listing or a glob.
  *
  * The control-plane `ObjectStore` talks to MinIO directly, so the proxy counters describe the
  * query engine's traffic alone.
  */
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -25,23 +29,19 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
-import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
 
-import { DuckDBInstance } from '@duckdb/node-api';
+import type { S3Client } from '@aws-sdk/client-s3';
 
-import { computeDatasetChecksumSha256 } from '../../ts-api-agent/src/application/dataset-checksum.ts';
-import { assertValidDatasetManifest } from '../../ts-api-agent/src/application/dataset-checksum.ts';
+import { manifestKeyFor } from '../../ts-api-agent/src/application/control-plane-activities.ts';
+import { datasetCatalog } from '../../ts-api-agent/src/application/dataset-catalog.ts';
 import {
-  ARTIFACT_FORMAT,
   type DatasetManifest,
   DatasetManifestSchema,
-  LAYOUT_VERSION,
-  PARQUET_SCHEMA_FINGERPRINT,
-  type ParquetObject,
-  SCHEMA_VERSION,
 } from '../../ts-api-agent/src/application/ingestion-contracts.ts';
+import type { DatasetKey } from '../../ts-api-agent/src/domain/datasets.ts';
 import { REFERENCE_BUILD, REFERENCE_VERSION } from '../../ts-api-agent/src/domain/datasets.ts';
+import { createApp } from '../../ts-api-agent/src/index.ts';
+import { askBioinformaticsAgent } from '../../ts-api-agent/src/infrastructure/ai/agent.ts';
 import { openClinVarCoordinateResolver } from '../../ts-api-agent/src/infrastructure/database/clinvar-coordinate-resolver.ts';
 import { createDuckDbSessionFactory } from '../../ts-api-agent/src/infrastructure/database/duckdb-session-factory.ts';
 import {
@@ -51,26 +51,53 @@ import {
 } from '../../ts-api-agent/src/infrastructure/database/duckdb.ts';
 import { createParquetDatasetResolver } from '../../ts-api-agent/src/infrastructure/database/parquet-dataset-resolver.ts';
 import { buildReferenceDatabase } from '../../ts-api-agent/src/infrastructure/database/reference-bootstrap.ts';
-import { S3ObjectStore } from '../../ts-api-agent/src/infrastructure/object-store/s3-object-store.ts';
+import { createTemporalIngestionClient } from '../../ts-api-agent/src/infrastructure/temporal/temporal-ingestion-client.ts';
+import {
+  type ControlPlaneWorker,
+  OwnedBuckets,
+  REPO_ROOT,
+  type RunningApi,
+  type RustWorker,
+  S3_ACCESS_KEY,
+  S3_ENDPOINT,
+  S3_REGION,
+  S3_SECRET_KEY,
+  type TemporalDevServer,
+  buildRustWorker,
+  clearLlmProviderKeys,
+  newObjectStore,
+  newRunId,
+  newS3Client,
+  postJson,
+  putSourceObject,
+  startApi,
+  startControlPlaneWorker,
+  startMinio,
+  startRustWorker,
+  startTemporalDevServer,
+  testCatalog,
+  testCatalogEntry,
+  waitForIngestion,
+  writeSyntheticVcf,
+} from './support/stack.ts';
 
-const execFileAsync = promisify(execFile);
+const RUN_ID = newRunId();
+const SOURCE_BUCKET = `pruning-src-${RUN_ID}`;
+const ARTIFACT_BUCKET = `pruning-art-${RUN_ID}`;
+const INGESTION_TIMEOUT_MS = 10 * 60_000;
 
-const REPO_ROOT = path.resolve(import.meta.dirname, '../..');
-const S3_ENDPOINT = process.env.S3_ENDPOINT ?? 'http://localhost:9000';
-const S3_ACCESS_KEY = process.env.S3_ACCESS_KEY ?? 'admin';
-const S3_SECRET_KEY = process.env.S3_SECRET_KEY ?? 'password123';
-const ARTIFACT_BUCKET = 'genomic-artifacts';
-const ARTIFACT_VERSION = 'v1';
-
-const RUN_ID = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+/** `rust-ingestion-worker/src/artifact/mod.rs::ROW_GROUP_SIZE`. */
+const PRODUCER_ROW_GROUP_SIZE = 100_000;
 
 /** SLCO1B1 rs4149056, GRCh38 chr12:21178615 T>C — the chromosome-12 pruning target. */
 const CHROM12_TARGET_POS = 21_178_615;
 const CHROM12_ROWS = 300_000;
-const CHROM12_ROW_GROUP_SIZE = 100_000;
-/** Row index of the target, placed in row group 1 of 3. */
+/** Row index of the target once the producer has sorted the partition: row group 1 of 3. */
 const CHROM12_TARGET_ROW = 150_000;
-const CHROM12_POS_BASE = CHROM12_TARGET_POS - CHROM12_TARGET_ROW * 100;
+const CHROM12_POS_STEP = 100;
+const CHROM12_POS_BASE = CHROM12_TARGET_POS - CHROM12_TARGET_ROW * CHROM12_POS_STEP;
+
+const CHROM1_ROWS = 100_000;
 
 /** CYP1A2 rs762551, GRCh38 chr15:74749576 A>C — the isolation target. */
 const CHROM15_TARGET_POS = 74_749_576;
@@ -79,7 +106,9 @@ const CHROM15_TARGET_POS = 74_749_576;
 const CHROMX_TARGET_POS = 154_536_002;
 
 interface DatasetSpec {
-  readonly datasetId: string;
+  readonly label: string;
+  readonly datasetKey: DatasetKey;
+  readonly sourceKey: string;
   /** Raw VCF genotype of rs762551 in this dataset. */
   readonly rs762551Genotype: string;
   /** Raw VCF genotype of rs4149056 in this dataset. */
@@ -87,8 +116,20 @@ interface DatasetSpec {
 }
 
 const DATASETS: readonly DatasetSpec[] = [
-  { datasetId: `pruning-a-${RUN_ID}`, rs762551Genotype: '0/1', rs4149056Genotype: '0/1' },
-  { datasetId: `pruning-b-${RUN_ID}`, rs762551Genotype: '1/1', rs4149056Genotype: '1/1' },
+  {
+    label: 'pruning-a',
+    datasetKey: 'demo-small',
+    sourceKey: 'samples/pruning_a.vcf.gz',
+    rs762551Genotype: '0/1',
+    rs4149056Genotype: '0/1',
+  },
+  {
+    label: 'pruning-b',
+    datasetKey: 'na12878-full',
+    sourceKey: 'samples/pruning_b.vcf.gz',
+    rs762551Genotype: '1/1',
+    rs4149056Genotype: '1/1',
+  },
 ];
 
 interface ProxyRequest {
@@ -170,42 +211,6 @@ function requestSpan(request: ProxyRequest, objectEnd: number): Span {
   };
 }
 
-async function awsS3(args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync('aws', ['--endpoint-url', S3_ENDPOINT, ...args], {
-    env: {
-      ...process.env,
-      AWS_ACCESS_KEY_ID: S3_ACCESS_KEY,
-      AWS_SECRET_ACCESS_KEY: S3_SECRET_KEY,
-      AWS_DEFAULT_REGION: 'us-east-1',
-      AWS_EC2_METADATA_DISABLED: 'true',
-    },
-  });
-  return stdout;
-}
-
-async function waitFor(label: string, predicate: () => Promise<boolean>, timeoutMs = 60_000) {
-  const deadline = Date.now() + timeoutMs;
-  let lastError: unknown;
-  while (Date.now() < deadline) {
-    try {
-      if (await predicate()) return;
-    } catch (err) {
-      lastError = err;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  throw new Error(`timed out waiting for ${label}: ${String(lastError)}`);
-}
-
-interface LocalPartition {
-  readonly chrom: string;
-  readonly relativePath: string;
-  readonly localPath: string;
-  readonly rowCount: number;
-  readonly minPos: number;
-  readonly maxPos: number;
-}
-
 /**
  * Every `.duckdb` file directly under the repository root, as a sorted list.
  *
@@ -224,217 +229,116 @@ function duckDbFilesInRepoRoot(): string[] {
 
 describe('remote parquet serving (dataset isolation and partition pruning)', () => {
   const proxy = new MinioProxy();
-  let workDir: string;
-  let objectStore: S3ObjectStore;
-  let bindingVersion: string;
+  let s3: S3Client;
+  let buckets: OwnedBuckets;
+  let temporal: TemporalDevServer;
+  let rustWorker: RustWorker;
+  let controlPlane: ControlPlaneWorker;
+  let api: RunningApi;
+  let objectStore: ReturnType<typeof newObjectStore>;
+  let coordinateResolver: Awaited<ReturnType<typeof openClinVarCoordinateResolver>>;
+  let ingestionClient: ReturnType<typeof createTemporalIngestionClient>;
+  let workDir = '';
+  let stagingRoot = '';
+  let bindingVersion = '';
   let httpfsVersion = '';
-  const repositories = new Map<string, GenotypeRepository>();
+
+  const datasetIds = new Map<string, string>();
   const manifests = new Map<string, DatasetManifest>();
-  /** Byte size of each published object, keyed by S3 key. */
-  const objectSize = new Map<string, number>();
-  /** Byte spans of the chromosome-12 row groups, per dataset. */
+  const repositories = new Map<string, GenotypeRepository>();
+  /** Byte spans of the chromosome-12 row groups, per dataset label. */
   const rowGroups = new Map<string, (Span & { id: number })[]>();
   let duckDbFilesBefore: string[] = [];
-  let coordinateResolver: Awaited<ReturnType<typeof openClinVarCoordinateResolver>>;
   /** Points DuckDB — and only DuckDB — at the counting proxy. */
   let sessionFactory: ReturnType<typeof createDuckDbSessionFactory>;
 
-  /** Builds one dataset's Parquet partitions locally, matching the frozen physical schema. */
-  async function buildPartitions(spec: DatasetSpec, outputDir: string): Promise<LocalPartition[]> {
-    const instance = await DuckDBInstance.create(':memory:');
-    const connection = await instance.connect();
-    const partitions: LocalPartition[] = [];
-    try {
-      const sources: { chrom: string; select: string }[] = [
+  /** Writes one dataset's source VCF: chromosomes 1, 12, 15 and X, with the planted targets. */
+  async function writeSource(spec: DatasetSpec, destination: string): Promise<void> {
+    await writeSyntheticVcf(
+      destination,
+      [
         {
           chrom: '1',
-          select: `
-            SELECT (10000000 + i * 100)::UINTEGER AS pos,
-                   'rs1' || i AS rsid, 'A' AS ref, 'G' AS alt,
-                   CASE WHEN i % 3 = 0 THEN '0/1' ELSE '1/1' END AS gt_raw
-            FROM range(0, 100000) t(i)`,
+          count: CHROM1_ROWS,
+          pos: (index) => 10_000_000 + index * 100,
         },
         {
           chrom: '12',
-          select: `
-            SELECT (${CHROM12_POS_BASE} + i * 100)::UINTEGER AS pos,
-                   CASE WHEN i = ${CHROM12_TARGET_ROW} THEN 'rs4149056' ELSE 'rs12' || i END AS rsid,
-                   CASE WHEN i = ${CHROM12_TARGET_ROW} THEN 'T' ELSE 'A' END AS ref,
-                   CASE WHEN i = ${CHROM12_TARGET_ROW} THEN 'C' ELSE 'G' END AS alt,
-                   CASE WHEN i = ${CHROM12_TARGET_ROW} THEN '${spec.rs4149056Genotype}'
-                        WHEN i % 3 = 0 THEN '0/1' ELSE '1/1' END AS gt_raw
-            FROM range(0, ${CHROM12_ROWS}) t(i)`,
+          count: CHROM12_ROWS,
+          pos: (index) => CHROM12_POS_BASE + index * CHROM12_POS_STEP,
+          override: (index) =>
+            index === CHROM12_TARGET_ROW
+              ? { rsid: 'rs4149056', ref: 'T', alt: 'C', gt: spec.rs4149056Genotype }
+              : undefined,
         },
         {
           chrom: '15',
-          select: `
-            SELECT (${CHROM15_TARGET_POS} + i * 1000)::UINTEGER AS pos,
-                   CASE WHEN i = 0 THEN 'rs762551' ELSE 'rs15' || i END AS rsid,
-                   CASE WHEN i = 0 THEN 'A' ELSE 'C' END AS ref,
-                   CASE WHEN i = 0 THEN 'C' ELSE 'T' END AS alt,
-                   CASE WHEN i = 0 THEN '${spec.rs762551Genotype}' ELSE '0/0' END AS gt_raw
-            FROM range(0, 200) t(i)`,
+          count: 200,
+          pos: (index) => CHROM15_TARGET_POS + index * 1000,
+          override: (index) =>
+            index === 0
+              ? { rsid: 'rs762551', ref: 'A', alt: 'C', gt: spec.rs762551Genotype }
+              : { ref: 'C', alt: 'T', gt: '0/0' },
         },
         {
           // A non-numeric partition value in the same dataset as the autosomes: this is the
           // dataset shape contracts/ingestion-v1.md singles out, where a narrow scan and a
           // whole-dataset scan disagree about `chrom`'s type unless autocast is disabled.
           chrom: 'X',
-          select: `
-            SELECT (${CHROMX_TARGET_POS} + i * 1000)::UINTEGER AS pos,
-                   CASE WHEN i = 0 THEN 'rs1050828' ELSE 'rsX' || i END AS rsid,
-                   CASE WHEN i = 0 THEN 'C' ELSE 'A' END AS ref,
-                   CASE WHEN i = 0 THEN 'T' ELSE 'G' END AS alt,
-                   CASE WHEN i = 0 THEN '0/1' ELSE '0/0' END AS gt_raw
-            FROM range(0, 200) t(i)`,
+          count: 200,
+          pos: (index) => CHROMX_TARGET_POS + index * 1000,
+          override: (index) =>
+            index === 0
+              ? { rsid: 'rs1050828', ref: 'C', alt: 'T', gt: '0/1' }
+              : { ref: 'A', alt: 'G', gt: '0/0' },
         },
-      ];
-
-      for (const source of sources) {
-        const relativePath = `chrom=${source.chrom}/part-000.parquet`;
-        const localPath = path.join(outputDir, relativePath);
-        fs.mkdirSync(path.dirname(localPath), { recursive: true });
-        await connection.run(`
-          COPY (SELECT pos, rsid, ref, alt, gt_raw FROM (${source.select}) ORDER BY pos, ref, alt)
-          TO '${localPath}'
-          (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE ${CHROM12_ROW_GROUP_SIZE});
-        `);
-        const [stats] = (
-          await connection.runAndReadAll(
-            `SELECT count(*) AS n, min(pos) AS lo, max(pos) AS hi FROM read_parquet('${localPath}');`,
-          )
-        ).getRowObjects();
-        partitions.push({
-          chrom: source.chrom,
-          relativePath,
-          localPath,
-          rowCount: Number(stats!.n),
-          minPos: Number(stats!.lo),
-          maxPos: Number(stats!.hi),
-        });
-      }
-
-      const chrom12 = partitions.find((partition) => partition.chrom === '12')!;
-      rowGroups.set(
-        spec.datasetId,
-        (
-          await connection.runAndReadAll(`
-            -- total_compressed_size covers the dictionary page too, so a chunk's end must be
-            -- measured from its first page, not from data_page_offset.
-            SELECT row_group_id,
-                   min(coalesce(dictionary_page_offset, data_page_offset)) AS rg_start,
-                   max(coalesce(dictionary_page_offset, data_page_offset) + total_compressed_size)
-                     AS rg_end
-            FROM parquet_metadata('${chrom12.localPath}')
-            GROUP BY row_group_id ORDER BY row_group_id;
-          `)
-        )
-          .getRowObjects()
-          .map((row) => ({
-            id: Number(row.row_group_id),
-            start: Number(row.rg_start),
-            end: Number(row.rg_end),
-          })),
-      );
-    } finally {
-      connection.disconnectSync();
-      instance.closeSync();
-    }
-    return partitions;
-  }
-
-  /** Uploads the partitions and publishes the manifest last, exactly as the control plane does. */
-  async function publish(spec: DatasetSpec, partitions: readonly LocalPartition[]): Promise<void> {
-    const attemptPrefix = `datasets/${spec.datasetId}/versions/${ARTIFACT_VERSION}/attempt-1/`;
-    const descriptors: ParquetObject[] = [];
-
-    for (const partition of [...partitions].sort((left, right) =>
-      Buffer.compare(Buffer.from(left.chrom), Buffer.from(right.chrom)),
-    )) {
-      const key = `${attemptPrefix}variants/${partition.relativePath}`;
-      const body = fs.readFileSync(partition.localPath);
-      const checksumSha256 = (await import('node:crypto'))
-        .createHash('sha256')
-        .update(body)
-        .digest('hex');
-      await awsS3([
-        's3',
-        'cp',
-        partition.localPath,
-        `s3://${ARTIFACT_BUCKET}/${key}`,
-        '--metadata',
-        `sha256=${checksumSha256}`,
-      ]);
-      const head = await objectStore.head({ bucket: ARTIFACT_BUCKET, key });
-      assert.ok(head?.etag, `uploaded object '${key}' reported no ETag`);
-      objectSize.set(key, body.byteLength);
-      descriptors.push({
-        bucket: ARTIFACT_BUCKET,
-        key,
-        etag: head.etag,
-        versionId: head.versionId,
-        chrom: partition.chrom,
-        checksumSha256,
-        byteSize: body.byteLength,
-        rowCount: partition.rowCount,
-        minPos: partition.minPos,
-        maxPos: partition.maxPos,
-      });
-    }
-
-    const manifest = DatasetManifestSchema.parse({
-      datasetId: spec.datasetId,
-      artifactFormat: ARTIFACT_FORMAT,
-      layoutVersion: LAYOUT_VERSION,
-      schemaVersion: SCHEMA_VERSION,
-      schemaFingerprint: PARQUET_SCHEMA_FINGERPRINT,
-      artifactVersion: ARTIFACT_VERSION,
-      referenceBuild: REFERENCE_BUILD,
-      referenceVersion: REFERENCE_VERSION,
-      attemptPrefix,
-      datasetChecksumSha256: computeDatasetChecksumSha256(attemptPrefix, descriptors),
-      variantCount: descriptors.reduce((sum, object) => sum + object.rowCount, 0),
-      rejectedRecordCount: 0,
-      processorVersion: 'integration-test/1.0.0',
-      partitionSpec: ['chrom'],
-      sortOrder: ['chrom', 'pos', 'ref', 'alt'],
-      parquetObjects: descriptors,
-    });
-    assertValidDatasetManifest(manifest, { expectedBucket: ARTIFACT_BUCKET });
-
-    const written = await objectStore.putJsonConditional(
-      { bucket: ARTIFACT_BUCKET, key: `datasets/${spec.datasetId}/manifest.json` },
-      manifest,
+      ],
+      // Descending, so the producer is what puts the rows in `(pos, ref, alt)` order — the
+      // row-group geometry this test measures is only meaningful if the sort really happened.
+      { compress: true, descending: true },
     );
-    assert.equal(written.outcome, 'created');
-    manifests.set(spec.datasetId, manifest);
   }
 
   before(async () => {
+    clearLlmProviderKeys();
     duckDbFilesBefore = duckDbFilesInRepoRoot();
     workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-parquet-pruning-'));
+    stagingRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-parquet-staging-'));
     bindingVersion = JSON.parse(
       fs.readFileSync(path.join(REPO_ROOT, 'node_modules/@duckdb/node-api/package.json'), 'utf8'),
     ).version;
 
-    await execFileAsync('docker', ['compose', 'up', '-d', 'minio'], { cwd: REPO_ROOT });
-    await waitFor('minio', async () => (await fetch(`${S3_ENDPOINT}/minio/health/live`)).ok);
-    await awsS3(['s3', 'mb', `s3://${ARTIFACT_BUCKET}`]).catch(() => '');
-
-    objectStore = new S3ObjectStore({
-      endpoint: S3_ENDPOINT,
-      region: 'us-east-1',
-      accessKeyId: S3_ACCESS_KEY,
-      secretAccessKey: S3_SECRET_KEY,
-      forcePathStyle: true,
-    });
+    await startMinio();
+    s3 = newS3Client();
+    buckets = new OwnedBuckets(s3);
+    await buckets.create(SOURCE_BUCKET);
+    await buckets.create(ARTIFACT_BUCKET);
 
     for (const spec of DATASETS) {
-      const outputDir = path.join(workDir, spec.datasetId);
-      await publish(spec, await buildPartitions(spec, outputDir));
+      const local = path.join(workDir, `${spec.label}.vcf.gz`);
+      await writeSource(spec, local);
+      await putSourceObject(s3, SOURCE_BUCKET, spec.sourceKey, local);
+      fs.rmSync(local, { force: true });
     }
 
-    await proxy.start(new URL(S3_ENDPOINT));
+    temporal = await startTemporalDevServer();
+    await buildRustWorker();
+    rustWorker = await startRustWorker({ address: temporal.address, stagingRoot });
+
+    objectStore = newObjectStore();
+    controlPlane = await startControlPlaneWorker({
+      address: temporal.address,
+      objectStore,
+      artifactBucket: ARTIFACT_BUCKET,
+      catalog: testCatalog(
+        Object.fromEntries(
+          DATASETS.map((spec) => [
+            spec.datasetKey,
+            testCatalogEntry(spec.datasetKey, SOURCE_BUCKET, spec.sourceKey),
+          ]),
+        ),
+      ),
+    });
 
     const snapshot = await buildReferenceDatabase({
       tsvPath: path.join(REPO_ROOT, 'tests/fixtures/clinvar_coordinates_grch38.tsv'),
@@ -443,55 +347,169 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
       referenceBuild: REFERENCE_BUILD,
     });
     coordinateResolver = await openClinVarCoordinateResolver({ databasePath: snapshot.path });
+    ingestionClient = createTemporalIngestionClient({ address: temporal.address });
 
+    // The proxy sits between DuckDB and MinIO. Everything else — the control plane, the
+    // manifest resolver, this test's own S3 client — talks to MinIO directly, so the counters
+    // below describe the query engine's traffic and nothing else.
+    await proxy.start(new URL(S3_ENDPOINT));
     sessionFactory = createDuckDbSessionFactory({
       s3: {
         endpoint: `127.0.0.1:${proxy.port}`,
-        region: 'us-east-1',
+        region: S3_REGION,
         accessKeyId: S3_ACCESS_KEY,
         secretAccessKey: S3_SECRET_KEY,
         useSsl: false,
         urlStyle: 'path',
         scope: `s3://${ARTIFACT_BUCKET}/`,
       },
+      queryDeadlineMs: 120_000,
     });
 
+    api = await startApi(
+      createApp({
+        catalog: datasetCatalog,
+        ingestionClient,
+        datasetResolver: createParquetDatasetResolver({
+          objectStore,
+          artifactBucket: ARTIFACT_BUCKET,
+        }),
+        coordinateResolver,
+        sessionFactory,
+        askAgent: (question, options) => askBioinformaticsAgent(question, options),
+      }),
+    );
+
+    for (const spec of DATASETS) {
+      const started = await postJson(`${api.baseUrl}/api/ingestions`, {
+        datasetKey: spec.datasetKey,
+      });
+      assert.equal(started.status, 202, JSON.stringify(started.body));
+      const terminal = await waitForIngestion(
+        api.baseUrl,
+        started.body.workflowId,
+        INGESTION_TIMEOUT_MS,
+      );
+      assert.equal(
+        terminal.state,
+        'COMPLETED',
+        `${spec.label} did not complete: ${JSON.stringify(terminal)}\n${rustWorker
+          .log()
+          .slice(-4000)}`,
+      );
+      datasetIds.set(spec.label, started.body.datasetId);
+      manifests.set(
+        spec.label,
+        DatasetManifestSchema.parse(
+          await objectStore.getJson({
+            bucket: ARTIFACT_BUCKET,
+            key: manifestKeyFor(started.body.datasetId),
+          }),
+        ),
+      );
+    }
+
     const factory = createGenotypeRepositoryFactory({
-      datasetResolver: createParquetDatasetResolver({ objectStore, artifactBucket: ARTIFACT_BUCKET }),
+      datasetResolver: createParquetDatasetResolver({
+        objectStore,
+        artifactBucket: ARTIFACT_BUCKET,
+      }),
       coordinateResolver,
       sessionFactory,
     });
-
     for (const spec of DATASETS) {
-      repositories.set(spec.datasetId, await factory.open(spec.datasetId));
+      repositories.set(spec.label, await factory.open(datasetIds.get(spec.label)!));
     }
 
-    const probe = await sessionFactory.open();
-    httpfsVersion = String(
-      (
-        await probe.query(
-          "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'httpfs' AND loaded;",
-        )
-      )[0]?.extension_version,
-    );
-    await probe.close();
+    // Row-group geometry, read out of the *published* object rather than assumed. Done through a
+    // direct session (not the proxy) so it does not pollute the request counters.
+    const direct = createDuckDbSessionFactory({
+      s3: {
+        endpoint: new URL(S3_ENDPOINT).host,
+        region: S3_REGION,
+        accessKeyId: S3_ACCESS_KEY,
+        secretAccessKey: S3_SECRET_KEY,
+        useSsl: new URL(S3_ENDPOINT).protocol === 'https:',
+        urlStyle: 'path',
+        scope: `s3://${ARTIFACT_BUCKET}/`,
+      },
+      queryDeadlineMs: 120_000,
+    });
+    const probe = await direct.open();
+    try {
+      httpfsVersion = String(
+        (
+          await probe.query(
+            "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'httpfs' AND loaded;",
+          )
+        )[0]?.extension_version,
+      );
+      for (const spec of DATASETS) {
+        const chrom12 = manifests
+          .get(spec.label)!
+          .parquetObjects.find((object) => object.chrom === '12')!;
+        rowGroups.set(
+          spec.label,
+          (
+            await probe.query(`
+              -- total_compressed_size covers the dictionary page too, so a chunk's end must be
+              -- measured from its first page, not from data_page_offset.
+              SELECT row_group_id,
+                     min(coalesce(dictionary_page_offset, data_page_offset)) AS rg_start,
+                     max(coalesce(dictionary_page_offset, data_page_offset) + total_compressed_size)
+                       AS rg_end
+              FROM parquet_metadata('s3://${chrom12.bucket}/${chrom12.key}')
+              GROUP BY row_group_id ORDER BY row_group_id;
+            `)
+          ).map((row) => ({
+            id: Number(row.row_group_id),
+            start: Number(row.rg_start),
+            end: Number(row.rg_end),
+          })),
+        );
+      }
+    } finally {
+      await probe.close();
+    }
   });
 
   after(async () => {
+    await api?.stop();
+    await ingestionClient?.close();
     await coordinateResolver?.close();
+    await controlPlane?.stop();
+    await rustWorker?.stop();
+    await temporal?.stop();
     await proxy.stop();
     objectStore?.destroy();
+    await buckets?.removeAll();
+    s3?.destroy();
     if (workDir) fs.rmSync(workDir, { recursive: true, force: true });
+    if (stagingRoot) fs.rmSync(stagingRoot, { recursive: true, force: true });
+  });
+
+  it("ingested both datasets with the producer's own multi-row-group geometry", () => {
     for (const spec of DATASETS) {
-      await awsS3(['s3', 'rm', `s3://${ARTIFACT_BUCKET}/datasets/${spec.datasetId}`, '--recursive'])
-        .catch(() => '');
+      const manifest = manifests.get(spec.label)!;
+      assert.deepEqual(
+        manifest.parquetObjects.map((object) => object.chrom),
+        ['1', '12', '15', 'X'],
+        `${spec.label} must publish exactly the four seeded partitions, byte-wise ordered`,
+      );
+      const chrom12 = manifest.parquetObjects.find((object) => object.chrom === '12')!;
+      assert.equal(chrom12.rowCount, CHROM12_ROWS);
+      assert.equal(
+        rowGroups.get(spec.label)!.length,
+        CHROM12_ROWS / PRODUCER_ROW_GROUP_SIZE,
+        'the chromosome-12 object must span three row groups for the pruning claim to mean anything',
+      );
     }
   });
 
   it('answers the same question differently from two published datasets', async () => {
     const [first, second] = DATASETS;
-    const a = await repositories.get(first!.datasetId)!.synthesizeVariant('CYP1A2');
-    const b = await repositories.get(second!.datasetId)!.synthesizeVariant('CYP1A2');
+    const a = await repositories.get(first!.label)!.synthesizeVariant('CYP1A2');
+    const b = await repositories.get(second!.label)!.synthesizeVariant('CYP1A2');
 
     assert.deepEqual(
       a.variants.map((variant) => [variant.rsid, variant.userGenotype]),
@@ -506,26 +524,28 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
       b.provenance.datasetChecksumSha256,
       'two different datasets must not report the same content checksum',
     );
-    assert.equal(a.provenance.datasetId, first!.datasetId);
-    assert.equal(b.provenance.datasetId, second!.datasetId);
+    assert.equal(a.provenance.datasetId, datasetIds.get(first!.label));
+    assert.equal(b.provenance.datasetId, datasetIds.get(second!.label));
     for (const uri of a.provenance.filesScanned) {
       assert.ok(
-        uri.includes(`/datasets/${first!.datasetId}/`),
-        `dataset ${first!.datasetId} scanned an object outside its own prefix: ${uri}`,
+        uri.includes(`/datasets/${datasetIds.get(first!.label)}/`),
+        `dataset ${first!.label} scanned an object outside its own prefix: ${uri}`,
       );
     }
   });
 
   it('reads only the chromosome-12 object for a chromosome-12 target', async () => {
     const spec = DATASETS[0]!;
-    const manifest = manifests.get(spec.datasetId)!;
+    const manifest = manifests.get(spec.label)!;
     const chrom12 = manifest.parquetObjects.find((object) => object.chrom === '12')!;
     const chrom1 = manifest.parquetObjects.find((object) => object.chrom === '1')!;
     const size = chrom12.byteSize;
-    const groups = rowGroups.get(spec.datasetId)!;
+    const groups = rowGroups.get(spec.label)!;
 
     proxy.reset();
-    const result = await repositories.get(spec.datasetId)!.synthesizeVariant('rs4149056');
+    const startedAt = performance.now();
+    const result = await repositories.get(spec.label)!.synthesizeVariant('rs4149056');
+    const queryLatencyMs = Math.round(performance.now() - startedAt);
 
     const gets = proxy.requests.filter((request) => request.method === 'GET');
     /**
@@ -540,11 +560,8 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
       requestSpan(request, size).end === size;
     // Row-group attribution counts only non-footer-probe GETs. Excluding the footer probe
     // outright — rather than clipping its span to a computed footer offset and hoping the
-    // remainder is small — is what lets row group 2 (immediately adjacent to the footer) keep
-    // the same strict-zero assertion as row group 0 below: the footer probe's incidental
-    // overlap with row group 2's tail bytes (explained at FOOTER_PROBE_MAX_BYTES below) is no
-    // longer counted as row-group traffic at all, instead of being tolerated as a percentage of
-    // an unrelated quantity.
+    // remainder is small — is what lets the last row group (immediately adjacent to the footer)
+    // keep the same strict-zero assertion as row group 0 below.
     const bytesFromRowGroup = (id: number) =>
       gets
         .filter((request) => !isEofTerminatingGet(request))
@@ -556,14 +573,17 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
         {
           duckdbBinding: `@duckdb/node-api@${bindingVersion}`,
           httpfsVersion,
-          datasetId: spec.datasetId,
+          datasetId: result.provenance.datasetId,
           filesSelected: result.provenance.filesScanned,
           inventorySize: manifest.parquetObjects.length,
           chrom12ObjectBytes: size,
+          chrom12RowCount: chrom12.rowCount,
           chrom1ObjectBytes: chrom1.byteSize,
+          chrom1RowCount: chrom1.rowCount,
           s3Requests: proxy.requests.length,
           bytesRead: totalBytes,
           bytesReadRatio: Number((totalBytes / size).toFixed(4)),
+          queryLatencyMs,
           dataBytesPerRowGroup: groups.map((group) => bytesFromRowGroup(group.id)),
           requests: proxy.requests,
         },
@@ -604,19 +624,17 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
     );
     assert.equal(bytesFromRowGroup(0), 0, 'no data may be read from non-matching row group 0');
 
-    // Row group 2 is the last one in the file, immediately adjacent to the footer. httpfs
-    // locates the footer with a single fixed-size speculative tail GET (observed above: exactly
-    // 16 KiB, ending at the file's last byte) rather than a preliminary round trip to learn the
+    // The last row group is immediately adjacent to the footer. httpfs locates the footer with a
+    // single fixed-size speculative tail GET rather than a preliminary round trip to learn the
     // true footer size first — the same "guess and hope it's enough" technique essentially every
-    // remote Parquet reader uses. For an object this compact, that guess window is larger than
-    // the true footer + column/offset-index trailer (about 1.7 KiB here), so the same GET also
-    // incidentally pulls in the tail end of row group 2's own column data: bytes that are never
-    // used to answer the query (only row group 1 is joined against) but are genuinely on the
-    // wire regardless of pruning. That is structural — a property of the footer-probe size
-    // relative to this object's layout, not a pruning regression. Because that GET is now
-    // excluded from row-group attribution entirely (identified by `end === size`, not tolerated
-    // as a fraction of row group 2's size), row group 2 gets the same strict-zero assertion as
-    // row group 0: nothing attributable to actual row-group scanning may come from it.
+    // remote Parquet reader uses. For a compact object, that guess window is larger than the true
+    // footer + column/offset-index trailer, so the same GET also incidentally pulls in the tail
+    // end of the last row group's column data: bytes that are never used to answer the query but
+    // are genuinely on the wire regardless of pruning. That is structural — a property of the
+    // footer-probe size relative to this object's layout, not a pruning regression. Because that
+    // GET is excluded from row-group attribution entirely (identified by `end === size`, not
+    // tolerated as a fraction of the row group's size), the last row group gets the same
+    // strict-zero assertion as row group 0.
     const footerAdjacentRowGroup = groups[groups.length - 1]!;
     assert.equal(
       bytesFromRowGroup(footerAdjacentRowGroup.id),
@@ -628,10 +646,10 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
     // The exclusion above only holds if the footer probe itself stays small — otherwise a
     // regression could hide a whole row-group read inside "one GET that happens to end at EOF"
     // and it would simply vanish from every row-group total instead of being caught. Bound it
-    // directly: FOOTER_PROBE_MAX_BYTES is 4x the observed 16 KiB probe (headroom for an httpfs
-    // version bump) and still far tighter than one column chunk of this object (~73.6 KB on
-    // average across its 5 physical columns, from row group 1's 368,187 bytes / 5), so a
-    // single-column-chunk read smuggled in under "ends at EOF" cannot pass.
+    // directly: FOOTER_PROBE_MAX_BYTES is 4x the 16 KiB probe observed across every real-MinIO
+    // run of this test (headroom for an httpfs version bump) and still far tighter than one
+    // column chunk of this object, so a single-column-chunk read smuggled in under "ends at EOF"
+    // cannot pass.
     const FOOTER_PROBE_MAX_BYTES = 64 * 1024;
     const eofTerminatingGets = gets.filter((request) => isEofTerminatingGet(request));
     for (const request of eofTerminatingGets) {
@@ -644,13 +662,10 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
 
     // The per-request bound above only stops one large probe; it does nothing against several
     // small ones. Two or three EOF-terminating GETs, each individually under
-    // FOOTER_PROBE_MAX_BYTES, are all excluded from `bytesFromRowGroup` by construction (Finding
-    // 1, fix pass 2) and would sail past the per-request check individually — while together
-    // reading deep into row group 2 (any one 64 KiB tail read already reaches back
-    // FOOTER_PROBE_MAX_BYTES bytes from EOF, well inside its 356,546-byte span) with every
-    // assertion above still green. httpfs locates the footer with exactly one speculative tail
-    // read per query — observed as exactly 1 across every real-MinIO run of this test to date
-    // (fix passes 1 and 2, and this pass) — so assert that invariant directly instead of only
+    // FOOTER_PROBE_MAX_BYTES, are all excluded from `bytesFromRowGroup` by construction and would
+    // sail past the per-request check individually — while together reading deep into the last
+    // row group with every assertion above still green. httpfs locates the footer with exactly
+    // one speculative tail read per query, so assert that invariant directly instead of only
     // bounding each probe's individual size.
     assert.equal(
       eofTerminatingGets.length,
@@ -666,11 +681,11 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
 
   it('answers an X-chromosome target, and reads chrom back as a string', async () => {
     const spec = DATASETS[0]!;
-    const manifest = manifests.get(spec.datasetId)!;
+    const manifest = manifests.get(spec.label)!;
     const chromX = manifest.parquetObjects.find((object) => object.chrom === 'X')!;
 
     proxy.reset();
-    const result = await repositories.get(spec.datasetId)!.synthesizeVariant('G6PD');
+    const result = await repositories.get(spec.label)!.synthesizeVariant('G6PD');
 
     assert.deepEqual(
       result.variants.map((variant) => [variant.rsid, variant.gene, variant.userGenotype]),
@@ -711,7 +726,10 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
 
   it('cannot be pointed at another dataset by asking for one that was never published', async () => {
     const factory = createGenotypeRepositoryFactory({
-      datasetResolver: createParquetDatasetResolver({ objectStore, artifactBucket: ARTIFACT_BUCKET }),
+      datasetResolver: createParquetDatasetResolver({
+        objectStore,
+        artifactBucket: ARTIFACT_BUCKET,
+      }),
       coordinateResolver,
       sessionFactory,
     });

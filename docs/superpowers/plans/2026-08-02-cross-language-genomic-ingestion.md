@@ -161,7 +161,7 @@ Create a chromosome-1 object plus a chromosome-12 Zstandard Parquet object conta
 SELECT rsid, gt_raw
 FROM read_parquet(
   ['s3://probe/variants/chrom=12/part-000.parquet'],
-  hive_partitioning = true
+  hive_partitioning = true, hive_types_autocast = 0
 )
 WHERE chrom = '12' AND pos = 21178615;
 ```
@@ -370,7 +370,7 @@ TO '<attempt-parquet-directory>' (
 
 Close the staging database, enumerate every generated Parquet file, validate its schema and statistics through DuckDB, and calculate per-file SHA-256 plus a deterministic dataset content checksum over local descriptors sorted by `(chrom, relativePath)`. S3 keys, ETags, and version IDs do not exist at this layer and are added only after upload in Task 5.
 
-The physical file schema contains `pos`, `rsid`, `ref`, `alt`, and `gt_raw`; `chrom` is encoded by `chrom=<value>` directories and restored as a logical column only through `read_parquet(..., hive_partitioning = true)`. Attempt/version directory segments must not contain `=`.
+The physical file schema contains `pos`, `rsid`, `ref`, `alt`, and `gt_raw`; `chrom` is encoded by `chrom=<value>` directories and restored as a logical column only through `read_parquet(..., hive_partitioning = true, hive_types_autocast = 0)` — both options, always; see `contracts/ingestion-v1.md`, "Reading the dataset". Attempt/version directory segments must not contain `=`.
 
 - [ ] **Step 7: Replace fake Temporal context with `ProgressSink`**
 
@@ -671,7 +671,7 @@ Add a 10-second application query deadline and call the binding's interrupt/canc
 
 - [ ] **Step 8: Implement explicit-file remote Parquet querying**
 
-Remove fixture initialization, vector JSON storage, exception-swallowing synthesis fallback, dataset-local path caching, and the global user-data repository. For each chromosome group, construct the `read_parquet([...], hive_partitioning = true)` file list exclusively from validated manifest descriptors, apply literal `chrom` plus parameterized position predicates directly above the scan, and join a small candidate relation on `pos`, `ref`, and `alt`. Do not rely on dynamic join filtering alone to prune S3 data.
+Remove fixture initialization, vector JSON storage, exception-swallowing synthesis fallback, dataset-local path caching, and the global user-data repository. For each chromosome group, construct the `read_parquet([...], hive_partitioning = true, hive_types_autocast = 0)` file list exclusively from validated manifest descriptors, apply literal `chrom` plus parameterized position predicates directly above the scan, and join a small candidate relation on `pos`, `ref`, and `alt`. Do not rely on dynamic join filtering alone to prune S3 data.
 
 - [ ] **Step 9: Inject the repository into agent tools**
 

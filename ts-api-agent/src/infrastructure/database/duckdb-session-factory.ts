@@ -73,8 +73,24 @@ export interface DuckDbSessionConfig {
   readonly allowExtensionInstall?: boolean;
 }
 
+/**
+ * What the engine itself says it moved over the wire for this session.
+ *
+ * Both numbers are read out of DuckDB's own `duckdb_logs`, not estimated by this process and
+ * not measured by a proxy: `s3Requests` counts the HTTP requests `httpfs` issued, `bytesRead`
+ * sums the bytes the S3 filesystem delivered to the reader. A caller that wants to know whether
+ * partition pruning actually happened has no other honest source — the control plane's own
+ * `ObjectStore` traffic is a different connection entirely.
+ */
+export interface DuckDbSessionTraffic {
+  readonly s3Requests: number;
+  readonly bytesRead: number;
+}
+
 export interface DuckDbSession {
   query(sql: string, values?: readonly DuckDbParam[]): Promise<Record<string, unknown>[]>;
+  /** Cumulative S3 traffic this session has caused so far. */
+  readTraffic(): Promise<DuckDbSessionTraffic>;
   close(): Promise<void>;
 }
 
@@ -177,6 +193,24 @@ export function duckDbS3SessionConfigFromEnv(
   };
 }
 
+/**
+ * The per-query wall-clock budget this deployment enforces.
+ *
+ * Configurable because "how long may one question take" is a deployment decision, but never
+ * unbounded and never silently mis-parsed: a malformed value fails startup rather than quietly
+ * reverting to the default, which is the failure mode where an operator believes a limit is in
+ * force and it is not.
+ */
+export function queryDeadlineFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.DUCKDB_QUERY_DEADLINE_MS;
+  if (raw === undefined || raw.length === 0) return DEFAULT_QUERY_DEADLINE_MS;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`DUCKDB_QUERY_DEADLINE_MS must be a positive integer, got '${raw}'`);
+  }
+  return value;
+}
+
 async function loadHttpfs(
   connection: DuckDBConnection,
   allowExtensionInstall: boolean,
@@ -257,6 +291,24 @@ export async function configureSession(
     SET enable_http_metadata_cache = true;
   `);
 
+  // Engine-sourced request accounting. All four statements are load bearing on DuckDB 1.5.5:
+  //
+  // - `logging_mode = 'ENABLE_SELECTED'` must be set *explicitly*. Setting `enabled_log_types`
+  //   alone leaves the mode at `LEVEL_ONLY`, and the selection is then silently ignored.
+  // - `logging_level = 'trace'` is required because `HTTP` and `FileSystem` entries are emitted
+  //   at TRACE; at the default INFO level `duckdb_logs` stays empty and every metric reads 0.
+  // - restricting the types keeps `QueryLog` and `Transaction` out of the in-memory log, so the
+  //   generated SQL is not accumulated alongside the traffic counters.
+  //
+  // The log lives in this session's memory and dies with it: `readTraffic` only ever aggregates
+  // it into two integers, and no message is printed or returned.
+  await connection.run(`
+    SET logging_mode = 'ENABLE_SELECTED';
+    SET enabled_log_types = 'HTTP,FileSystem';
+    SET logging_level = 'trace';
+    SET enable_logging = true;
+  `);
+
   const { s3 } = config;
   // A scoped secret rather than global `s3_*` settings: the credentials are only offered for
   // URLs below the artifact prefix, so a stray URI elsewhere fails to authenticate instead of
@@ -279,6 +331,30 @@ export async function configureSession(
 export async function teardownSession(connection: DuckDBConnection): Promise<void> {
   await connection.run(`DROP SECRET IF EXISTS ${SESSION_SECRET_NAME};`);
 }
+
+/**
+ * Aggregates `duckdb_logs` into the two traffic numbers.
+ *
+ * Deliberately regex-based rather than JSON-based: `json_extract_string` lives in the `json`
+ * extension, and this session has `autoload_known_extensions` off, so a build without `json`
+ * statically linked would turn a metrics read into a hard query failure on the serving path.
+ * `regexp_extract` is core.
+ */
+const TRAFFIC_SQL = `
+  SELECT
+    count(*) FILTER (WHERE type = 'HTTP') AS s3_requests,
+    coalesce(
+      sum(
+        TRY_CAST(regexp_extract(message, '"bytes":"(\\d+)"', 1) AS BIGINT)
+      ) FILTER (
+        WHERE type = 'FileSystem'
+          AND message LIKE '%"fs":"S3FileSystem"%'
+          AND message LIKE '%"op":"READ"%'
+      ),
+      0
+    ) AS bytes_read
+  FROM duckdb_logs;
+`;
 
 /**
  * DuckDB hands back 64-bit integers as `BigInt` and composite values as wrapper objects. A
@@ -351,6 +427,20 @@ export function createDuckDbSessionFactory(config: DuckDbSessionConfig): DuckDbS
             },
             () => new QueryBudgetExceededError(deadlineMs),
           );
+        },
+
+        async readTraffic(): Promise<DuckDbSessionTraffic> {
+          if (closed) throw new DuckDbSessionClosedError();
+          const [row] = await runWithDeadline(
+            connection,
+            deadlineMs,
+            async () => (await connection.runAndReadAll(TRAFFIC_SQL)).getRowObjectsJS(),
+            () => new QueryBudgetExceededError(deadlineMs),
+          );
+          return {
+            s3Requests: Number(row?.s3_requests ?? 0),
+            bytesRead: Number(row?.bytes_read ?? 0),
+          };
         },
 
         async close() {
