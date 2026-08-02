@@ -654,8 +654,18 @@ describe('cross-language genomic ingestion (API → Temporal → Rust → S3 →
           // file*, so `lag(...) OVER (ORDER BY file_row_number)` compares each row with the one
           // physically before it. Ordering by `pos` here instead would make the query sort the
           // data itself and assert nothing at all.
+          // `violations` is a `FILTER`, not an outer `WHERE`: an outer `WHERE` would restrict
+          // *both* aggregates to the matching rows, so a well-sorted file (correctly zero
+          // violations) would also aggregate `max(file_row_number)` over zero rows — NULL,
+          // coerced to 0 below — silently reporting "zero rows examined" on every passing run.
+          // `FILTER` keeps `rows` computed over the whole partition regardless of how many rows
+          // violate the ordering.
           const [row] = await session.query(`
-            SELECT count(*) AS violations, max(file_row_number) + 1 AS rows
+            SELECT
+              count(*) FILTER (
+                WHERE prev_pos IS NOT NULL AND (pos, ref, alt) < (prev_pos, prev_ref, prev_alt)
+              ) AS violations,
+              max(file_row_number) + 1 AS rows
             FROM (
               SELECT file_row_number,
                      pos, ref, alt,
@@ -666,14 +676,17 @@ describe('cross-language genomic ingestion (API → Temporal → Rust → S3 →
                 ['s3://${object.bucket}/${object.key}'],
                 file_row_number = true
               )
-            )
-            WHERE prev_pos IS NOT NULL
-              AND (pos, ref, alt) < (prev_pos, prev_ref, prev_alt);
+            );
           `);
           violations.push({
             chrom: object.chrom,
             count: Number(row?.violations ?? -1),
-            rows: object.rowCount,
+            // The query's own row count, not `object.rowCount` from the manifest: the manifest
+            // says how many rows the producer *wrote*, which proves nothing about how many the
+            // readback query actually saw. A partition that reads back as zero rows also reads
+            // back as zero violations, so sourcing `rows` from the manifest would let that pass
+            // silently as `violations: 0`. Asserted below.
+            rows: Number(row?.rows ?? 0),
           });
         }
       } finally {
@@ -690,6 +703,11 @@ describe('cross-language genomic ingestion (API → Temporal → Rust → S3 →
           'row-group pruning is only correct because they are',
       );
       assert.ok(violations.length > 0, 'the sweep must have examined at least one partition');
+      assert.ok(
+        violations.every((entry) => entry.rows > 0),
+        'every partition must actually read back rows from the readback query itself; a ' +
+          `zero-row readback would otherwise pass as zero violations: ${JSON.stringify(violations)}`,
+      );
     });
 
     it('the sortedness check above is capable of failing', async () => {

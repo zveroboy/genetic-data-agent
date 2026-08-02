@@ -24,7 +24,9 @@ anything.
 TypeScript. The Workflow schedules it by name onto the other queue. Nothing in the TypeScript
 process launches a Rust binary, shells out, or touches a local VCF — a unit test
 (`ts-api-agent/src/serving-invariants.test.ts`) fails the build if a `child_process` import or
-the word `cargo` appears anywhere in the TypeScript sources.
+the word `cargo` appears anywhere under `ts-api-agent/src`. The sweep does not reach
+`tests/integration/support/stack.ts`, which legitimately spawns `cargo` to drive the Rust worker
+for the integration suites and is not request-path code.
 
 ### Progress, and what it is allowed to claim
 
@@ -338,7 +340,7 @@ machines (`export PATH="$(rustup which cargo | xargs dirname):$PATH"`).
 | `remote_parquet_pruning` | from an HTTP proxy's request log: a chromosome-12 target reads one object, part of it, and never touches chromosome 1 |
 | `offline_container_serving` | a cold container with no route off the host answers `/ask` from remote Parquet |
 | `temporal_rust_probe` | retry and cancellation semantics against real Temporal history |
-| `serving-invariants` (unit) | the *absence* of a second way to answer: no local database, no glob, no fixture fallback, no subprocess, no bare `hive_partitioning` |
+| `serving-invariants` (unit) | the *absence* of a second way to answer across `ts-api-agent/src` and `rust-ingestion-worker/src`: no local database, no glob, no fixture fallback, no subprocess, no bare `hive_partitioning`. `tests/integration/**` is outside both collections and is not swept. |
 
 Every suite creates its own buckets under a per-run name and removes exactly those. None of them
 deletes anything it did not create.

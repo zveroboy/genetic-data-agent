@@ -29,4 +29,10 @@ jobs:
             # and the overlay only changes what differs away from a laptop. Both files are
             # required, in this order.
             docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
-            docker system prune -f
+            # Scoped to images this project built (both Dockerfiles carry
+            # `LABEL com.genomic-ingestion.project=genomic-ingestion`), and only dangling ones —
+            # never a running image, another project's stopped container or unattached network,
+            # and never the BuildKit cache the Rust image's cache mounts depend on for the
+            # ~21-second warm rebuild. `docker system prune -f` did all of that unscoped and is
+            # deliberately not used here.
+            docker image prune -f --filter "label=com.genomic-ingestion.project=genomic-ingestion"

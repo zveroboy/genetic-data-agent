@@ -85,14 +85,8 @@ candidates="$(
       newestByPrefix.set(prefix, Math.max(newestByPrefix.get(prefix) ?? 0, at));
     }
 
-    // Which attempt prefix each published dataset actually depends on. Read from the manifest
+    // Which attempt prefix each published dataset actually depends on is read from the manifest
     // itself, never guessed from the key: "the highest attempt number" is not the same thing.
-    const live = new Set();
-    for (const object of objects) {
-      if (!/^datasets\/[^/]+\/manifest\.json$/.test(object.k)) continue;
-      live.add(object.k.replace(/manifest\.json$/, "__pending__"));
-    }
-
     // The manifest bodies are fetched by the shell (one `aws s3 cp` each) rather than here, so
     // this stays a pure function of its input. Emit the datasets to inspect and the prefixes
     // seen, and let the shell resolve the rest.

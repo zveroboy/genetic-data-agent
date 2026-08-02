@@ -51,8 +51,16 @@ const execFileAsync = promisify(execFile);
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
-/** `cargo` is installed through rustup and is not on a login shell's PATH on this machine. */
-export const CARGO_PATH = `/opt/homebrew/opt/rustup/bin:${process.env.PATH ?? ''}`;
+/**
+ * `cargo` is installed through rustup and is not on a login shell's PATH on every machine. The
+ * directory to prepend is not guessable in general — it depends on how rustup was installed —
+ * so it is read from `CARGO_BIN_DIR` when set (`export CARGO_BIN_DIR="$(rustup which cargo |
+ * xargs dirname)"` is the portable way to get it, and is what `GUIDE.md` recommends) and falls
+ * back to this machine's Homebrew layout only when that variable is absent. Prepending is
+ * harmless even when `cargo` is already reachable another way.
+ */
+const CARGO_BIN_DIR = process.env.CARGO_BIN_DIR ?? '/opt/homebrew/opt/rustup/bin';
+export const CARGO_PATH = `${CARGO_BIN_DIR}:${process.env.PATH ?? ''}`;
 
 export const S3_ENDPOINT = process.env.S3_ENDPOINT ?? 'http://localhost:9000';
 export const S3_ACCESS_KEY = process.env.S3_ACCESS_KEY ?? 'admin';

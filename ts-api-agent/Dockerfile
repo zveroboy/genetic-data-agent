@@ -23,6 +23,11 @@
 #
 # At run time the serving session forces `autoinstall_known_extensions` and
 # `autoload_known_extensions` off, so neither is ever fetched on a user's first request.
+#
+# Requires BuildKit: the `ARG TARGETARCH` used below to pick the `@swc/core` platform binding is
+# only populated by BuildKit's default builder. Build with `DOCKER_BUILDKIT=1` or `docker buildx`,
+# not the legacy builder (`DOCKER_BUILDKIT=0`), which leaves `TARGETARCH` empty and fails the
+# `unsupported TARGETARCH ''` guard below.
 
 FROM node:25-bookworm-slim AS build
 
@@ -79,6 +84,10 @@ FROM node:25-bookworm-slim AS runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+
+# Scopes `docker image prune -f --filter label=...` (used by the deploy workflow) to images this
+# project built, so a prune after deploy never touches another project's dangling image.
+LABEL com.genomic-ingestion.project="genomic-ingestion"
 
 WORKDIR /app/ts-api-agent
 ENV NODE_ENV=production \

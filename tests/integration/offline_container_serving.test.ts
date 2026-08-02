@@ -70,9 +70,24 @@ const MINIO_PASSWORD = 'password123';
 const DATASET_KEY = 'demo-small';
 const SOURCE_KEY = 'samples/demo_user.vcf';
 
-async function docker(args: string[], options: { allowFailure?: boolean } = {}): Promise<string> {
+// Bounds every `docker` invocation below with `execFile`'s own `timeout`/`killSignal`, which
+// actually terminates the child process — unlike `withTimeout` (see `support/stack.ts`), which
+// only races a promise and leaves whatever it wraps still running. A `docker build` is the case
+// that matters most: without this, a wedged build would keep consuming CPU/disk in the
+// background for the rest of the run (and beyond) even after the test that started it had timed
+// out and moved on.
+const DEFAULT_DOCKER_TIMEOUT_MS = 60_000;
+
+async function docker(
+  args: string[],
+  options: { allowFailure?: boolean; timeoutMs?: number } = {},
+): Promise<string> {
   try {
-    const { stdout } = await execFileAsync('docker', args, { maxBuffer: 64 * 1024 * 1024 });
+    const { stdout } = await execFileAsync('docker', args, {
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: options.timeoutMs ?? DEFAULT_DOCKER_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    });
     return stdout;
   } catch (error) {
     if (options.allowFailure === true) return '';
@@ -80,9 +95,16 @@ async function docker(args: string[], options: { allowFailure?: boolean } = {}):
   }
 }
 
-/** Runs a snippet of Node inside the API container and returns its stdout. */
-async function inContainer(script: string): Promise<string> {
-  return docker(['exec', API_CONTAINER, 'node', '-e', script]);
+/**
+ * Runs a snippet of Node inside the API container and returns its stdout.
+ *
+ * Bounded by default: a wedged container must not block this suite until the runner's own
+ * one-hour `--test-timeout`. 30s is generous for everything called here (a health probe, a DNS
+ * lookup, one `/ask`), and the timeout kills the `docker exec` client-side rather than hanging
+ * indefinitely on a container that stopped responding.
+ */
+async function inContainer(script: string, timeoutMs = 30_000): Promise<string> {
+  return docker(['exec', API_CONTAINER, 'node', '-e', script], { timeoutMs });
 }
 
 describe('a cold, network-isolated ts-api container', () => {
@@ -103,19 +125,13 @@ describe('a cold, network-isolated ts-api container', () => {
     stagingRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-staging-'));
 
     // --- the image under test, and an isolated network with no way off the host --------------
-    await withTimeout(
-      // Absolute `-f`: the suite runs from the `ts-api-agent` workspace directory, and a
-      // Dockerfile path is resolved against the caller's cwd, not against the build context.
-      docker([
-        'build',
-        '-f',
-        path.join(REPO_ROOT, 'ts-api-agent/Dockerfile'),
-        '-t',
-        IMAGE_TAG,
-        REPO_ROOT,
-      ]),
-      20 * 60_000,
-      'the ts-api image build',
+    // Absolute `-f`: the suite runs from the `ts-api-agent` workspace directory, and a
+    // Dockerfile path is resolved against the caller's cwd, not against the build context.
+    // `timeoutMs` here — not `withTimeout` — is what actually kills a wedged build instead of
+    // merely giving up on waiting for it.
+    await docker(
+      ['build', '-f', path.join(REPO_ROOT, 'ts-api-agent/Dockerfile'), '-t', IMAGE_TAG, REPO_ROOT],
+      { timeoutMs: 20 * 60_000 },
     );
     await docker(['network', 'create', '--internal', NETWORK]);
 
@@ -127,7 +143,9 @@ describe('a cold, network-isolated ts-api container', () => {
       '-p', `127.0.0.1:${minioPort}:9000`,
       '-e', `MINIO_ROOT_USER=${MINIO_USER}`,
       '-e', `MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}`,
-      'minio/minio:latest',
+      // Pinned to match `docker-compose.yml`'s `minio` service — see the comment there for how
+      // to move this pin.
+      'minio/minio:RELEASE.2025-09-07T16-13-09Z',
       'server', '/data',
     ]);
     await docker(['network', 'connect', '--alias', 'minio', NETWORK, MINIO_CONTAINER]);
@@ -276,6 +294,15 @@ describe('a cold, network-isolated ts-api container', () => {
       })().catch((e) => console.log('FAILED ' + e.message));
     `);
     assert.match(output, /^HTTPFS \w+/m, `httpfs did not load offline: ${output}`);
+    // GUIDE.md documents this exact pair (engine v1.5.5, extension 827222f) as what the image
+    // preinstalls. A binding bump could leave the extension loading (the assertion above stays
+    // green) while pulling a different build than documented; pin the actual value here too, in
+    // the one place that runs against the built container rather than the build script.
+    assert.match(
+      output,
+      /^HTTPFS 827222f$/m,
+      `httpfs extension version drifted from the pair documented in GUIDE.md: ${output}`,
+    );
   });
 
   it('answers /ask from remote Parquet, from inside the isolated network', async () => {

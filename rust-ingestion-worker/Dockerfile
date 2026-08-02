@@ -11,6 +11,10 @@
 # The image runs `temporal_worker`, which polls the activity-only `genomic-ingestion-rust` task
 # queue. It is never invoked by the TypeScript control plane as a subprocess: the only thing that
 # crosses the language boundary is a Temporal Activity payload naming S3 objects.
+#
+# Requires BuildKit (the cache mounts below and `docker build`'s implicit `TARGETARCH` are both
+# BuildKit features): build with `DOCKER_BUILDKIT=1` or a `docker buildx` builder, not the legacy
+# builder (`DOCKER_BUILDKIT=0`), which fails on the unrecognised `--mount=type=cache` syntax.
 
 # The toolchain is pinned rather than `rust:latest`: the Temporal Rust SDK is a `=0.5.0` Public
 # Preview pin, and a floating compiler is exactly how a reproducible build stops being one.
@@ -78,6 +82,10 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+
+# Scopes `docker image prune -f --filter label=...` (used by the deploy workflow) to images this
+# project built, so a prune after deploy never touches another project's dangling image.
+LABEL com.genomic-ingestion.project="genomic-ingestion"
 
 # An unprivileged user with a staging directory of its own. Ingestion stages a DuckDB database
 # and a Parquet export per attempt under `INGESTION_STAGING_ROOT`; `docker-compose.prod.yml`

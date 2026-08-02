@@ -78,10 +78,12 @@ Pruning is by construction rather than by hope: the partition value is a literal
 the scan, positions are bound parameters, and only objects whose declared `[minPos, maxPos]`
 can contain a resolved coordinate are listed at all. Measured on a real ingestion
 (`tests/integration/remote_parquet_pruning.test.ts`, chromosome-12 target in a four-partition
-dataset): **6 S3 requests, 384,647 of the 1,080,772 bytes of the one selected object, zero bytes
-from the two non-matching row groups, and not a single request against the chromosome-1
-object.** Those numbers come from an HTTP proxy in front of MinIO that counts every request the
-engine makes, and are reproduced independently by the API's own metrics record.
+dataset): a **single-digit number of S3 requests**, **a small fraction of the one selected
+object's bytes** read, **zero bytes** from the two non-matching row groups, and **not a single
+request** against the chromosome-1 object. Those numbers come from an HTTP proxy in front of
+MinIO that counts every request the engine makes, are reproduced independently by the API's own
+metrics record, and are pinned by assertions in the test itself rather than by this paragraph —
+see that file for the exact figures on any given run.
 
 ### Reference data is global; user data is per-dataset
 
@@ -115,8 +117,9 @@ versions, schema fingerprint, reference build and version, and **the exact objec
 
 ## Run it
 
-Requires Docker, and — for the integration suite — the [`temporal` CLI](https://docs.temporal.io/cli),
-a Rust toolchain and the AWS CLI.
+Requires Docker, and — for the integration suite — the [`temporal` CLI](https://docs.temporal.io/cli)
+and a Rust toolchain. The AWS CLI is not needed for the suites; only
+`scripts/cleanup_orphan_attempts.sh` (an operator tool, not part of any test) shells out to `aws`.
 
 ```bash
 make up      # temporal, minio, qdrant, ts-api, ts-control-worker, rust-ingestion-worker

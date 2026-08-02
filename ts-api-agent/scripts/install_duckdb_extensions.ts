@@ -15,6 +15,15 @@
  */
 import { DuckDBInstance } from '@duckdb/node-api';
 
+// The pair documented in `GUIDE.md` ("Neither runtime image invokes Cargo..."): engine `v1.5.5`,
+// `httpfs` extension `827222f`. Asserted below, not just logged — a `@duckdb/node-api` version
+// bump can pull a different engine build with a different bundled `httpfs`, and every other
+// committed assertion (`offline_container_serving.test.ts`'s `/^HTTPFS \w+/m`,
+// `remote_parquet_pruning.test.ts`'s log line) would stay green while the documented pairing
+// quietly went false. This is the one place a drift fails loud, at image-build time.
+const PINNED_ENGINE_VERSION = 'v1.5.5';
+const PINNED_HTTPFS_EXTENSION_VERSION = '827222f';
+
 const instance = await DuckDBInstance.create(':memory:');
 const connection = await instance.connect();
 
@@ -40,6 +49,15 @@ try {
 
   if (row?.httpfs === undefined || row.httpfs === null) {
     throw new Error('httpfs did not load after INSTALL; the image would fail every /ask');
+  }
+
+  if (row.engine !== PINNED_ENGINE_VERSION || row.httpfs !== PINNED_HTTPFS_EXTENSION_VERSION) {
+    throw new Error(
+      `engine/httpfs pair drifted from the pair documented in GUIDE.md: expected engine ` +
+        `${PINNED_ENGINE_VERSION} + httpfs ${PINNED_HTTPFS_EXTENSION_VERSION}, got engine ` +
+        `${String(row.engine)} + httpfs ${String(row.httpfs)}. Update the pin in GUIDE.md and ` +
+        'here once the new pair is verified, or pin @duckdb/node-api back.',
+    );
   }
 
   console.log(
