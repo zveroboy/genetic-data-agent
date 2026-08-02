@@ -1,6 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 
+import {
+  REFERENCE_BUILD,
+  REFERENCE_VERSION,
+} from '../ts-api-agent/src/domain/datasets.ts';
+
 // Realistic clinical benchmark variants from NA12878 / NIST Genome in a Bottle & ClinVar
 const CLINICAL_BENCHMARK_VARIANTS = [
   // Pharmacogenomics (PGx)
@@ -9,6 +14,9 @@ const CLINICAL_BENCHMARK_VARIANTS = [
   { chrom: 'chr16', pos: 31107689, rsid: 'rs9923231', ref: 'C', alt: 'T', gt: '1/1', gene: 'VKORC1', phenotype: 'High warfarin sensitivity', clinical_significance: 'Drug Response', evidence_note: 'Requires lower initial dose of warfarin blood thinner.' },
   { chrom: 'chr22', pos: 42128945, rsid: 'rs3892097', ref: 'C', alt: 'T', gt: '0/1', gene: 'CYP2D6', phenotype: 'Intermediate SSRI metabolizer (*4 allele)', clinical_significance: 'Drug Response', evidence_note: 'Reduced metabolism of codeine, SSRIs, and beta-blockers.' },
   { chrom: 'chr10', pos: 94781859, rsid: 'rs4244285', ref: 'G', alt: 'A', gt: '0/1', gene: 'CYP2C19', phenotype: 'Intermediate Clopidogrel metabolizer (*2 allele)', clinical_significance: 'Drug Response', evidence_note: 'Reduced bioactivation of clopidogrel (Plavix); alternative antiplatelet advised.' },
+  // X-linked on purpose: 'X' is a chromosome name, not a number, and a reference that contained
+  // only autosomes would never exercise the VARCHAR partition-value domain the readers rely on.
+  { chrom: 'chrX', pos: 154536002, rsid: 'rs1050828', ref: 'C', alt: 'T', gt: '0/1', gene: 'G6PD', phenotype: 'G6PD deficiency (A- variant), haemolysis risk', clinical_significance: 'Drug Response', evidence_note: 'Reduced G6PD activity; oxidative drugs such as primaquine and rasburicase can trigger haemolysis.' },
 
   // Nutrition & Metabolism
   { chrom: 'chr2', pos: 135851076, rsid: 'rs4988235', ref: 'T', alt: 'C', gt: '1/1', gene: 'LCT', phenotype: 'Primary Lactase Deficiency (Lactose Intolerance)', clinical_significance: 'Pathogenic', evidence_note: 'Absence of lactase persistence allele; adult hypolactasia.' },
@@ -80,9 +88,67 @@ function generateClinVarTsvContent(): string {
   return lines.join('\n') + '\n';
 }
 
+/**
+ * The versioned ClinVar coordinate snapshot the serving path resolves gene symbols and rsIDs
+ * against, before a single byte of user Parquet is read.
+ *
+ * Unlike `clinvar_benchmark.tsv` — which is keyed by rsID alone and carries no coordinates —
+ * every row here declares the exact `(reference_build, chrom, pos, ref, alt)` tuple the query
+ * planner needs for partition and row-group pruning, plus the snapshot version it belongs to.
+ * `reference_version` and `reference_build` are pinned to the same constants the dataset
+ * catalog stamps into every manifest, so a coordinate snapshot and a published dataset can
+ * never silently disagree about which genome they describe.
+ *
+ * Contigs are written in the `chr`-prefixed spelling the source VCF uses; the resolver
+ * normalizes them to the `1`..`22`/`X`/`Y`/`MT` partition-value domain at read time.
+ *
+ * The output is deterministic: same input, same bytes, so the fixture can be committed and
+ * regenerated without churn.
+ */
+function generateClinVarCoordinatesTsvContent(): string {
+  const columns = [
+    'reference_version',
+    'reference_build',
+    'chrom',
+    'pos',
+    'rsid',
+    'ref',
+    'alt',
+    'gene',
+    'phenotype',
+    'clinical_significance',
+    'evidence_note',
+  ];
+
+  const lines = [columns.join('\t')];
+  for (const v of CLINICAL_BENCHMARK_VARIANTS) {
+    lines.push(
+      [
+        REFERENCE_VERSION,
+        REFERENCE_BUILD,
+        v.chrom,
+        String(v.pos),
+        v.rsid,
+        v.ref,
+        v.alt,
+        v.gene,
+        v.phenotype,
+        v.clinical_significance,
+        v.evidence_note,
+      ].join('\t'),
+    );
+  }
+
+  return lines.join('\n') + '\n';
+}
+
 async function run() {
   const vcfPath = path.resolve(process.cwd(), 'tests/fixtures/na12878_clinical_benchmark.vcf');
   const tsvPath = path.resolve(process.cwd(), 'tests/fixtures/clinvar_benchmark.tsv');
+  const coordinatesPath = path.resolve(
+    process.cwd(),
+    'tests/fixtures/clinvar_coordinates_grch38.tsv',
+  );
 
   console.log('[Clinical Benchmark] Generating realistic NA12878 1000 Genomes VCF...');
   const vcfData = generateVcfContent();
@@ -93,6 +159,15 @@ async function run() {
   const tsvData = generateClinVarTsvContent();
   fs.writeFileSync(tsvPath, tsvData, 'utf-8');
   console.log(`✔ Created ClinVar TSV dataset: ${tsvPath}`);
+
+  console.log(
+    `[Clinical Benchmark] Generating versioned ClinVar coordinate snapshot (${REFERENCE_VERSION} / ${REFERENCE_BUILD})...`,
+  );
+  const coordinatesData = generateClinVarCoordinatesTsvContent();
+  fs.writeFileSync(coordinatesPath, coordinatesData, 'utf-8');
+  console.log(
+    `✔ Created ClinVar coordinate snapshot (${CLINICAL_BENCHMARK_VARIANTS.length} targets): ${coordinatesPath}`,
+  );
 }
 
 run().catch(console.error);

@@ -1,5 +1,11 @@
-import { duckDbRepository } from '../database/duckdb.ts';
-
+/**
+ * Global literature store. Holds published PubMed abstracts only — never a user genotype — so
+ * it is deliberately process-wide and shared, unlike the per-dataset genotype repository.
+ *
+ * The former DuckDB/JSON mirror of these vectors is gone: it wrote a `data/` file from the
+ * serving path and shared a module with user data. Qdrant is now the only store; when it is
+ * unreachable the search reports that, rather than answering from a stale local copy.
+ */
 export interface PubMedVectorDocument {
   id: number;
   pmid: string;
@@ -31,7 +37,7 @@ export class QdrantRepository {
   async initCollection(vectorSize: number = 768): Promise<void> {
     const isAlive = await this.isQdrantAlive();
     if (!isAlive) {
-      console.log('[QdrantRepository] Qdrant server offline. Using DuckDB native vector store fallback.');
+      console.warn('[QdrantRepository] Qdrant server offline; literature search is unavailable.');
       return;
     }
 
@@ -62,67 +68,55 @@ export class QdrantRepository {
   }
 
   async upsertPoints(documents: PubMedVectorDocument[]): Promise<void> {
-    const isAlive = await this.isQdrantAlive();
-
-    if (isAlive) {
-      const points = documents.map((doc) => ({
-        id: doc.id,
-        vector: doc.vector,
-        payload: {
-          pmid: doc.pmid,
-          gene: doc.gene,
-          title: doc.title,
-          abstract: doc.abstract,
-          year: doc.year,
-        },
-      }));
-
-      const res = await fetch(`${this.qdrantUrl}/collections/${this.collectionName}/points?wait=true`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ points }),
-      });
-
-      if (!res.ok) {
-        console.warn(`[QdrantRepository] Upsert failed: ${await res.text()}`);
-      } else {
-        console.log(`✔ Successfully upserted ${documents.length} points to Qdrant collection '${this.collectionName}'.`);
-      }
+    if (!(await this.isQdrantAlive())) {
+      throw new Error(
+        `[QdrantRepository] cannot upsert ${documents.length} documents: Qdrant at ${this.qdrantUrl} is unreachable`,
+      );
     }
 
-    // Always keep DuckDB synchronized as a fallback vector store
-    await duckDbRepository.initVectorTable(documents);
+    const points = documents.map((doc) => ({
+      id: doc.id,
+      vector: doc.vector,
+      payload: {
+        pmid: doc.pmid,
+        gene: doc.gene,
+        title: doc.title,
+        abstract: doc.abstract,
+        year: doc.year,
+      },
+    }));
+
+    const res = await fetch(`${this.qdrantUrl}/collections/${this.collectionName}/points?wait=true`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ points }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`[QdrantRepository] upsert failed: ${await res.text()}`);
+    }
+    console.log(`✔ Successfully upserted ${documents.length} points to Qdrant collection '${this.collectionName}'.`);
   }
 
   async searchVector(queryVector: number[], topK: number = 3): Promise<any[]> {
-    const isAlive = await this.isQdrantAlive();
-
-    if (isAlive) {
-      try {
-        const res = await fetch(`${this.qdrantUrl}/collections/${this.collectionName}/points/search`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            vector: queryVector,
-            limit: topK,
-            with_payload: true,
-          }),
-        });
-
-        if (res.ok) {
-          const data: any = await res.json();
-          return (data.result || []).map((hit: any) => ({
-            score: hit.score,
-            ...hit.payload,
-          }));
-        }
-      } catch (err: any) {
-        console.warn(`[QdrantRepository] Qdrant search fallback: ${err.message}`);
-      }
+    if (!(await this.isQdrantAlive())) {
+      throw new Error(`[QdrantRepository] Qdrant at ${this.qdrantUrl} is unreachable`);
     }
 
-    // DuckDB vector fallback search
-    return duckDbRepository.searchVectorDuckDb(queryVector, topK);
+    const res = await fetch(`${this.qdrantUrl}/collections/${this.collectionName}/points/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vector: queryVector, limit: topK, with_payload: true }),
+    });
+
+    if (!res.ok) {
+      throw new Error(
+        `[QdrantRepository] literature search failed (${res.status}): ${await res.text()}`,
+      );
+    }
+
+    const data: any = await res.json();
+    return (data.result || []).map((hit: any) => ({ score: hit.score, ...hit.payload }));
   }
 }
 

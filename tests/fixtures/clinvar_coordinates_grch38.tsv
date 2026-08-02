@@ -1,0 +1,16 @@
+reference_version	reference_build	chrom	pos	rsid	ref	alt	gene	phenotype	clinical_significance	evidence_note
+demo-clinvar-grch38-v1	GRCh38	chr15	74749576	rs762551	A	C	CYP1A2	Slow caffeine metabolizer	Risk Factor	Decreased CYP1A2 enzyme activity; slower clearance of caffeine.
+demo-clinvar-grch38-v1	GRCh38	chr12	21178615	rs4149056	T	C	SLCO1B1	Statins myopathy risk	Risk Factor	Intermediate OATP1B1 function; increased blood statin levels and myopathy risk.
+demo-clinvar-grch38-v1	GRCh38	chr16	31107689	rs9923231	C	T	VKORC1	High warfarin sensitivity	Drug Response	Requires lower initial dose of warfarin blood thinner.
+demo-clinvar-grch38-v1	GRCh38	chr22	42128945	rs3892097	C	T	CYP2D6	Intermediate SSRI metabolizer (*4 allele)	Drug Response	Reduced metabolism of codeine, SSRIs, and beta-blockers.
+demo-clinvar-grch38-v1	GRCh38	chr10	94781859	rs4244285	G	A	CYP2C19	Intermediate Clopidogrel metabolizer (*2 allele)	Drug Response	Reduced bioactivation of clopidogrel (Plavix); alternative antiplatelet advised.
+demo-clinvar-grch38-v1	GRCh38	chrX	154536002	rs1050828	C	T	G6PD	G6PD deficiency (A- variant), haemolysis risk	Drug Response	Reduced G6PD activity; oxidative drugs such as primaquine and rasburicase can trigger haemolysis.
+demo-clinvar-grch38-v1	GRCh38	chr2	135851076	rs4988235	T	C	LCT	Primary Lactase Deficiency (Lactose Intolerance)	Pathogenic	Absence of lactase persistence allele; adult hypolactasia.
+demo-clinvar-grch38-v1	GRCh38	chr1	11796321	rs1801133	G	A	MTHFR	Reduced folate metabolism (C677T thermolabile variant)	Risk Factor	30-60% decrease in MTHFR enzyme efficiency; elevated homocysteine risk without B-vitamin intake.
+demo-clinvar-grch38-v1	GRCh38	chr19	44908684	rs429358	T	C	APOE	APOE-e4 carrier (Elevated Alzheimer & LDL cholesterol risk)	Risk Factor	APOE epsilon 4 allele carrier; associated with increased beta-amyloid deposition and cardiovascular risk.
+demo-clinvar-grch38-v1	GRCh38	chr19	44908822	rs7412	C	T	APOE	APOE-e3 reference	Benign	Normal lipoprotein metabolism.
+demo-clinvar-grch38-v1	GRCh38	chr1	169549811	rs6025	C	T	F5	Factor V Leiden carrier (Thrombophilia risk)	Pathogenic	Activated protein C resistance; 3-5x increased relative risk for deep vein thrombosis (DVT).
+demo-clinvar-grch38-v1	GRCh38	chr6	32632646	rs2187668	T	C	HLA-DQA1	HLA-DQ2.5 haplotype (Celiac disease genetic susceptibility)	Risk Factor	Present in over 90% of celiac disease patients; dietary gluten triggers T-cell immune response.
+demo-clinvar-grch38-v1	GRCh38	chr17	43057051	rs80357906	G	A	BRCA1	Normal BRCA1 allele (No familial cancer mutation detected)	Benign	Wild-type tumor suppressor gene sequence.
+demo-clinvar-grch38-v1	GRCh38	chr13	32332611	rs80359550	C	T	BRCA2	Normal BRCA2 allele	Benign	Wild-type BRCA2 sequence.
+demo-clinvar-grch38-v1	GRCh38	chr17	7673802	rs1042522	G	C	TP53	TP53 Arg72Pro polymorphism	Benign / Risk Modifier	Common human polymorphism; minor modifier of cellular apoptosis efficiency.

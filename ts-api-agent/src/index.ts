@@ -4,8 +4,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Hono } from 'hono';
 import { Connection, Client } from '@temporalio/client';
-import { askBioinformaticsAgent } from './infrastructure/ai/agent.ts';
-import { duckDbRepository } from './infrastructure/database/duckdb.ts';
 import { newDatasetId } from './application/dataset-catalog.ts';
 import {
   CONTROL_PLANE_TASK_QUEUE,
@@ -16,22 +14,6 @@ import { DATASET_KEYS, isDatasetKey } from './domain/datasets.ts';
 
 export const app = new Hono();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const defaultVcf = path.resolve(__dirname, '../../tests/fixtures/demo_user.vcf');
-const defaultTsv = path.resolve(__dirname, '../../tests/fixtures/annotations_mock.tsv');
-
-async function autoInitFixtures() {
-  try {
-    if (fs.existsSync(defaultVcf) && fs.existsSync(defaultTsv)) {
-      await duckDbRepository.initFromFixtures(defaultVcf, defaultTsv);
-      console.log(`[Auto-Init] DuckDB initialized successfully from ${defaultVcf}.`);
-    }
-  } catch (err: any) {
-    console.warn('[Auto-Init Warning]:', err.message);
-  }
-}
-
-// Trigger auto-init on server start
-autoInitFixtures();
 
 // Static HTML Web UI (Zero-Build index.html)
 function getHtmlUi(): string {
@@ -101,38 +83,25 @@ app.get('/api/ingestion/status/:workflowId', async (c) => {
   }
 });
 
-app.post('/ask', async (c) => {
-  try {
-    const body = await c.req.json<{ question: string; dryRunLocal?: boolean }>();
-    if (!body.question) {
-      return c.json({ error: 'Question is required' }, 400);
-    }
-
-    try {
-      const result = await askBioinformaticsAgent(body.question, {
-        dryRunLocal: body.dryRunLocal,
-      });
-      return c.json(result);
-    } catch (agentErr: any) {
-      if (agentErr?.message?.includes('user_variants')) {
-        await autoInitFixtures();
-        const retryResult = await askBioinformaticsAgent(body.question, {
-          dryRunLocal: body.dryRunLocal,
-        });
-        return c.json(retryResult);
-      }
-      throw agentErr;
-    }
-  } catch (err: any) {
-    console.error('[API Server /ask Error]:', err);
-    return c.json({ error: err.message || String(err) }, 500);
-  }
-});
-
-app.post('/init-fixtures', async (c) => {
-  await autoInitFixtures();
-  return c.json({ status: 'fixtures initialized', vcf: defaultVcf, tsv: defaultTsv });
-});
+/**
+ * Placeholder while dataset selection is wired up.
+ *
+ * The fixture-backed answer this endpoint used to give is gone: the serving path now reads a
+ * user's own published Parquet, which means a request must name the dataset it may read. That
+ * request shape, and the composition of the per-request repository, belong to the task that
+ * owns this endpoint — so this reports the gap instead of guessing at a dataset or falling
+ * back to a fixture.
+ */
+app.post('/ask', async (c) =>
+  c.json(
+    {
+      error:
+        '/ask now requires an explicit published dataset; dataset selection is not wired into ' +
+        'this endpoint yet',
+    },
+    503,
+  ),
+);
 
 const port = Number(process.env.PORT) || 3000;
 

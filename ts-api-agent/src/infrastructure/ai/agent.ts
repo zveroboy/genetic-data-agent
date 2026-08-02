@@ -1,11 +1,13 @@
 import { generateOllamaEmbedding } from '../vector/embeddings.ts';
 import { qdrantRepository } from '../vector/qdrant.ts';
-import { duckDbRepository } from '../database/duckdb.ts';
+import { TargetNotResolvableError } from '../database/clinvar-coordinate-resolver.ts';
+import type { GenotypeProvenance, GenotypeRepository } from '../database/duckdb.ts';
+import { TargetNotPresentError } from '../database/parquet-dataset-resolver.ts';
 
-export const SYSTEM_PROMPT = `You are an expert bioinformatics AI assistant. 
+export const SYSTEM_PROMPT = `You are an expert bioinformatics AI assistant.
 Your primary directive is accuracy. You must NOT invent or hallucinate genetic variants.
 You have access to two tools:
-1. \`query_genotype\`: Queries the user genomic DuckDB database for specific genes or rsIDs.
+1. \`query_genotype\`: Queries the selected published genomic dataset for specific genes or rsIDs.
 2. \`search_medical_literature\`: Performs semantic vector search in Qdrant/PubMed for medical literature related to symptoms or drug responses.
 
 Use these tools to formulate clear, scientifically accurate answers.`;
@@ -15,14 +17,58 @@ export interface AgentResponse {
   toolCalls?: any[];
   toolResults?: any[];
   evidence?: any[];
+  /** What the genotype tool actually read: dataset checksum, reference version, files. */
+  provenance?: GenotypeProvenance;
   literatureHits?: any[];
   toolsUsed?: string[];
 }
 
+export interface AskBioinformaticsAgentOptions {
+  /**
+   * The dataset this question may read. Required: the agent has no ambient access to user
+   * data, and a repository is only obtainable for a dataset with a published manifest.
+   */
+  genotypeRepository: GenotypeRepository;
+  dryRunLocal?: boolean;
+}
+
+/**
+ * Queries one target, turning the two "there is nothing to read" outcomes into an answer
+ * rather than a crash.
+ *
+ * Both are ordinary, expected results — a target the reference cannot place, and a target the
+ * dataset provably does not contain — and both are named explicitly. Any other failure
+ * propagates: an S3 outage or a corrupted manifest must not be reported as "no variant found".
+ */
+async function queryGenotype(
+  repository: GenotypeRepository,
+  targetId: string,
+): Promise<{ evidence: any[]; provenance?: GenotypeProvenance; note?: string }> {
+  try {
+    const result = await repository.synthesizeVariant(targetId);
+    return { evidence: [...result.variants], provenance: result.provenance };
+  } catch (err) {
+    if (err instanceof TargetNotResolvableError) {
+      return {
+        evidence: [],
+        note: `'${targetId}' is not present in reference snapshot '${err.referenceVersion}'.`,
+      };
+    }
+    if (err instanceof TargetNotPresentError) {
+      return {
+        evidence: [],
+        note: `Dataset '${err.datasetId}' contains no variant at the coordinates for '${targetId}'.`,
+      };
+    }
+    throw err;
+  }
+}
+
 export async function askBioinformaticsAgent(
   question: string,
-  options: { dryRunLocal?: boolean } = {}
+  options: AskBioinformaticsAgentOptions
 ): Promise<AgentResponse> {
+  const repository = options.genotypeRepository;
   // 1. Dry run / local offline mode for instant E2E verification
   if (options.dryRunLocal || (!process.env.CEREBRAS_API_KEY && !process.env.ANTHROPIC_API_KEY)) {
     let targetId = 'rs762551';
@@ -40,14 +86,18 @@ export async function askBioinformaticsAgent(
       targetId = 'CYP2D6';
     }
 
-    const evidence = await duckDbRepository.synthesizeVariant(targetId);
+    const { evidence, provenance, note } = await queryGenotype(repository, targetId);
     let literatureHits: any[] = [];
     try {
       const qVector = await generateOllamaEmbedding(question, 'nomic-embed-text');
       literatureHits = await qdrantRepository.searchVector(qVector, 2);
-    } catch {}
+    } catch (err: any) {
+      // Literature is optional context; the genotype answer stands without it. The reason is
+      // logged rather than discarded so an outage is visible.
+      console.warn(`[agent] literature search unavailable: ${err?.message ?? String(err)}`);
+    }
 
-    let answer = 'No clinical variant data found.';
+    let answer = note ?? 'No clinical variant data found.';
     if (evidence.length > 0) {
       const v = evidence[0];
       answer = `Based on your genotype (${v.user_genotype} for rsID ${v.rsid} in gene ${v.gene}), clinical significance is ${v.clinical_significance} (${v.phenotype}). Note: ${v.evidence_note}`;
@@ -59,6 +109,7 @@ export async function askBioinformaticsAgent(
     return {
       answer,
       evidence,
+      ...(provenance === undefined ? {} : { provenance }),
       literatureHits,
       toolsUsed: ['query_genotype', ...(literatureHits.length > 0 ? ['search_medical_literature'] : [])],
     };
@@ -84,7 +135,7 @@ export async function askBioinformaticsAgent(
             type: 'function',
             function: {
               name: 'query_genotype',
-              description: 'Queries the user genomic DuckDB database for specific genes or rsIDs. Returns top clinical ACMG evidence.',
+              description: 'Queries the selected published genomic dataset for specific genes or rsIDs. Returns clinical evidence plus the provenance of what was read.',
               parameters: {
                 type: 'object',
                 properties: {
@@ -132,13 +183,23 @@ export async function askBioinformaticsAgent(
       const call = toolCalls[0];
       const fnName = call.function.name;
       let toolOutput: any = [];
+      let provenance: GenotypeProvenance | undefined;
+
+      const parseArguments = (): Record<string, unknown> => {
+        try {
+          return JSON.parse(call.function.arguments);
+        } catch (err: any) {
+          // A model that emits unparseable arguments is a real fault, not a default to
+          // silently paper over with a hard-coded target.
+          throw new Error(
+            `the model returned unparseable arguments for '${fnName}': ${err?.message ?? String(err)}`,
+          );
+        }
+      };
 
       if (fnName === 'search_medical_literature') {
-        let queryStr = question;
-        try {
-          const args = JSON.parse(call.function.arguments);
-          queryStr = args.query || queryStr;
-        } catch {}
+        const args = parseArguments();
+        const queryStr = typeof args.query === 'string' && args.query.length > 0 ? args.query : question;
         try {
           const vector = await generateOllamaEmbedding(queryStr, 'nomic-embed-text');
           toolOutput = await qdrantRepository.searchVector(vector, 2);
@@ -146,12 +207,13 @@ export async function askBioinformaticsAgent(
           toolOutput = [{ error: err.message }];
         }
       } else {
-        let targetId = 'rs762551';
-        try {
-          const args = JSON.parse(call.function.arguments);
-          targetId = args.targetId || targetId;
-        } catch {}
-        toolOutput = await duckDbRepository.synthesizeVariant(targetId);
+        const args = parseArguments();
+        if (typeof args.targetId !== 'string' || args.targetId.length === 0) {
+          throw new Error("the model called 'query_genotype' without a targetId");
+        }
+        const queried = await queryGenotype(repository, args.targetId);
+        toolOutput = queried.evidence;
+        provenance = queried.provenance;
       }
 
       // Follow-up request with tool output
@@ -183,6 +245,7 @@ export async function askBioinformaticsAgent(
         toolCalls,
         toolResults: [{ tool: fnName, result: toolOutput }],
         evidence: fnName === 'query_genotype' ? toolOutput : undefined,
+        ...(provenance === undefined ? {} : { provenance }),
         literatureHits: fnName === 'search_medical_literature' ? toolOutput : undefined,
         toolsUsed: [fnName],
       };
