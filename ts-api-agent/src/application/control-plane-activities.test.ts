@@ -221,6 +221,18 @@ const goldenManifestLocation: ObjectLocation = {
   key: manifestKeyFor(goldenInput.datasetId),
 };
 
+describe('createControlPlaneActivities never registers buildDatasetArtifact', () => {
+  it('exposes exactly inspectDatasetSource and publishDataset, in that order', () => {
+    // Brief Step 5: buildDatasetArtifact must never exist in TypeScript — it is Rust-only,
+    // scheduled by name on `genomic-ingestion-rust` and never implemented or registered here.
+    // This pins the control-plane activity map so a future edit that adds a TypeScript
+    // buildDatasetArtifact (or renames/drops one of the two real activities) fails a test
+    // instead of silently passing all 144 others.
+    const activities = activitiesFor(new FakeObjectStore());
+    assert.deepStrictEqual(Object.keys(activities), ['inspectDatasetSource', 'publishDataset']);
+  });
+});
+
 describe('inspectDatasetSource resolves immutable source identity through the catalog', () => {
   function storeWithSource(options: SeedOptions = {}): FakeObjectStore {
     const store = new FakeObjectStore();

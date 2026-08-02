@@ -19,12 +19,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultVcf = path.resolve(__dirname, '../../tests/fixtures/demo_user.vcf');
 const defaultTsv = path.resolve(__dirname, '../../tests/fixtures/annotations_mock.tsv');
 
-async function autoInitFixtures(targetVcf?: string) {
+async function autoInitFixtures() {
   try {
-    const chosenVcf = targetVcf && fs.existsSync(targetVcf) ? targetVcf : defaultVcf;
-    if (fs.existsSync(chosenVcf) && fs.existsSync(defaultTsv)) {
-      await duckDbRepository.initFromFixtures(chosenVcf, defaultTsv);
-      console.log(`[Auto-Init] DuckDB initialized successfully from ${chosenVcf}.`);
+    if (fs.existsSync(defaultVcf) && fs.existsSync(defaultTsv)) {
+      await duckDbRepository.initFromFixtures(defaultVcf, defaultTsv);
+      console.log(`[Auto-Init] DuckDB initialized successfully from ${defaultVcf}.`);
     }
   } catch (err: any) {
     console.warn('[Auto-Init Warning]:', err.message);
@@ -60,8 +59,8 @@ app.post('/api/ingestion/start', async (c) => {
     body = await c.req.json();
   } catch {}
 
-  const datasetKey = body.datasetKey ?? 'demo-small';
-  if (!isDatasetKey(datasetKey)) {
+  const datasetKey = body.datasetKey;
+  if (datasetKey === undefined || !isDatasetKey(datasetKey)) {
     return c.json({ error: `unknown dataset key '${datasetKey}'`, allowed: DATASET_KEYS }, 400);
   }
 

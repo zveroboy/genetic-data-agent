@@ -9,13 +9,23 @@
  * cancellation type), the order in which it emits them, and the state the `getProgress` query
  * reports at each point. Nothing here asserts "a mock was called".
  *
- * `@temporalio/testing`'s time-skipping environment was not used: it is not a dependency of
- * this workspace, and its ephemeral test server downloads a binary on first use, which the
- * brief's offline `node --test` command cannot do. The activator harness below is the
- * server-free substitute; it is confined to `createWorkflowEnvironment` and touches three SDK
- * internals, all of them stable across 1.x: the activator global, the `lib/cancellation-scope`
- * subpath, and the fact that `AsyncLocalStorage` degrades to an empty class outside the
- * sandbox.
+ * `@temporalio/testing`'s time-skipping environment was not used. It was not a dependency of
+ * this workspace when this suite was written and could not be installed in that session's
+ * network-blocked sandbox — that was a statement about the sandbox, not the package or the
+ * environment generally; a later fix pass re-attempted the install with the sandbox disabled
+ * and it succeeded cleanly (`ts-api-agent/package.json` now lists it as a devDependency). Even
+ * installed, `TestWorkflowEnvironment`'s ephemeral test server still downloads a binary lazily
+ * on first *use* (not at install time), which this suite has not attempted, and a rewrite onto
+ * it is out of scope for this fix pass. The activator harness below is the server-free
+ * substitute that was used instead; it is confined to `createWorkflowEnvironment` / `runWorkflow`
+ * and touches three SDK internals, all of them stable across 1.x: the activator global, the
+ * `lib/cancellation-scope` subpath, and the fact that `AsyncLocalStorage` degrades to an empty
+ * class outside the sandbox.
+ *
+ * FOLLOW-UP (explicit, not yet scheduled to a task): replace this harness with
+ * `TestWorkflowEnvironment.createTimeSkipping()` now that `@temporalio/testing` is installed.
+ * The assertions themselves (scheduled-activity shape, task queue, retry policy, cancellation,
+ * progress query) should carry over largely unchanged; only `runWorkflow`'s plumbing goes away.
  *
  * Payloads are the frozen golden fixtures under `contracts/fixtures/`, so no test here
  * restates the wire schema.
@@ -101,6 +111,13 @@ const WORKFLOW_INPUT: GenomicIngestionWorkflowInput = {
  * nested scopes, so a `getStore` that always reports "no scope entered" is exact: every
  * Activity it schedules belongs to the root scope, which is what a real Workflow's main
  * function runs in.
+ *
+ * WARNING — process-global side effect on a third-party module: this permanently patches
+ * `@temporalio/workflow`'s internal `AsyncLocalStorage` prototype for the lifetime of whatever
+ * process evaluates this file, and there is no matching teardown. It is safe ONLY because
+ * `node --test` isolates each test *file* into its own process — if this harness is ever
+ * extracted into a shared fixture imported by multiple test files running in the same process,
+ * or the test runner stops process-isolating files, this mutation will leak across them.
  */
 const storagePrototype = WorkflowAsyncLocalStorage.prototype as { getStore?: () => undefined };
 storagePrototype.getStore ??= () => undefined;
@@ -245,6 +262,14 @@ function runWorkflow<I, T>(workflow: (input: I) => Promise<T>, input: I): Workfl
     },
     fail(seq, cause) {
       const activity = scheduled.find((entry) => entry.seq === seq);
+      // A real `CancelledFailure` reaches Workflow code as itself — the server does not run it
+      // through `ApplicationFailure.fromError`, which would relabel it as an ApplicationFailure
+      // of type 'CancelledFailure' and make `isCancellation()` false. Every other cause here is
+      // already the exact shape `ApplicationFailure.fromError` would classify it as (either an
+      // `ApplicationFailure` built via `.create`, or an Error whose constructor name is the wire
+      // type), so routing those through `fromError` still reproduces what Temporal does.
+      const wrappedCause =
+        cause instanceof CancelledFailure ? cause : ApplicationFailure.fromError(cause);
       return settle(seq, (completion) =>
         completion.reject(
           new ActivityFailure(
@@ -253,7 +278,7 @@ function runWorkflow<I, T>(workflow: (input: I) => Promise<T>, input: I): Workfl
             String(seq),
             undefined,
             'test-worker',
-            ApplicationFailure.fromError(cause),
+            wrappedCause,
           ),
         ),
       );
@@ -529,12 +554,15 @@ describe('a failed build never reaches publication', () => {
     assert.match(progress.message, /malformed VCF record/);
   });
 
-  it('surfaces an exhausted transient object-store failure without publishing', async () => {
+  it('surfaces a transient object-store failure without publishing', async () => {
+    // This harness has no retry loop and never simulates server-side retry, so it cannot show
+    // an exhausted retry budget — only a single delivered failure. The property this test
+    // actually proves (a build failure of this shape does not lead to publication) is the same
+    // one 'surfaces an invalid VCF and stops' proves for a different failure type; retrying is
+    // the server's job, and the workflow only ever observes whichever outcome is delivered.
     const env = runWorkflow(GenomicIngestionWorkflow, WORKFLOW_INPUT);
     await env.complete(1, GOLDEN_INPUT);
 
-    // Retrying is the server's job; the workflow only ever observes the last attempt's outcome.
-    // Once the budget is spent the run must end unpublished, not fall through to publication.
     await env.fail(
       2,
       ApplicationFailure.create({
