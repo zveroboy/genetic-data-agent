@@ -15,7 +15,3 @@ export interface SynthesizedVariant {
   clinicalSignificance: string;
   evidenceNote: string;
 }
-
-export interface QueryGenotypeParams {
-  targetId: string;
-}
