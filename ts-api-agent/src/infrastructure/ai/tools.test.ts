@@ -20,10 +20,10 @@ const RESULT: GenotypeQueryResult = {
     {
       rsid: 'rs4149056',
       gene: 'SLCO1B1',
-      user_genotype: 'T/C',
+      userGenotype: 'T/C',
       phenotype: 'Statins myopathy risk',
-      clinical_significance: 'Risk Factor',
-      evidence_note: 'Intermediate OATP1B1 function.',
+      clinicalSignificance: 'Risk Factor',
+      evidenceNote: 'Intermediate OATP1B1 function.',
     },
   ],
   provenance: {

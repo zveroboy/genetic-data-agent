@@ -3,21 +3,22 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>🧬 Genomic AI Insight Engine & Ingestion Monitor</title>
-  
+  <title>🧬 Genomic AI Insight Engine — Dataset Lifecycle</title>
+
   <!-- Pico.css v2 for clean, modern dark/light styling without build step -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
-  
-  <!-- Alpine.js 3.x for reactive State Machine -->
+
+  <!-- Alpine.js 3.x for the reactive state machine -->
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
-  
+
   <!-- Marked.js for rendering AI response Markdown -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  
+
   <style>
     :root {
       --pico-font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
     }
+    [x-cloak] { display: none !important; }
     header.hero {
       padding: 1.5rem 0;
       border-bottom: 1px solid var(--pico-muted-border-color);
@@ -32,47 +33,34 @@
       margin-right: 0.4rem;
       margin-bottom: 0.4rem;
     }
-    .badge-tool {
-      background-color: #1e3a8a;
-      color: #93c5fd;
-      border: 1px solid #3b82f6;
-    }
-    .badge-rag {
-      background-color: #14532d;
-      color: #86efac;
-      border: 1px solid #22c55e;
-    }
-    .badge-evidence {
-      background-color: #4c1d95;
-      color: #ddd6fe;
-      border: 1px solid #8b5cf6;
-    }
-    .step-indicator {
-      display: flex;
-      gap: 0.5rem;
-      margin: 1rem 0;
-      flex-wrap: wrap;
-    }
+    .badge-tool { background: #1e3a8a; color: #93c5fd; border: 1px solid #3b82f6; }
+    .badge-evidence { background: #4c1d95; color: #ddd6fe; border: 1px solid #8b5cf6; }
+    .badge-rag { background: #14532d; color: #86efac; border: 1px solid #22c55e; }
+
+    .step-list { display: flex; flex-direction: column; gap: 0.5rem; margin: 1.2rem 0; }
     .step-item {
-      padding: 0.5rem 1rem;
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.6rem 0.9rem;
       border-radius: 8px;
-      font-size: 0.85rem;
+      font-size: 0.9rem;
       background: var(--pico-card-background-color);
       border: 1px solid var(--pico-muted-border-color);
-      flex: 1;
-      text-align: center;
-      min-width: 130px;
     }
-    .step-item.active {
-      border-color: #3b82f6;
-      background: rgba(59, 130, 246, 0.15);
-      font-weight: bold;
+    /* Proven: the workflow itself reported entering this state. */
+    .step-item.observed { border-color: #3b82f6; background: rgba(59, 130, 246, 0.15); font-weight: 600; }
+    .step-item.done { border-color: #10b981; background: rgba(16, 185, 129, 0.12); color: #34d399; }
+    /* Inferred: happening inside a running activity, with no separate observation. */
+    .step-item.unobserved {
+      border-style: dashed;
+      border-color: #f59e0b;
+      background: rgba(245, 158, 11, 0.08);
+      color: #fcd34d;
     }
-    .step-item.completed {
-      border-color: #10b981;
-      background: rgba(16, 185, 129, 0.15);
-      color: #34d399;
-    }
+    .step-tag { font-size: 0.72rem; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.85; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; word-break: break-all; }
+
     .chat-container {
       max-height: 550px;
       overflow-y: auto;
@@ -82,29 +70,19 @@
       border: 1px solid var(--pico-muted-border-color);
       margin-bottom: 1.5rem;
     }
-    .chat-msg {
-      margin-bottom: 1.2rem;
-      padding: 1rem;
-      border-radius: 8px;
-    }
-    .chat-msg.user {
-      background: rgba(59, 130, 246, 0.15);
-      border-left: 4px solid #3b82f6;
-    }
-    .chat-msg.agent {
-      background: rgba(16, 185, 129, 0.1);
-      border-left: 4px solid #10b981;
-    }
-    .quick-btn {
-      font-size: 0.8rem;
-      padding: 0.3rem 0.7rem;
-      margin-right: 0.5rem;
-      margin-bottom: 0.5rem;
-    }
+    .chat-msg { margin-bottom: 1.2rem; padding: 1rem; border-radius: 8px; }
+    .chat-msg.user { background: rgba(59, 130, 246, 0.15); border-left: 4px solid #3b82f6; }
+    .chat-msg.agent { background: rgba(16, 185, 129, 0.1); border-left: 4px solid #10b981; }
+    .chat-msg.error { background: rgba(239, 68, 68, 0.12); border-left: 4px solid #ef4444; }
+    .quick-btn { font-size: 0.8rem; padding: 0.3rem 0.7rem; margin-right: 0.5rem; margin-bottom: 0.5rem; }
+    .notice { padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; }
+    .notice.error { background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; }
+    .notice.ok { background: rgba(16, 185, 129, 0.15); border: 1px solid #10b981; }
+    details.provenance { margin-top: 0.6rem; font-size: 0.82rem; }
   </style>
 </head>
-<body x-data="genomicApp()">
-  
+<body x-data="genomicApp()" x-init="loadCatalog()">
+
   <header class="hero">
     <div class="container">
       <nav>
@@ -112,9 +90,9 @@
           <li><h2 style="margin: 0;">🧬 <strong>Genomic AI Insight Engine</strong></h2></li>
         </ul>
         <ul>
-          <li><span class="badge" style="background:#065f46; color:#a7f3d0;">Rust Rayon Engine</span></li>
+          <li><span class="badge" style="background:#065f46; color:#a7f3d0;">Rust Ingestion Worker</span></li>
           <li><span class="badge" style="background:#1e3a8a; color:#bfdbfe;">Temporal Orchestrated</span></li>
-          <li><span class="badge" style="background:#4c1d95; color:#e9d5ff;">DuckDB + Qdrant</span></li>
+          <li><span class="badge" style="background:#4c1d95; color:#e9d5ff;">Remote Parquet + DuckDB</span></li>
         </ul>
       </nav>
     </div>
@@ -123,178 +101,216 @@
   <main class="container">
 
     <!-- =========================
-         STATE 1: UPLOAD (UPLOAD FORM & SIMULATOR)
+         STATE 1: DATASET SELECTION
          ========================= -->
-    <section x-show="state === 'upload'" x-transition>
+    <section x-show="state === 'select'" x-transition>
       <article>
         <header>
-          <h3>📥 Загрузка геномного датасета (VCF/TSV)</h3>
-          <p class="muted">Выберите эталонный VCF-файл или загрузите собственный геном для высокопроизводительной многопоточной обработки в Rust & DuckDB.</p>
+          <h3>🗂 Выбор геномного датасета</h3>
+          <p class="muted">
+            Ингестируется только один из подготовленных датасетов каталога. Загрузка произвольных
+            файлов, URL и путей не поддерживается: источник в S3 определяется на сервере по ключу
+            каталога.
+          </p>
         </header>
 
-        <form @submit.prevent="startUploadSimulation()">
-          <label for="fileSelect">
-            <strong>Геномный образец (VCF / TSV)</strong>
-            <select id="fileSelect" x-model="selectedFileKey" :disabled="uploading">
-              <option value="tests/fixtures/demo_user.vcf">⚡ demo_user.vcf — Быстрый демо-геном (CYP1A2, LCT, SLCO1B1, VKORC1)</option>
-              <option value="s3://genomic-data/na12878_hg001.vcf.gz">🌐 na12878_hg001.vcf.gz — Полный геном человека NIST GIAB (3.89 млн вариантов из S3)</option>
+        <div x-show="catalogError" x-cloak class="notice error">
+          <strong>Каталог недоступен.</strong>
+          <p class="mono" style="margin: 0.4rem 0 0 0;" x-text="catalogError"></p>
+        </div>
+
+        <form @submit.prevent="startIngestion()">
+          <label for="datasetSelect">
+            <strong>Датасет</strong>
+            <select id="datasetSelect" x-model="selectedDatasetKey" :disabled="starting || catalog.length === 0">
+              <template x-for="entry in catalog" :key="entry.key">
+                <option :value="entry.key" x-text="entry.key + ' — ' + entry.displayName"></option>
+              </template>
             </select>
           </label>
+          <small x-show="selectedEntry()" x-cloak>
+            <span x-text="selectedEntry()?.description"></span>
+            (<span x-text="selectedEntry()?.expectedReferenceBuild"></span>,
+            <span x-text="selectedEntry()?.referenceVersion"></span>)
+          </small>
 
-          <!-- Simulated Upload Progress Bar (3 seconds) -->
-          <div x-show="uploading" style="margin-top: 1.5rem;">
-            <label>
-              <small x-text="uploadStatusText"></small>
-              <progress :value="uploadPercentage" max="100"></progress>
-            </label>
+          <!-- `x-show` only hides; the bindings still evaluate, so they must tolerate null. -->
+          <div x-show="startError" x-cloak class="notice error" style="margin-top: 1rem;">
+            <strong x-text="startError?.error"></strong>
+            <p class="mono" style="margin: 0.4rem 0 0 0;" x-text="startError?.message"></p>
           </div>
 
-          <button type="submit" class="contrast" :aria-busy="uploading" :disabled="uploading" style="margin-top: 1rem;">
-            <span x-text="uploading ? 'Загрузка...' : '🚀 Загрузить и обработать в Temporal'"></span>
+          <button
+            type="submit"
+            class="contrast"
+            :aria-busy="starting"
+            :disabled="starting || catalog.length === 0"
+            style="margin-top: 1rem;"
+          >
+            <span x-text="starting ? 'Запуск Workflow…' : '🚀 Запустить ингестию'"></span>
           </button>
         </form>
       </article>
     </section>
 
     <!-- =========================
-         STATE 2: PROCESSING (TEMPORAL WORKFLOW MONITORING)
+         STATE 2: INGESTION IN PROGRESS (REAL WORKFLOW QUERY)
          ========================= -->
-    <section x-show="state === 'processing'" x-transition x-cloak>
+    <section x-show="state === 'ingesting'" x-transition x-cloak>
       <article>
         <header>
-          <h3>⚙️ Обработка геномных данных в Temporal & Rust Rayon Engine</h3>
-          <p class="muted">Выполняется оркестрация Workflow, многопоточный парсинг VCF и ACMG валидация вариантов.</p>
+          <h3>⚙️ Ингестия датасета</h3>
+          <p class="muted">
+            Состояние читается запросом <code>getProgress</code> к самому Workflow. Никакой
+            прогресс здесь не моделируется на клиенте.
+          </p>
         </header>
 
-        <!-- Step Indicator Grid -->
-        <div class="step-indicator">
-          <div class="step-item" 
-               :class="{'active': progress.step === 'DOWNLOADING_S3', 'completed': percentage >= 25}">
-            📥 1. S3 Download
-          </div>
-          <div class="step-item" 
-               :class="{'active': progress.step === 'PARSING_VCF', 'completed': percentage >= 55}">
-            ⚙️ 2. Rust Rayon Indexing
-          </div>
-          <div class="step-item" 
-               :class="{'active': progress.step === 'VALIDATING', 'completed': percentage >= 85}">
-            🔍 3. ACMG Validation
-          </div>
-          <div class="step-item" 
-               :class="{'active': progress.step === 'COMPLETED', 'completed': progress.step === 'COMPLETED'}">
-            ✔ 4. DuckDB Ready
-          </div>
+        <p class="mono">
+          <strong>datasetId:</strong> <span x-text="datasetId"></span><br />
+          <strong>workflowId:</strong> <span x-text="workflowId"></span>
+        </p>
+
+        <!-- Honest step list: proven states vs states inside a running activity. -->
+        <div class="step-list">
+          <template x-for="step in STEPS" :key="step.state">
+            <div class="step-item" :class="stepClass(step.state)">
+              <span x-text="step.label" style="flex: 1;"></span>
+              <span class="step-tag" x-text="stepTag(step.state)"></span>
+            </div>
+          </template>
         </div>
 
-        <!-- Real Progress Bar from Temporal Query -->
-        <div style="margin: 2rem 0;">
-          <label>
-            <strong x-text="progress.message"></strong>
-            <progress :value="progress.percentage" max="100" style="height: 14px; margin-top: 0.5rem;"></progress>
-          </label>
-          <div style="display: flex; justify-content: space-between; font-size: 0.85rem; color: #94a3b8;">
-            <span>Статус: <strong x-text="progress.step"></strong></span>
-            <span><strong x-text="progress.percentage + '%'"></strong></span>
-          </div>
+        <!-- Indeterminate on purpose: the pipeline reports states, not a percentage. -->
+        <progress x-show="!isTerminal()" style="height: 10px;"></progress>
+
+        <p>
+          <strong>Статус:</strong> <code x-text="progress?.state ?? '—'"></code>
+          <span
+            x-show="progress && progress.unobservedStates && progress.unobservedStates.length > 0"
+            x-cloak
+            class="badge"
+            style="background: rgba(245,158,11,0.15); color:#fcd34d; border:1px dashed #f59e0b;"
+            x-text="'внутри активности, без отдельного наблюдения: ' + (progress?.unobservedStates ?? []).join(', ')"
+          ></span>
+        </p>
+        <p x-text="progress?.message ?? 'Ожидание первого ответа Workflow…'"></p>
+
+        <div x-show="pollError" x-cloak class="notice error">
+          <strong x-text="pollError?.error"></strong>
+          <p class="mono" style="margin: 0.4rem 0 0 0;" x-text="pollError?.message"></p>
         </div>
 
-        <!-- Error Handling State -->
-        <div x-show="progress.step === 'ERROR'" class="card" style="background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; padding: 1rem; border-radius: 8px;">
-          <h4>❌ Ошибка ингестии в Temporal</h4>
-          <p x-text="progress.message"></p>
-          <button class="secondary" @click="resetToUpload()">Попробовать снова</button>
+        <div x-show="progress?.state === 'FAILED'" x-cloak class="notice error">
+          <h4 style="margin-top: 0;">❌ Ингестия не удалась</h4>
+          <p>Манифест не опубликован, датасет не доступен для запросов.</p>
+          <button class="secondary" @click="backToSelection()">Выбрать датасет заново</button>
         </div>
       </article>
     </section>
 
     <!-- =========================
-         STATE 3: CHAT (GENOMIC AI INSIGHT INTERFACE)
+         STATE 3: CHAT OVER THE PUBLISHED DATASET
          ========================= -->
     <section x-show="state === 'chat'" x-transition x-cloak>
-      
-      <!-- Green Completion Alert Banner -->
-      <article style="background: rgba(16, 185, 129, 0.15); border: 1px solid #10b981; padding: 1rem; margin-bottom: 1.5rem;">
-        <h4 style="margin: 0; color: #34d399;">
-          🎉 Данные успешно проиндексированы в DuckDB! Задайте вопрос вашему геному.
-        </h4>
-        <small style="color: #cbd5e1;">База DuckDB оптимизирована. Доступен детерминированный инструмент <code>query_genotype</code> и векторный RAG поиск по статьям PubMed.</small>
+
+      <article class="notice ok">
+        <h4 style="margin: 0; color: #34d399;">🎉 Манифест опубликован — датасет доступен для запросов.</h4>
+        <p class="mono" style="margin: 0.5rem 0 0 0;">
+          <strong>datasetId:</strong> <span x-text="datasetId"></span>
+        </p>
+        <small>Все вопросы этого диалога адресуются именно этому опубликованному датасету.</small>
       </article>
 
       <article>
-        <header style="display: flex; justify-content: space-between; align-items: center;">
-          <h3 style="margin: 0;">💬 Биоинформатический Чат-Агент (Llama-3.3-70B)</h3>
-          <button class="outline secondary" style="padding: 0.3rem 0.8rem; font-size: 0.8rem;" @click="resetToUpload()">
-            🔄 Загрузить другой геном
+        <header style="display: flex; justify-content: space-between; align-items: center; gap: 1rem;">
+          <h3 style="margin: 0;">💬 Биоинформатический чат-агент</h3>
+          <button
+            class="outline secondary"
+            style="padding: 0.3rem 0.8rem; font-size: 0.8rem; white-space: nowrap;"
+            @click="backToSelection()"
+          >
+            🔄 Запустить ингестию заново
           </button>
         </header>
 
-        <!-- Quick Question Examples -->
         <div style="margin: 1rem 0;">
-          <small style="display: block; margin-bottom: 0.5rem; color: #94a3b8;">Примеры вопросов:</small>
-          <button class="secondary quick-btn" @click="askQuickQuestion('Can I drink coffee? Check my CYP1A2 genetic variant and explain what it means.')">
-            ☕ Кофе и CYP1A2
-          </button>
-          <button class="secondary quick-btn" @click="askQuickQuestion('Am I at risk for muscle toxicity from statins? Check my SLCO1B1 genotype.')">
-            💊 Статины и SLCO1B1
-          </button>
-          <button class="secondary quick-btn" @click="askQuickQuestion('Am I lactose intolerant? What is my LCT genotype?')">
-            🥛 Лактоза и LCT
-          </button>
-          <button class="secondary quick-btn" @click="askQuickQuestion('What is my warfarin sensitivity risk (VKORC1)?')">
-            💉 Варфарин и VKORC1
-          </button>
+          <small style="display: block; margin-bottom: 0.5rem;">Примеры вопросов:</small>
+          <button class="secondary quick-btn" @click="askQuickQuestion('Can I drink coffee? Check my CYP1A2 genetic variant and explain what it means.')">☕ Кофе и CYP1A2</button>
+          <button class="secondary quick-btn" @click="askQuickQuestion('Am I at risk for muscle toxicity from statins? Check my SLCO1B1 genotype.')">💊 Статины и SLCO1B1</button>
+          <button class="secondary quick-btn" @click="askQuickQuestion('Am I lactose intolerant? What is my LCT genotype?')">🥛 Лактоза и LCT</button>
+          <button class="secondary quick-btn" @click="askQuickQuestion('What is my warfarin sensitivity risk (VKORC1)?')">💉 Варфарин и VKORC1</button>
         </div>
 
-        <!-- Chat History List -->
         <div class="chat-container" id="chatWindow">
           <template x-for="(msg, index) in messages" :key="index">
             <div class="chat-msg" :class="msg.sender">
-              <!-- Sender Header -->
               <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem;">
-                <strong x-text="msg.sender === 'user' ? '🧑 Вы' : '🤖 AI Геномный Агент'"></strong>
-                <small class="muted" x-text="msg.time"></small>
+                <strong x-text="msg.sender === 'user' ? '🧑 Вы' : '🤖 AI геномный агент'"></strong>
+                <small x-text="msg.time"></small>
               </div>
 
-              <!-- Tool Call Badges -->
               <div x-show="msg.toolsUsed && msg.toolsUsed.length > 0" style="margin-bottom: 0.5rem;">
-                <template x-for="tool in msg.toolsUsed" :key="tool">
-                  <span class="badge badge-tool" x-text="'⚙️ Инструмент: ' + tool"></span>
+                <template x-for="tool in (msg.toolsUsed || [])" :key="tool">
+                  <span class="badge badge-tool" x-text="'⚙️ ' + tool"></span>
                 </template>
               </div>
 
-              <!-- Evidence Badges -->
-              <div x-show="msg.evidence && msg.evidence.length > 0" style="margin-bottom: 0.5rem;">
-                <template x-for="ev in msg.evidence" :key="ev.rsid">
-                  <span class="badge badge-evidence" 
-                        x-text="'🧬 Genotype: ' + ev.user_genotype + ' (' + ev.rsid + ' / ' + ev.gene + ') — ' + ev.clinical_significance">
-                  </span>
+              <div x-show="msg.variants && msg.variants.length > 0" style="margin-bottom: 0.5rem;">
+                <template x-for="variant in (msg.variants || [])" :key="variant.rsid">
+                  <span
+                    class="badge badge-evidence"
+                    x-text="'🧬 ' + variant.userGenotype + ' (' + variant.rsid + ' / ' + variant.gene + ') — ' + variant.clinicalSignificance"
+                  ></span>
                 </template>
               </div>
 
-              <!-- Markdown Text Content -->
               <div class="markdown-body" x-html="renderMarkdown(msg.text)"></div>
+
+              <details class="provenance" x-show="msg.provenance" x-cloak>
+                <summary>Происхождение ответа</summary>
+                <p class="mono" style="margin: 0.5rem 0 0 0;">
+                  datasetChecksumSha256: <span x-text="msg.provenance?.datasetChecksumSha256"></span><br />
+                  layoutVersion: <span x-text="msg.provenance?.layoutVersion"></span> ·
+                  schemaVersion: <span x-text="msg.provenance?.schemaVersion"></span> ·
+                  artifactVersion: <span x-text="msg.provenance?.artifactVersion"></span><br />
+                  reference: <span x-text="msg.provenance?.referenceBuild"></span> /
+                  <span x-text="msg.provenance?.referenceVersion"></span><br />
+                  прочитанные объекты (<span x-text="(msg.provenance?.filesScanned || []).length"></span>):
+                </p>
+                <ul class="mono">
+                  <template x-for="file in (msg.provenance?.filesScanned || [])" :key="file">
+                    <li x-text="file"></li>
+                  </template>
+                </ul>
+                <p class="mono" x-show="(msg.provenance?.filesScanned || []).length === 0">
+                  ни один объект не читался.
+                </p>
+              </details>
             </div>
           </template>
 
-          <!-- Agent Loading State -->
-          <div x-show="chatLoading" class="chat-msg agent">
-            <strong>🤖 AI Геномный Агент</strong>
-            <p style="margin: 0.5rem 0 0 0;">
-              <em>⚡ Анализ генотипа в DuckDB и семантический поиск PubMed RAG...</em>
-            </p>
+          <div x-show="chatLoading" x-cloak class="chat-msg agent">
+            <strong>🤖 AI геномный агент</strong>
+            <p style="margin: 0.5rem 0 0 0;"><em>⚡ Чтение опубликованного Parquet и поиск по литературе…</em></p>
           </div>
         </div>
 
-        <!-- Question Input Form -->
         <form @submit.prevent="sendQuestion()" style="display: flex; gap: 0.8rem;">
-          <input 
-            type="text" 
-            x-model="currentInput" 
-            placeholder="Задайте клинический или нутригеномный вопрос..." 
-            :disabled="chatLoading"
+          <input
+            type="text"
+            x-model="currentInput"
+            placeholder="Задайте клинический или нутригеномный вопрос…"
+            :disabled="chatLoading || state !== 'chat'"
             style="flex: 1; margin: 0;"
           />
-          <button type="submit" class="contrast" :aria-busy="chatLoading" :disabled="chatLoading || !currentInput.trim()" style="margin: 0; width: 150px;">
+          <button
+            type="submit"
+            class="contrast"
+            :aria-busy="chatLoading"
+            :disabled="chatLoading || state !== 'chat' || !currentInput.trim()"
+            style="margin: 0; width: 150px;"
+          >
             Отправить
           </button>
         </form>
@@ -304,157 +320,209 @@
   </main>
 
   <script>
+    /**
+     * The UI mirrors the API's honesty rules:
+     *
+     * - the dataset list comes from `GET /api/datasets/catalog`; nothing else is selectable;
+     * - progress comes only from `GET /api/ingestions/:workflowId`, and a state the workflow
+     *   cannot witness is drawn as *inferred*, never as a completed step;
+     * - the chat is enabled only after a real `COMPLETED`, and every message carries the same
+     *   `datasetId`; re-running ingestion is a separate, explicit action.
+     */
     function genomicApp() {
+      // Canonical pipeline order, matching `domain/datasets.ts`.
+      const STEPS = [
+        { state: 'RESOLVING', label: '1. Определение источника в S3' },
+        { state: 'BUILDING', label: '2. Rust: VCF → партиционированный Parquet' },
+        { state: 'VERIFYING_OBJECTS', label: '3. Проверка выгруженных объектов' },
+        { state: 'PUBLISHING_MANIFEST', label: '4. Публикация манифеста' },
+        { state: 'COMPLETED', label: '5. Датасет доступен для запросов' },
+      ];
+      const ORDER = STEPS.map((step) => step.state);
+
       return {
-        // State Machine: 'upload' | 'processing' | 'chat'
-        state: 'upload',
-        
-        // State 1: Upload Form & Simulation
-        selectedFileKey: 'tests/fixtures/demo_user.vcf',
-        uploading: false,
-        uploadPercentage: 0,
-        uploadStatusText: 'Подготовка к загрузке...',
+        STEPS,
 
-        // State 2: Processing (Temporal)
+        // 'select' | 'ingesting' | 'chat'
+        state: 'select',
+
+        catalog: [],
+        catalogError: null,
+        selectedDatasetKey: '',
+
+        starting: false,
+        startError: null,
+
+        datasetId: null,
         workflowId: null,
-        progress: {
-          step: 'DOWNLOADING_S3',
-          fileKey: '',
-          percentage: 0,
-          message: 'Подключение к оркестратору Temporal...'
-        },
-        percentage: 0,
-        pollInterval: null,
+        progress: null,
+        pollError: null,
+        pollTimer: null,
 
-        // State 3: Chat
-        messages: [
-          {
-            sender: 'agent',
-            text: 'Здравствуйте! Ваш геном успешно загружен и проиндексирован в DuckDB. Вы можете спросить о метаболизме кофеина (**CYP1A2**), чувствительности к статинам (**SLCO1B1**), переносимости лактозы (**LCT**) и других биоинформатических маркерах.',
-            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            toolsUsed: []
-          }
-        ],
+        messages: [],
         currentInput: '',
         chatLoading: false,
 
-        // --- Methods ---
+        // --- Step 1: catalog -------------------------------------------------
 
-        // 1. Start 3-second Upload Simulation -> Transition to State 2
-        startUploadSimulation() {
-          this.uploading = true;
-          this.uploadPercentage = 0;
-          this.uploadStatusText = 'Отправка файла на сервер... 0%';
-
-          const start = Date.now();
-          const duration = 2800;
-
-          const interval = setInterval(() => {
-            const elapsed = Date.now() - start;
-            this.uploadPercentage = Math.min(100, Math.floor((elapsed / duration) * 100));
-            this.uploadStatusText = `Загрузка файла на сервер... ${this.uploadPercentage}%`;
-
-            if (this.uploadPercentage >= 100) {
-              clearInterval(interval);
-              this.uploading = false;
-              this.startTemporalIngestion();
-            }
-          }, 100);
-        },
-
-        // 2. Start Temporal Workflow via POST /api/ingestion/start
-        async startTemporalIngestion() {
-          this.state = 'processing';
-          this.progress = {
-            step: 'DOWNLOADING_S3',
-            fileKey: this.selectedFileKey,
-            percentage: 10,
-            message: 'Инициализация Temporal Workflow...'
-          };
-
+        async loadCatalog() {
           try {
-            const res = await fetch('/api/ingestion/start', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ fileKey: this.selectedFileKey })
-            });
+            const res = await fetch('/api/datasets/catalog');
             const data = await res.json();
-            
-            if (data.workflowId) {
-              this.workflowId = data.workflowId;
-              this.startPollingStatus();
-            } else {
-              throw new Error(data.error || 'Не удалось запустить Workflow');
-            }
+            if (!res.ok) throw new Error(data.message || 'не удалось получить каталог');
+            this.catalog = data.datasets || [];
+            this.selectedDatasetKey = this.catalog.length > 0 ? this.catalog[0].key : '';
+            this.catalogError = null;
           } catch (err) {
-            this.progress = {
-              step: 'ERROR',
-              fileKey: this.selectedFileKey,
-              percentage: 0,
-              message: err.message
-            };
+            this.catalog = [];
+            this.catalogError = err.message;
           }
         },
 
-        // 3. Poll Temporal Query GET /api/ingestion/status/:workflowId
-        startPollingStatus() {
-          if (this.pollInterval) clearInterval(this.pollInterval);
-
-          this.pollInterval = setInterval(async () => {
-            if (!this.workflowId) return;
-
-            try {
-              const res = await fetch(`/api/ingestion/status/${this.workflowId}`);
-              if (res.ok) {
-                const data = await res.json();
-                this.progress = data;
-                this.percentage = data.percentage || 0;
-
-                // When COMPLETED -> Wait 1 second -> Switch to State 3
-                if (data.step === 'COMPLETED') {
-                  clearInterval(this.pollInterval);
-                  setTimeout(() => {
-                    this.state = 'chat';
-                    this.scrollToBottom();
-                  }, 1000);
-                } else if (data.step === 'ERROR') {
-                  clearInterval(this.pollInterval);
-                }
-              }
-            } catch (err) {
-              console.error('Ошибка опроса статуса:', err);
-            }
-          }, 1500);
+        selectedEntry() {
+          return this.catalog.find((entry) => entry.key === this.selectedDatasetKey) || null;
         },
 
-        // 4. Reset Back to State 1
-        resetToUpload() {
-          if (this.pollInterval) clearInterval(this.pollInterval);
-          this.state = 'upload';
-          this.uploading = false;
-          this.uploadPercentage = 0;
+        // --- Step 2: ingestion -----------------------------------------------
+
+        async startIngestion() {
+          if (!this.selectedDatasetKey) return;
+          this.starting = true;
+          this.startError = null;
+
+          try {
+            const res = await fetch('/api/ingestions', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ datasetKey: this.selectedDatasetKey }),
+            });
+            const data = await res.json();
+            if (!res.ok) {
+              // No local progress is invented here: a run that did not start has no state.
+              this.startError = { error: data.error || 'RequestFailed', message: data.message || '' };
+              return;
+            }
+
+            this.datasetId = data.datasetId;
+            this.workflowId = data.workflowId;
+            this.progress = null;
+            this.pollError = null;
+            this.messages = [];
+            this.state = 'ingesting';
+            this.pollProgress();
+          } catch (err) {
+            this.startError = { error: 'NetworkError', message: err.message };
+          } finally {
+            this.starting = false;
+          }
+        },
+
+        isTerminal() {
+          return this.progress?.state === 'COMPLETED' || this.progress?.state === 'FAILED';
+        },
+
+        /** Poll the workflow query until it reports a terminal state. */
+        async pollProgress() {
+          if (this.pollTimer) clearTimeout(this.pollTimer);
+          if (!this.workflowId) return;
+
+          try {
+            const res = await fetch(`/api/ingestions/${encodeURIComponent(this.workflowId)}`);
+            const data = await res.json();
+
+            if (res.ok) {
+              this.progress = data;
+              this.pollError = null;
+              if (data.state === 'COMPLETED') {
+                this.openChat();
+                return;
+              }
+              if (data.state === 'FAILED') return;
+            } else if (res.status === 404) {
+              this.pollError = { error: data.error || 'IngestionRunNotFound', message: data.message || '' };
+              return;
+            } else {
+              // Typically a 503: the orchestrator is unreachable. Reported, and retried —
+              // but the last proven state is left untouched rather than advanced.
+              this.pollError = { error: data.error || 'RequestFailed', message: data.message || '' };
+            }
+          } catch (err) {
+            this.pollError = { error: 'NetworkError', message: err.message };
+          }
+
+          this.pollTimer = setTimeout(() => this.pollProgress(), 1500);
+        },
+
+        /**
+         * How much of a step the workflow can actually prove.
+         *
+         * `FAILED` replaces the state rather than annotating it, so the query no longer says
+         * where the run got to. Nothing is highlighted in that case — guessing the last step
+         * from a state that no longer names it would be the same invention this UI avoids.
+         */
+        stepClass(step) {
+          if (!this.progress || this.progress.state === 'FAILED') return '';
+          if (step === this.progress.state) return 'observed';
+          if ((this.progress.unobservedStates || []).includes(step)) return 'unobserved';
+          return this.reached(step) ? 'done' : '';
+        },
+
+        stepTag(step) {
+          if (!this.progress) return 'ожидается';
+          if (this.progress.state === 'FAILED') return '—';
+          if (step === this.progress.state) return 'наблюдается';
+          if ((this.progress.unobservedStates || []).includes(step)) return 'выводится';
+          return this.reached(step) ? 'пройдено' : 'ожидается';
+        },
+
+        /** True once the workflow has proven it moved past this step. */
+        reached(step) {
+          if (!this.progress) return false;
+          const current = ORDER.indexOf(this.progress.state);
+          if (current < 0) return false;
+          return ORDER.indexOf(step) < current;
+        },
+
+        // --- Step 3: chat ------------------------------------------------------
+
+        openChat() {
+          this.state = 'chat';
+          this.messages = [
+            {
+              sender: 'agent',
+              text:
+                'Датасет опубликован и доступен для запросов. Спросите о метаболизме кофеина ' +
+                '(**CYP1A2**), чувствительности к статинам (**SLCO1B1**), переносимости лактозы ' +
+                '(**LCT**) или других маркерах.',
+              time: this.now(),
+              toolsUsed: [],
+              variants: [],
+            },
+          ];
+          this.scrollToBottom();
+        },
+
+        /** Explicit, separate action: go back and start a *new* run. */
+        backToSelection() {
+          if (this.pollTimer) clearTimeout(this.pollTimer);
+          this.pollTimer = null;
+          this.state = 'select';
+          this.progress = null;
+          this.pollError = null;
+          this.datasetId = null;
           this.workflowId = null;
         },
 
-        // 5. Ask Quick Question Button
-        askQuickQuestion(questionText) {
-          this.currentInput = questionText;
+        askQuickQuestion(text) {
+          this.currentInput = text;
           this.sendQuestion();
         },
 
-        // 6. Send Question to POST /ask
         async sendQuestion() {
           const question = this.currentInput.trim();
-          if (!question || this.chatLoading) return;
+          if (!question || this.chatLoading || !this.datasetId) return;
 
-          // Add User Message
-          this.messages.push({
-            sender: 'user',
-            text: question,
-            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            toolsUsed: []
-          });
-
+          this.messages.push({ sender: 'user', text: question, time: this.now(), toolsUsed: [], variants: [] });
           this.currentInput = '';
           this.chatLoading = true;
           this.scrollToBottom();
@@ -463,24 +531,36 @@
             const res = await fetch('/ask', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ question, dryRunLocal: false })
+              // The same published dataset for every message of the conversation.
+              body: JSON.stringify({ datasetId: this.datasetId, question }),
             });
             const data = await res.json();
 
-            // Add Agent Response with Tool Badges & Evidence
-            this.messages.push({
-              sender: 'agent',
-              text: data.answer || 'Не удалось получить ответ.',
-              time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-              toolsUsed: data.toolsUsed || [],
-              evidence: data.evidence || []
-            });
+            if (!res.ok) {
+              this.messages.push({
+                sender: 'error',
+                text: `**${data.error || 'RequestFailed'}** — ${data.message || res.statusText}`,
+                time: this.now(),
+                toolsUsed: [],
+                variants: [],
+              });
+            } else {
+              this.messages.push({
+                sender: 'agent',
+                text: data.answer || 'Ответ не получен.',
+                time: this.now(),
+                toolsUsed: data.toolsUsed || [],
+                variants: data.variants || [],
+                provenance: data.provenance || null,
+              });
+            }
           } catch (err) {
             this.messages.push({
-              sender: 'agent',
+              sender: 'error',
               text: `**Ошибка соединения:** ${err.message}`,
-              time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-              toolsUsed: []
+              time: this.now(),
+              toolsUsed: [],
+              variants: [],
             });
           } finally {
             this.chatLoading = false;
@@ -488,7 +568,12 @@
           }
         },
 
-        // 7. Render Markdown via Marked.js CDN
+        // --- helpers -----------------------------------------------------------
+
+        now() {
+          return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        },
+
         renderMarkdown(text) {
           if (!text) return '';
           try {
@@ -498,13 +583,12 @@
           }
         },
 
-        // 8. Auto-scroll chat to bottom
         scrollToBottom() {
           setTimeout(() => {
             const win = document.getElementById('chatWindow');
             if (win) win.scrollTop = win.scrollHeight;
           }, 100);
-        }
+        },
       };
     }
   </script>

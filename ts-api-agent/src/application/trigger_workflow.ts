@@ -6,36 +6,32 @@
  * dataset id minted here names the immutable artifact prefix that run may write under.
  *
  *   node ts-api-agent/src/application/trigger_workflow.ts [demo-small|na12878-full]
+ *
+ * It goes through the same `IngestionClient` adapter `POST /api/ingestions` uses, so a run
+ * started from the shell is indistinguishable from one started by the API — same Workflow, same
+ * task queue, and above all the same `workflowId` spelling, so `GET /api/ingestions/:workflowId`
+ * can poll a run this script started.
  */
-import { Client, Connection } from '@temporalio/client';
-
 import { datasetCatalog, newDatasetId } from './dataset-catalog.ts';
-import { CONTROL_PLANE_TASK_QUEUE, GenomicIngestionWorkflow } from './workflows.ts';
+import { ingestionWorkflowIdFor } from './ingestion-client.ts';
+import { createTemporalIngestionClient } from '../infrastructure/temporal/temporal-ingestion-client.ts';
 
 async function run(): Promise<void> {
   const entry = datasetCatalog.get(process.argv[2] ?? 'demo-small');
   const datasetId = newDatasetId(entry.key);
-  const address = process.env.TEMPORAL_HOST ?? 'localhost:7233';
+  const workflowId = ingestionWorkflowIdFor(datasetId);
 
-  console.log(`[Temporal Client] Connecting to ${address}...`);
-  const connection = await Connection.connect({ address });
-
+  const client = createTemporalIngestionClient();
   try {
-    const client = new Client({ connection });
-    const handle = await client.workflow.start(GenomicIngestionWorkflow, {
-      taskQueue: CONTROL_PLANE_TASK_QUEUE,
-      workflowId: `genomic-ingestion-${datasetId}`,
-      args: [{ datasetId, datasetKey: entry.key }],
-    });
+    await client.start({ workflowId, datasetId, datasetKey: entry.key });
 
-    console.log(`✔ Started ${handle.workflowId}`);
+    console.log(`✔ Started ${workflowId}`);
     console.log(`  Dataset:  ${entry.key} (${entry.displayName})`);
     console.log(`  Source:   s3://${entry.source.bucket}/${entry.source.key}`);
-    console.log(
-      `  Temporal: http://localhost:8233/namespaces/default/workflows/${handle.workflowId}`,
-    );
+    console.log(`  Progress: GET /api/ingestions/${workflowId}`);
+    console.log(`  Temporal: http://localhost:8233/namespaces/default/workflows/${workflowId}`);
   } finally {
-    await connection.close();
+    await client.close();
   }
 }
 

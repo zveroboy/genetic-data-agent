@@ -74,7 +74,7 @@ async function runE2eTest() {
     }
 
     console.log(
-      `✔ E2E Test PASSED: read ${caffeineVariant.user_genotype} for rs762551 (CYP1A2) from ` +
+      `✔ E2E Test PASSED: read ${caffeineVariant.userGenotype} for rs762551 (CYP1A2) from ` +
         `${response.provenance?.filesScanned.length ?? 0} remote Parquet object(s).`,
     );
   } finally {

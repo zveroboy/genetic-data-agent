@@ -38,6 +38,7 @@ import {
   type ObjectStore,
   headManyBounded,
 } from '../object-store/object-store.ts';
+import type { SynthesizedVariant } from '../../domain/types.ts';
 import type { DuckDbSession, DuckDbSessionFactory } from './duckdb-session-factory.ts';
 import {
   DatasetNotPublishedError,
@@ -251,6 +252,7 @@ function harness(options: {
   return { store, sessions, coordinates, factory };
 }
 
+/** One row as DuckDB returns it: the physical, snake_case column names. */
 const PARQUET_ROW = {
   rsid: 'rs4149056',
   gene: 'SLCO1B1',
@@ -258,6 +260,16 @@ const PARQUET_ROW = {
   phenotype: 'Statins myopathy risk',
   clinical_significance: 'Risk Factor',
   evidence_note: 'Intermediate OATP1B1 function.',
+};
+
+/** The same row as it leaves the repository: a camelCase wire payload. */
+const SYNTHESIZED_VARIANT: SynthesizedVariant = {
+  rsid: 'rs4149056',
+  gene: 'SLCO1B1',
+  userGenotype: 'T/C',
+  phenotype: 'Statins myopathy risk',
+  clinicalSignificance: 'Risk Factor',
+  evidenceNote: 'Intermediate OATP1B1 function.',
 };
 
 describe('genotype repository', () => {
@@ -348,7 +360,9 @@ describe('genotype repository', () => {
 
     const result = await repository.synthesizeVariant('SLCO1B1');
 
-    assert.deepEqual(result.variants, [PARQUET_ROW]);
+    // The SQL row's physical column names become the wire payload's camelCase field names;
+    // `toSynthesizedVariant` is the only place that translation happens.
+    assert.deepEqual(result.variants, [SYNTHESIZED_VARIANT]);
     assert.deepEqual(result.provenance, {
       datasetId: DATASET_ID,
       datasetChecksumSha256: computeDatasetChecksumSha256(ATTEMPT_PREFIX, INVENTORY),

@@ -111,7 +111,7 @@ export async function askBioinformaticsAgent(
     let answer = note ?? 'No clinical variant data found.';
     if (evidence.length > 0) {
       const v = evidence[0];
-      answer = `Based on your genotype (${v.user_genotype} for rsID ${v.rsid} in gene ${v.gene}), clinical significance is ${v.clinical_significance} (${v.phenotype}). Note: ${v.evidence_note}`;
+      answer = `Based on your genotype (${v.userGenotype} for rsID ${v.rsid} in gene ${v.gene}), clinical significance is ${v.clinicalSignificance} (${v.phenotype}). Note: ${v.evidenceNote}`;
       if (literatureHits.length > 0) {
         answer += `\n\n📚 Medical Literature (PubMed RAG): "${literatureHits[0].title}" (PMID: ${literatureHits[0].pmid})`;
       }

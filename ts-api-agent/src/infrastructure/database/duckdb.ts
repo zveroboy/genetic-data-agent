@@ -255,15 +255,21 @@ function buildGroupQuery(group: ChromosomeGroup): { sql: string; values: DuckDbP
   return { sql, values };
 }
 
-/** Rows come back as plain JSON primitives; this only narrows them to the domain shape. */
+/**
+ * Narrows one SQL row to the domain shape, and is the only place the two naming conventions
+ * meet. The column names above are physical — they are what the Parquet files and the reference
+ * snapshot actually store — while `SynthesizedVariant` is a wire payload and therefore camelCase.
+ * Renaming the SQL aliases instead would push snake_case out to the browser or push camelCase
+ * into the Parquet schema; neither is free.
+ */
 function toSynthesizedVariant(row: Record<string, unknown>): SynthesizedVariant {
   return {
     rsid: String(row.rsid ?? ''),
     gene: String(row.gene ?? ''),
-    user_genotype: String(row.user_genotype ?? ''),
+    userGenotype: String(row.user_genotype ?? ''),
     phenotype: String(row.phenotype ?? ''),
-    clinical_significance: String(row.clinical_significance ?? ''),
-    evidence_note: String(row.evidence_note ?? ''),
+    clinicalSignificance: String(row.clinical_significance ?? ''),
+    evidenceNote: String(row.evidence_note ?? ''),
   };
 }
 
