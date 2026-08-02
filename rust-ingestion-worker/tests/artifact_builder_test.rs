@@ -1004,6 +1004,72 @@ mod artifact_builder {
         assert!(groups[0] >= ROW_GROUP_SIZE as u64);
         assert_eq!(groups.iter().sum::<u64>(), rows as u64);
     }
+
+    /// Every partition file must be *physically* ordered by the contract's in-file sort key,
+    /// for a dataset with several partitions that each span many chunks.
+    ///
+    /// The regression: the export used to be one `COPY … PARTITION_BY (chrom)`, and DuckDB's
+    /// partition writer does not preserve the statement's `ORDER BY` inside the files it
+    /// produces — it buffers and flushes each partition independently of the sort. The
+    /// existing coverage could not see it, because the demo VCF puts a single row in each
+    /// partition and the bounded-memory fixture happens to land on a chunk boundary that
+    /// survives. This shape (six partitions, 2 000 rows each) reproduced it on every run.
+    ///
+    /// Sortedness is asserted against `file_row_number`, the reader's physical row index. A
+    /// bare `lag(pos) OVER ()` would describe whatever order the scan happened to emit, which
+    /// is not the question being asked.
+    #[test]
+    fn every_partition_file_is_physically_sorted_across_many_chunks() {
+        const CHROMS: [&str; 6] = ["1", "2", "10", "22", "X", "MT"];
+        const PER_CHROM: u32 = 2_000;
+
+        let directory = TempDir::new().expect("temp dir");
+        let source = directory.path().join("multi_chrom.vcf");
+        {
+            let mut writer = BufWriter::new(File::create(&source).expect("create"));
+            writer.write_all(VCF_HEADER.as_bytes()).expect("header");
+            // Descending within each chromosome and interleaved across them, so nothing but the
+            // export can be responsible for the order on disk.
+            for index in (0..PER_CHROM).rev() {
+                for chrom in CHROMS {
+                    writer
+                        .write_all(
+                            data_line(chrom, 10_000 + index * 100, ".", "A", "C", "0/1").as_bytes(),
+                        )
+                        .expect("record");
+                }
+            }
+        }
+
+        let (stats, parquet_dir) =
+            build_in(&directory, &source, &RecordingProgressSink::default(), 1_000)
+                .expect("build succeeds");
+        assert_eq!(stats.local_parquet_files.len(), CHROMS.len());
+        assert_eq!(stats.variant_count, u64::from(PER_CHROM) * CHROMS.len() as u64);
+
+        let connection = Connection::open_in_memory().expect("connection");
+        for file in &stats.local_parquet_files {
+            let quoted = sql_path(&parquet_dir.join(&file.relative_path));
+            let out_of_order: i64 = scalar(
+                &connection,
+                &format!(
+                    "SELECT count(*) FROM (
+                       SELECT (pos, ref, alt) AS current,
+                              lag((pos, ref, alt)) OVER (ORDER BY file_row_number) AS previous
+                       FROM read_parquet('{quoted}', file_row_number = true)
+                     ) WHERE previous IS NOT NULL AND current < previous"
+                ),
+            );
+            assert_eq!(
+                out_of_order, 0,
+                "'{}' is not physically ordered by (pos, ref, alt)",
+                file.relative_path
+            );
+            assert_eq!(file.row_count, u64::from(PER_CHROM));
+            assert_eq!(file.min_pos, 10_000);
+            assert_eq!(file.max_pos, 10_000 + (PER_CHROM - 1) * 100);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
