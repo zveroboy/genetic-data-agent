@@ -230,6 +230,8 @@ const RUNNING_PROGRESS: IngestionProgress = {
 
 class FakeIngestionClient implements IngestionClient {
   readonly started: StartIngestionRequest[] = [];
+  /** Every workflowId a query was actually forwarded for — proves a rejected shape never reaches here. */
+  readonly queried: string[] = [];
   startFailure: Error | null = null;
   progressFailure: Error | null = null;
   progress: IngestionProgress = RUNNING_PROGRESS;
@@ -239,7 +241,8 @@ class FakeIngestionClient implements IngestionClient {
     this.started.push(request);
   }
 
-  async getProgress(): Promise<IngestionProgress> {
+  async getProgress(workflowId: string): Promise<IngestionProgress> {
+    this.queried.push(workflowId);
     if (this.progressFailure !== null) throw this.progressFailure;
     return this.progress;
   }
@@ -513,6 +516,40 @@ describe('GET /api/ingestions/:workflowId', () => {
     assert.equal(body.error, 'IngestionServiceUnavailable');
     assert.equal('state' in body, false);
   });
+
+  for (const rejected of [
+    'some-other-workflow-id',
+    'control-plane-run-1',
+    'genomic-ingestion-',
+    'genomic-ingestion-../../etc/passwd',
+    'genomic-ingestion-demo small',
+  ]) {
+    it(`rejects the non-ingestion-shaped id ${JSON.stringify(rejected)} with 404 without querying the orchestrator`, async () => {
+      const { app, ingestion } = harness();
+
+      const response = await app.request(`/api/ingestions/${encodeURIComponent(rejected)}`);
+
+      assert.equal(response.status, 404);
+      const body = (await response.json()) as Record<string, unknown>;
+      assert.equal(body.error, 'IngestionRunNotFound');
+      assert.deepEqual(
+        ingestion.queried,
+        [],
+        'a wrong-shaped id must never reach a getProgress query — that is how an unmapped query ' +
+          'error used to become a 500',
+      );
+    });
+  }
+
+  it('still queries the orchestrator for a correctly-shaped id that names no known run', async () => {
+    const { app, ingestion } = harness();
+    ingestion.progressFailure = new IngestionRunNotFoundError('genomic-ingestion-demo-small-nope');
+
+    const response = await app.request('/api/ingestions/genomic-ingestion-demo-small-nope');
+
+    assert.equal(response.status, 404);
+    assert.deepEqual(ingestion.queried, ['genomic-ingestion-demo-small-nope']);
+  });
 });
 
 describe('POST /ask', () => {
@@ -664,9 +701,12 @@ describe('POST /ask', () => {
   });
 
   it('reports a dataset whose targets are absent as an answer, not as fabricated variants', async () => {
-    // `TargetNotPresent` is what the resolver raises when the manifest declares no object that
-    // can contain the coordinates. The shipped agent absorbs it into a note, so the honest API
-    // outcome is a 200 with an empty variant list — never a fixture-shaped variant.
+    // The agent is faked here, so this proves only the HTTP layer's half: an agent response
+    // with no evidence serialises as a 200 with an empty `variants` array and an empty,
+    // nothing-scanned provenance — never a crash and never a fixture-shaped variant. That the
+    // *shipped* `askBioinformaticsAgent` actually produces such a response for a real
+    // `TargetNotPresentError` (rather than letting it propagate) is proven separately, by the
+    // real agent and the real `createQueryGenotypeTool`, in `infrastructure/ai/agent.test.ts`.
     const { app } = harness({
       askAgent: async () => ({
         answer: `Dataset '${DATASET_ID}' contains no variant at those coordinates.`,
@@ -733,14 +773,29 @@ describe('POST /ask', () => {
 });
 
 describe('the runtime path', () => {
-  const source = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+  // Both files a request actually runs through end to end: the route handlers, and the adapter
+  // that talks to the real orchestrator underneath `ingestionClient`. A timer planted below the
+  // port — e.g. a `catch` in the adapter that swallows a connect failure and returns a
+  // fabricated `{ state: 'COMPLETED' }` — would sail through every other test in this file,
+  // because those tests only ever inject an already-classified error into a fake `IngestionClient`
+  // (see `FakeIngestionClient` above); none of them drive a real adapter failure. Scanning only
+  // `index.ts` would miss exactly that case, so both sources are scanned here.
+  const scannedFiles = [
+    { name: 'index.ts', url: new URL('./index.ts', import.meta.url) },
+    {
+      name: 'infrastructure/temporal/temporal-ingestion-client.ts',
+      url: new URL('./infrastructure/temporal/temporal-ingestion-client.ts', import.meta.url),
+    },
+  ].map(({ name, url }) => ({ name, source: readFileSync(fileURLToPath(url), 'utf8') }));
 
-  it('initialises no fixtures at module load', () => {
-    assert.doesNotMatch(source, /autoInitFixtures/);
-    assert.doesNotMatch(source, /fixtures\//, 'no fixture path may appear in the runtime path');
-  });
+  for (const { name, source } of scannedFiles) {
+    it(`${name} initialises no fixtures at module load`, () => {
+      assert.doesNotMatch(source, /autoInitFixtures/);
+      assert.doesNotMatch(source, /fixtures\//, 'no fixture path may appear in the runtime path');
+    });
 
-  it('runs no timer, so no progress can be simulated', () => {
-    assert.doesNotMatch(source, /setTimeout|setInterval/);
-  });
+    it(`${name} runs no timer, so no progress can be simulated`, () => {
+      assert.doesNotMatch(source, /setTimeout|setInterval/);
+    });
+  }
 });

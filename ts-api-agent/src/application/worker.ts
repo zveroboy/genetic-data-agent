@@ -10,22 +10,10 @@
  */
 import { Worker } from '@temporalio/worker';
 
+import { artifactBucketFromEnv } from './artifact-bucket.ts';
 import { createControlPlaneActivities } from './control-plane-activities.ts';
 import { CONTROL_PLANE_TASK_QUEUE } from './workflows.ts';
 import { S3ObjectStore } from '../infrastructure/object-store/s3-object-store.ts';
-
-/** Matches the bucket `scripts/seed_demo_s3.sh` creates. */
-export const DEFAULT_ARTIFACT_BUCKET = 'genomic-artifacts';
-
-/**
- * Bucket every published artifact and manifest is written to. It is Worker configuration, never
- * wire input, which is what lets `publishDataset` reject an otherwise well-formed request that
- * targets a different bucket.
- */
-export function artifactBucketFromEnv(env: NodeJS.ProcessEnv = process.env): string {
-  const configured = env.S3_ARTIFACT_BUCKET ?? '';
-  return configured.length > 0 ? configured : DEFAULT_ARTIFACT_BUCKET;
-}
 
 async function run(): Promise<void> {
   const objectStore = S3ObjectStore.fromEnv();

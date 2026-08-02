@@ -1,20 +1,3 @@
-export interface UserVariant {
-  chrom: string;
-  pos: number;
-  rsid: string;
-  ref: string;
-  alt: string;
-  gt_raw: string;
-}
-
-export interface ClinVarAnnotation {
-  rsid: string;
-  gene: string;
-  phenotype: string;
-  clinical_significance: string;
-  evidence_note: string;
-}
-
 /**
  * One answered variant, as it reaches the agent and the wire.
  *

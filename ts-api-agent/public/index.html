@@ -199,6 +199,12 @@
         <div x-show="pollError" x-cloak class="notice error">
           <strong x-text="pollError?.error"></strong>
           <p class="mono" style="margin: 0.4rem 0 0 0;" x-text="pollError?.message"></p>
+          <p x-show="pollRetrying" x-cloak style="margin: 0.4rem 0 0 0;">
+            Повтор запроса через <span x-text="Math.round(pollRetryDelayMs / 1000)"></span> с…
+          </p>
+          <button class="secondary" style="margin-top: 0.6rem;" @click="backToSelection()">
+            Выбрать датасет заново
+          </button>
         </div>
 
         <div x-show="progress?.state === 'FAILED'" x-cloak class="notice error">
@@ -358,6 +364,11 @@
         progress: null,
         pollError: null,
         pollTimer: null,
+        // Backoff state for a poll that keeps failing (e.g. the orchestrator is down). Reset to
+        // zero on any successful poll, so a transient blip does not slow down the next one.
+        pollFailureCount: 0,
+        pollRetrying: false,
+        pollRetryDelayMs: 0,
 
         messages: [],
         currentInput: '',
@@ -407,6 +418,9 @@
             this.workflowId = data.workflowId;
             this.progress = null;
             this.pollError = null;
+            this.pollFailureCount = 0;
+            this.pollRetrying = false;
+            this.pollRetryDelayMs = 0;
             this.messages = [];
             this.state = 'ingesting';
             this.pollProgress();
@@ -421,10 +435,21 @@
           return this.progress?.state === 'COMPLETED' || this.progress?.state === 'FAILED';
         },
 
-        /** Poll the workflow query until it reports a terminal state. */
+        /**
+         * Poll the workflow query until it reports a terminal state.
+         *
+         * A run of consecutive failures backs off exponentially (capped), rather than hammering
+         * an orchestrator that is already down every 1.5s forever; any successful poll resets the
+         * count, so a single blip does not slow down the next real poll. A `404` (the run id
+         * names nothing the orchestrator knows about) does not back off — it stops polling
+         * outright, since retrying cannot turn a nonexistent run into an existing one.
+         */
         async pollProgress() {
           if (this.pollTimer) clearTimeout(this.pollTimer);
           if (!this.workflowId) return;
+
+          const MAX_RETRY_DELAY_MS = 15000;
+          const BASE_RETRY_DELAY_MS = 1500;
 
           try {
             const res = await fetch(`/api/ingestions/${encodeURIComponent(this.workflowId)}`);
@@ -433,24 +458,37 @@
             if (res.ok) {
               this.progress = data;
               this.pollError = null;
+              this.pollFailureCount = 0;
+              this.pollRetrying = false;
               if (data.state === 'COMPLETED') {
                 this.openChat();
                 return;
               }
               if (data.state === 'FAILED') return;
             } else if (res.status === 404) {
+              // No local progress is invented here: an unknown run has no state to report, and
+              // no amount of retrying will make it exist.
               this.pollError = { error: data.error || 'IngestionRunNotFound', message: data.message || '' };
+              this.pollRetrying = false;
               return;
             } else {
-              // Typically a 503: the orchestrator is unreachable. Reported, and retried —
-              // but the last proven state is left untouched rather than advanced.
+              // Typically a 503: the orchestrator is unreachable. Reported, and retried with
+              // backoff — but the last proven state is left untouched rather than advanced.
               this.pollError = { error: data.error || 'RequestFailed', message: data.message || '' };
+              this.pollFailureCount += 1;
             }
           } catch (err) {
             this.pollError = { error: 'NetworkError', message: err.message };
+            this.pollFailureCount += 1;
           }
 
-          this.pollTimer = setTimeout(() => this.pollProgress(), 1500);
+          const delay = Math.min(
+            BASE_RETRY_DELAY_MS * 2 ** Math.max(0, this.pollFailureCount - 1),
+            MAX_RETRY_DELAY_MS,
+          );
+          this.pollRetrying = true;
+          this.pollRetryDelayMs = delay;
+          this.pollTimer = setTimeout(() => this.pollProgress(), delay);
         },
 
         /**
@@ -509,6 +547,9 @@
           this.state = 'select';
           this.progress = null;
           this.pollError = null;
+          this.pollFailureCount = 0;
+          this.pollRetrying = false;
+          this.pollRetryDelayMs = 0;
           this.datasetId = null;
           this.workflowId = null;
         },

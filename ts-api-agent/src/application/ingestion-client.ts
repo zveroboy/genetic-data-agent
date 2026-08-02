@@ -30,6 +30,32 @@ export function ingestionWorkflowIdFor(datasetId: string): string {
   return `genomic-ingestion-${datasetId}`;
 }
 
+/** The fixed prefix every id `ingestionWorkflowIdFor` produces starts with. */
+const INGESTION_WORKFLOW_ID_PREFIX = 'genomic-ingestion-';
+
+/**
+ * A single safe path segment — matches `newDatasetId`'s output and the resolver's own
+ * `DATASET_ID_UNSAFE` check, without hard-coding a UUID shape the id's suffix happens to have
+ * today.
+ */
+const SAFE_ID_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * True only for ids shaped exactly like `ingestionWorkflowIdFor` produces: the fixed prefix
+ * followed by a safe dataset-id segment.
+ *
+ * `GET /api/ingestions/:workflowId` forwards its path parameter to a Temporal query, and a query
+ * error the orchestrator's SDK does not classify has no mapping in `ERROR_STATUS` and would
+ * otherwise surface as an opaque `500`. Rejecting a wrong-shaped id here — before it ever reaches
+ * `getProgress` — turns "this names no execution this process could have started" into a clean
+ * `404`, the same status a real unknown-but-well-shaped id gets from the orchestrator itself.
+ */
+export function isIngestionWorkflowId(value: string): boolean {
+  if (!value.startsWith(INGESTION_WORKFLOW_ID_PREFIX)) return false;
+  const suffix = value.slice(INGESTION_WORKFLOW_ID_PREFIX.length);
+  return SAFE_ID_SEGMENT_PATTERN.test(suffix);
+}
+
 /**
  * One run's identity, resolved by the caller *before* the Workflow starts.
  *

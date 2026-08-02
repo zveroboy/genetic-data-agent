@@ -28,8 +28,13 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
+import { artifactBucketFromEnv } from './application/artifact-bucket.ts';
 import { newDatasetId } from './application/dataset-catalog.ts';
-import { type IngestionClient, ingestionWorkflowIdFor } from './application/ingestion-client.ts';
+import {
+  type IngestionClient,
+  ingestionWorkflowIdFor,
+  isIngestionWorkflowId,
+} from './application/ingestion-client.ts';
 import { DATASET_KEYS, isDatasetKey } from './domain/datasets.ts';
 import type { DatasetCatalogEntry } from './domain/datasets.ts';
 import type { AgentResponse } from './infrastructure/ai/agent.ts';
@@ -330,10 +335,27 @@ export function createApp(dependencies: AppDependencies): Hono {
    * Nothing is added here. `VERIFYING_OBJECTS` and `PUBLISHING_MANIFEST` happen inside one
    * activity, so the Workflow cannot witness the boundary; interpolating the transition on the
    * way out would invent an observation the system never made.
+   *
+   * The id is checked against the shape `ingestionWorkflowIdFor` produces *before* it reaches
+   * the orchestrator. Without this, an id naming some other Temporal workflow — one this
+   * process never started — would be forwarded straight into a `getProgress` query; the
+   * resulting query error has no mapping in `ERROR_STATUS` and would surface as an opaque
+   * `500`. An id that merely *looks* right but names no run this process started still reaches
+   * the query below and gets the orchestrator's own real `404`.
    */
   app.get('/api/ingestions/:workflowId', async (c) => {
+    const workflowId = c.req.param('workflowId');
+    if (!isIngestionWorkflowId(workflowId)) {
+      return c.json(
+        {
+          error: 'IngestionRunNotFound',
+          message: `no ingestion run '${workflowId}' exists`,
+        },
+        404,
+      );
+    }
     try {
-      return c.json(await ingestionClient.getProgress(c.req.param('workflowId')));
+      return c.json(await ingestionClient.getProgress(workflowId));
     } catch (error) {
       return errorResponse(c, error);
     }
@@ -386,20 +408,6 @@ export function createApp(dependencies: AppDependencies): Hono {
   });
 
   return app;
-}
-
-/**
- * Bucket every published artifact and manifest lives in.
- *
- * Deliberately the same variable and default as `application/worker.ts`'s
- * `artifactBucketFromEnv`, and deliberately not imported from it: that module pulls in
- * `@temporalio/worker` and its native core, which the API process has no other reason to load.
- * The two must agree — the Worker writes manifests where this process looks for them — so if
- * either default changes, both do.
- */
-function artifactBucketFromEnv(env: NodeJS.ProcessEnv = process.env): string {
-  const configured = env.S3_ARTIFACT_BUCKET ?? '';
-  return configured.length > 0 ? configured : 'genomic-artifacts';
 }
 
 /**
