@@ -319,6 +319,7 @@ impl fmt::Display for FailureType {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
     /// Golden fixtures live at the repository root and are read verbatim by both languages.
@@ -405,6 +406,24 @@ mod tests {
             Some("fixture-version-chrom-12")
         );
         assert_eq!(second.byte_size, 15360);
+    }
+
+    /// The fingerprint is pinned as a literal in both languages so workflow code can compare
+    /// it without hashing. Nothing tied the two constants together until this test: a change
+    /// to the column list that left the literal alone would have gone unnoticed.
+    #[test]
+    fn parquet_schema_fingerprint_is_the_sha256_of_the_column_description() {
+        let mut hasher = Sha256::new();
+        hasher.update(PARQUET_SCHEMA_COLUMNS.as_bytes());
+        assert_eq!(hex::encode(hasher.finalize()), PARQUET_SCHEMA_FINGERPRINT);
+
+        // `chrom` is a partition directory, never a physical column.
+        assert!(!PARQUET_SCHEMA_COLUMNS.contains("chrom"));
+        assert_eq!(
+            PARQUET_SCHEMA_COLUMNS.split(';').count(),
+            SORT_ORDER.len() + 1,
+            "pos, rsid, ref, alt, gt_raw"
+        );
     }
 
     #[test]
