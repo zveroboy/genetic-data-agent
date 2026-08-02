@@ -41,6 +41,7 @@ import {
   ingestionWorkflowIdFor,
 } from './application/ingestion-client.ts';
 import { datasetCatalog } from './application/dataset-catalog.ts';
+import { ObjectVerificationError } from './application/object-identity.ts';
 import type { IngestionProgress } from './application/workflows.ts';
 import { DATASET_KEYS } from './domain/datasets.ts';
 import {
@@ -736,6 +737,7 @@ describe('POST /ask', () => {
     [new TargetNotPresentError(DATASET_ID, 'the requested coordinates'), 404],
     [new RemoteDatasetUnavailableError(DATASET_ID, 'IO Error: connection reset'), 503],
     [new QueryBudgetExceededError(10_000), 504],
+    [new ObjectVerificationError('ETAG_MISMATCH', 'a/b.parquet', 'differs'), 409],
   ] as const) {
     it(`maps ${error.name} to ${status} without substituting a fixture result`, async () => {
       const { app } = harness({ askAgent: failingAgent(error) });
@@ -780,13 +782,30 @@ describe('the runtime path', () => {
   // because those tests only ever inject an already-classified error into a fake `IngestionClient`
   // (see `FakeIngestionClient` above); none of them drive a real adapter failure. Scanning only
   // `index.ts` would miss exactly that case, so both sources are scanned here.
+  //
+  // `index.ts` used to carry the closed-body reader, the provenance envelope, the error-status
+  // policy and the Node↔Hono bridge inline; they now live under `http/`. Every one of those
+  // files is concatenated into the same entry below so the two checks below still cover every
+  // byte that used to be part of `index.ts`'s text, not just what is left of it.
   const scannedFiles = [
-    { name: 'index.ts', url: new URL('./index.ts', import.meta.url) },
+    {
+      name: 'index.ts',
+      urls: [
+        new URL('./index.ts', import.meta.url),
+        new URL('./http/error-status.ts', import.meta.url),
+        new URL('./http/closed-json-body.ts', import.meta.url),
+        new URL('./http/provenance-envelope.ts', import.meta.url),
+        new URL('./http/node-listener.ts', import.meta.url),
+      ],
+    },
     {
       name: 'infrastructure/temporal/temporal-ingestion-client.ts',
-      url: new URL('./infrastructure/temporal/temporal-ingestion-client.ts', import.meta.url),
+      urls: [new URL('./infrastructure/temporal/temporal-ingestion-client.ts', import.meta.url)],
     },
-  ].map(({ name, url }) => ({ name, source: readFileSync(fileURLToPath(url), 'utf8') }));
+  ].map(({ name, urls }) => ({
+    name,
+    source: urls.map((url) => readFileSync(fileURLToPath(url), 'utf8')).join('\n'),
+  }));
 
   for (const { name, source } of scannedFiles) {
     it(`${name} initialises no fixtures at module load`, () => {

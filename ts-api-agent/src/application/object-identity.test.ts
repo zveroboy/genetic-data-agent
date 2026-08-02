@@ -97,8 +97,9 @@ describe('verifyObjectIdentity', () => {
       assert.equal(error.code, code);
       assert.equal(error.name, 'ObjectVerificationFailed');
       assert.equal(error.key, object.key);
-      // The code and the offending key lead the message: it is what an operator sees, and what
-      // the HTTP layer and Temporal's retry classification key off.
+      // The code and the offending key lead the message: it is what an operator sees. The HTTP
+      // layer and Temporal's retry classification both key off `error.name`
+      // ('ObjectVerificationFailed', asserted above), never off this message text.
       assert.ok(error.message.startsWith(`${code}: object '${object.key}' `));
     });
   }
@@ -168,6 +169,13 @@ describe('verifyObjectIdentities', () => {
   }
 
   it('heads exactly the declared objects, in the order it was given them', async () => {
+    // `FakeObjectStore.headMany` is a plain `Promise.all` and ignores `concurrency`, so this
+    // only pins that `verifyObjectIdentities` issues one HEAD per declared object and passes
+    // them through in input order — it cannot observe the *bounded*-concurrency guarantee,
+    // which the fake makes trivially true regardless of `concurrency`. The real guarantee (that
+    // requests still start in input order with only `concurrency` in flight) is pinned against
+    // `headManyBounded` by 'heads objects in canonical manifest order with bounded concurrency'
+    // in `control-plane-activities.test.ts`.
     const store = storeWith(new Map());
 
     await verifyObjectIdentities(store, objects, { declaredBy: 'manifest' });

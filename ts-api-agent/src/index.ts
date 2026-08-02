@@ -26,7 +26,6 @@ import { fileURLToPath } from 'node:url';
 
 import { Hono } from 'hono';
 import type { Context } from 'hono';
-import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
 import { artifactBucketFromEnv } from './application/artifact-bucket.ts';
 import { newDatasetId } from './application/dataset-catalog.ts';
@@ -37,15 +36,16 @@ import {
 } from './application/ingestion-client.ts';
 import { DATASET_KEYS, isDatasetKey } from './domain/datasets.ts';
 import type { DatasetCatalogEntry } from './domain/datasets.ts';
+import { nameOf, statusFor } from './http/error-status.ts';
+import { readClosedJsonObject } from './http/closed-json-body.ts';
+import { provenanceEnvelope } from './http/provenance-envelope.ts';
+import { nodeListener } from './http/node-listener.ts';
 import type { AgentResponse } from './infrastructure/ai/agent.ts';
 import type { ClinVarCoordinateResolver } from './infrastructure/database/clinvar-coordinate-resolver.ts';
 import type { DuckDbSessionFactory } from './infrastructure/database/duckdb-session-factory.ts';
 import { createGenotypeRepositoryFactory } from './infrastructure/database/duckdb.ts';
-import type { GenotypeProvenance, GenotypeRepository } from './infrastructure/database/duckdb.ts';
-import type {
-  ParquetDatasetResolver,
-  ResolvedParquetDataset,
-} from './infrastructure/database/parquet-dataset-resolver.ts';
+import type { GenotypeRepository } from './infrastructure/database/duckdb.ts';
+import type { ParquetDatasetResolver } from './infrastructure/database/parquet-dataset-resolver.ts';
 
 /** The read side of the seeded allowlist. `application/dataset-catalog.ts` satisfies it. */
 export interface DatasetCatalogPort {
@@ -73,65 +73,8 @@ export interface AppDependencies {
   readonly uiHtmlPath?: string;
 }
 
-/**
- * Status for every failure the serving path and the orchestrator can raise, keyed by the
- * error's `name`.
- *
- * Matching on the name rather than on `instanceof` is deliberate. These names are the frozen
- * cross-layer contract (`contracts/ingestion-v1.md` and the serving modules pin each one with
- * an explicit `this.name`), and importing the classes would drag the DuckDB native binding and
- * the reference snapshot module into every consumer of the HTTP layer for nothing.
- *
- * The three families:
- *
- * - `409` — the dataset exists as an id but cannot be served as published: no manifest, a
- *   manifest that no longer matches its objects, or a reference snapshot that describes a
- *   different genome than the one the dataset was ingested against. Answering anyway would
- *   mean returning the wrong person's answer to the right question.
- * - `4xx` on the target — the question named something the reference cannot place, or that the
- *   dataset provably does not contain. Neither is widened into a scan.
- * - `5xx` — the object store or the query budget gave out. These are the ones a caller may
- *   retry; none of them may be answered from anything else.
- */
-const ERROR_STATUS: Readonly<Record<string, ContentfulStatusCode>> = Object.freeze({
-  IngestionServiceUnavailable: 503,
-  IngestionRunNotFound: 404,
-
-  DatasetNotPublished: 409,
-  ObjectVerificationFailed: 409,
-  ReferenceSnapshotMismatch: 409,
-  ReferenceBuildMismatch: 409,
-  DatasetPublicationConflict: 409,
-
-  TargetNotResolvable: 422,
-  TargetResolutionLimitExceeded: 422,
-  TargetNotPresent: 404,
-
-  RemoteDatasetUnavailable: 503,
-  ReferenceSnapshotUnavailable: 503,
-  HttpfsExtensionUnavailable: 503,
-  QueryBudgetExceeded: 504,
-  SessionConfigurationTimedOut: 504,
-});
-
-function nameOf(error: unknown): string {
-  const name = (error as { name?: unknown } | null)?.name;
-  return typeof name === 'string' ? name : '';
-}
-
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function statusFor(error: unknown): ContentfulStatusCode | undefined {
-  const name = nameOf(error);
-  if (name === 'DatasetResolutionFailed') {
-    // One resolution code is the caller's fault — an id that is not a single safe path segment
-    // never named a dataset in the first place. Every other code means the *published* artifact
-    // is not trustworthy, which is a conflict with the dataset's state, not a bad request.
-    return (error as { code?: unknown }).code === 'DATASET_ID_UNSAFE' ? 400 : 409;
-  }
-  return ERROR_STATUS[name];
 }
 
 /**
@@ -162,79 +105,6 @@ function errorResponse(c: Context, error: unknown) {
     },
     status,
   );
-}
-
-type ParsedBody =
-  | { readonly ok: true; readonly body: Record<string, unknown> }
-  | { readonly ok: false; readonly error: string; readonly message: string };
-
-/**
- * Reads a closed JSON object body.
- *
- * "Closed" is the load-bearing part: a field the endpoint does not know about is rejected
- * rather than ignored. Ignoring it would make `{"datasetKey":"demo-small","bucket":"…"}` and
- * `{"datasetKey":"demo-small"}` indistinguishable to the caller, and the day someone starts
- * reading `bucket` the API silently gains an override nobody reviewed.
- */
-async function readClosedJsonObject(
-  c: Context,
-  allowedFields: readonly string[],
-): Promise<ParsedBody> {
-  let parsed: unknown;
-  try {
-    parsed = await c.req.json();
-  } catch {
-    return { ok: false, error: 'MalformedRequestBody', message: 'the body must be a JSON object' };
-  }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return { ok: false, error: 'MalformedRequestBody', message: 'the body must be a JSON object' };
-  }
-
-  const unexpected = Object.keys(parsed).filter((key) => !allowedFields.includes(key));
-  if (unexpected.length > 0) {
-    return {
-      ok: false,
-      error: 'UnrecognizedRequestField',
-      message:
-        `this endpoint accepts only ${allowedFields.join(', ')}; got ${unexpected.join(', ')}. ` +
-        'Object URIs, buckets, source paths and manifest overrides are never taken from a request.',
-    };
-  }
-  return { ok: true, body: parsed as Record<string, unknown> };
-}
-
-/**
- * What was read, and against what.
- *
- * The manifest half — checksum, layout/schema version, fingerprint, artifact version, reference
- * identity — describes the dataset the request was authorised against, and is present on every
- * answer. The read half — the exact object URIs and how many coordinates were resolved — comes
- * from the genotype tool and is empty when the agent never queried genotypes, because claiming
- * a scan that did not happen is the same lie as claiming a variant that was not found.
- */
-function provenanceEnvelope(
-  dataset: ResolvedParquetDataset,
-  read: GenotypeProvenance | undefined,
-) {
-  if (read !== undefined && read.datasetId !== dataset.datasetId) {
-    throw new Error(
-      `internal invariant violated: provenance for '${read.datasetId}' was produced while ` +
-        `serving '${dataset.datasetId}'`,
-    );
-  }
-  return {
-    datasetId: dataset.datasetId,
-    datasetChecksumSha256: dataset.datasetChecksumSha256,
-    artifactFormat: dataset.manifest.artifactFormat,
-    artifactVersion: dataset.manifest.artifactVersion,
-    layoutVersion: dataset.manifest.layoutVersion,
-    schemaVersion: dataset.manifest.schemaVersion,
-    schemaFingerprint: dataset.manifest.schemaFingerprint,
-    referenceBuild: dataset.referenceBuild,
-    referenceVersion: dataset.referenceVersion,
-    filesScanned: read?.filesScanned ?? [],
-    targetsResolved: read?.targetsResolved ?? 0,
-  };
 }
 
 const DEFAULT_UI_HTML_PATH = path.resolve(
@@ -462,33 +332,6 @@ async function buildRuntimeDependencies(): Promise<AppDependencies & { close(): 
       await coordinateResolver.close();
       objectStore.destroy();
     },
-  };
-}
-
-/** Bridges Node's `http` server onto Hono's fetch handler; no framework adapter needed. */
-function nodeListener(app: Hono): http.RequestListener {
-  return async (req, res) => {
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-    const method = req.method ?? 'GET';
-
-    const headers = new Headers();
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (value === undefined) continue;
-      headers.set(key, Array.isArray(value) ? value.join(', ') : value);
-    }
-
-    let body: Buffer | undefined;
-    if (method !== 'GET' && method !== 'HEAD') {
-      const chunks: Buffer[] = [];
-      for await (const chunk of req) chunks.push(chunk as Buffer);
-      body = Buffer.concat(chunks);
-    }
-
-    const response = await app.fetch(new Request(url, { method, headers, body }));
-
-    res.statusCode = response.status;
-    response.headers.forEach((value, key) => res.setHeader(key, value));
-    res.end(Buffer.from(await response.arrayBuffer()));
   };
 }
 
