@@ -265,6 +265,78 @@ describe('target resolution limit', () => {
   });
 });
 
+describe('target resolution limit is counted after normalisation', () => {
+  let workDir: string;
+  let resolver: ClinVarCoordinateResolver;
+
+  before(async () => {
+    workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clinvar-limit-normalised-'));
+
+    // One raw row more than the cap, but one of those raw rows carries an unplaceable
+    // chromosome ('ZZ' does not normalize to anything). The overflow check must be counted
+    // after that row is dropped: this gene resolves to exactly MAX_TARGETS_PER_QUERY targets and
+    // must answer in full, not be rejected on the pre-filter raw row count.
+    const header = [
+      'reference_version',
+      'reference_build',
+      'chrom',
+      'pos',
+      'rsid',
+      'ref',
+      'alt',
+      'gene',
+      'phenotype',
+      'clinical_significance',
+      'evidence_note',
+    ].join('\t');
+    const row = (chrom: string, index: number) =>
+      [
+        REFERENCE_VERSION,
+        REFERENCE_BUILD,
+        chrom,
+        String(1_000_000 + index),
+        `rsONEUNPLACEABLE${index}`,
+        'A',
+        'G',
+        'ONEUNPLACEABLE',
+        'Synthetic phenotype',
+        'Uncertain Significance',
+        'Synthetic row for the post-normalisation overflow-count test.',
+      ].join('\t');
+    const rows = [
+      // The unplaceable row sorts first ('ZZ' precedes 'chr3' lexically), so it is guaranteed to
+      // be within the fetched LIMIT window regardless of fetch order.
+      row('ZZ', 0),
+      ...Array.from({ length: MAX_TARGETS_PER_QUERY }, (_unused, index) => row('chr3', index + 1)),
+    ];
+    const tsvPath = path.join(workDir, 'overflow_normalised.tsv');
+    fs.writeFileSync(tsvPath, [header, ...rows].join('\n') + '\n');
+
+    const snapshot = await buildReferenceDatabase({
+      tsvPath,
+      databasePath: path.join(workDir, 'overflow_normalised.duckdb'),
+      referenceVersion: REFERENCE_VERSION,
+      referenceBuild: REFERENCE_BUILD,
+    });
+    assert.equal(snapshot.rowCount, MAX_TARGETS_PER_QUERY + 1);
+    resolver = await openClinVarCoordinateResolver({ databasePath: snapshot.path });
+  });
+
+  after(async () => {
+    await resolver?.close();
+    if (workDir) fs.rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it('does not signal overflow when one raw row over the cap is unplaceable', async () => {
+    const targets = await resolver.resolve('ONEUNPLACEABLE', 'GRCh38');
+    assert.equal(
+      targets.length,
+      MAX_TARGETS_PER_QUERY,
+      'one unplaceable raw row must not count against the cap',
+    );
+  });
+});
+
 describe('reference snapshot bootstrap', () => {
   let workDir: string;
 

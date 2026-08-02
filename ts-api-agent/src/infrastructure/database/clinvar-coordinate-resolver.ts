@@ -206,14 +206,6 @@ export async function openClinVarCoordinateResolver(
         )
       ).getRowObjects();
 
-      if (rows.length > MAX_TARGETS_PER_QUERY) {
-        throw new TargetResolutionLimitExceededError(
-          targetId,
-          snapshot.referenceVersion,
-          MAX_TARGETS_PER_QUERY,
-        );
-      }
-
       const targets: VariantTarget[] = [];
       const seen = new Set<string>();
       for (const row of rows) {
@@ -242,6 +234,20 @@ export async function openClinVarCoordinateResolver(
           clinicalSignificance: String(row.clinical_significance),
           evidenceNote: String(row.evidence_note),
         });
+      }
+
+      // Counted after unplaceable rows are dropped and duplicates are collapsed: the raw row
+      // count fetched above is what the SQL `LIMIT` capped, not what the target actually
+      // resolves to, and those two only coincide when every fetched row survives filtering. A
+      // gene with `MAX_TARGETS_PER_QUERY + 1` raw rows of which one is unplaceable resolves to
+      // exactly `MAX_TARGETS_PER_QUERY` targets and must answer in full, not be rejected with a
+      // message asserting it resolves to more coordinates than it does.
+      if (targets.length > MAX_TARGETS_PER_QUERY) {
+        throw new TargetResolutionLimitExceededError(
+          targetId,
+          snapshot.referenceVersion,
+          MAX_TARGETS_PER_QUERY,
+        );
       }
 
       if (targets.length === 0) {

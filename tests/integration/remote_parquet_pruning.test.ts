@@ -528,22 +528,27 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
     const result = await repositories.get(spec.datasetId)!.synthesizeVariant('rs4149056');
 
     const gets = proxy.requests.filter((request) => request.method === 'GET');
-    // The footer immediately follows the last row group's data (`parquet_metadata()` above
-    // already gives that boundary exactly), then the 8-byte trailer (footer length + magic).
-    // This is the file's *actual* footer offset, not a fixed-size guess: a fixed 64 KiB window
-    // can start inside the last row group for a file this size, which would make a GET that
-    // fully re-reads that row group overlap the window and get discarded whole rather than
-    // measured — the very blind spot this derivation closes.
-    const footerStart = groups.reduce((max, group) => Math.max(max, group.end), 0);
-    // Per-byte, not per-request: a request's span is clipped to the data region before it is
-    // attributed to a row group, so a request that straddles the footer boundary still counts
-    // its data-side bytes correctly instead of being excluded in its entirety.
-    const dataSpan = (request: ProxyRequest): Span => {
-      const raw = requestSpan(request, size);
-      return { start: raw.start, end: Math.min(raw.end, footerStart) };
-    };
+    /**
+     * DuckDB's httpfs locates the footer with a single speculative tail GET whose span
+     * terminates at the object's real last byte (`end === size`) — it does not know the true
+     * footer size in advance, so it guesses a fixed-size window and reads to EOF. That GET is
+     * structurally identifiable by this property alone, independent of any row-group geometry:
+     * no ordinary row-group data read ever needs to run all the way to the physical end of the
+     * file, only the footer probe does.
+     */
+    const isEofTerminatingGet = (request: ProxyRequest): boolean =>
+      requestSpan(request, size).end === size;
+    // Row-group attribution counts only non-footer-probe GETs. Excluding the footer probe
+    // outright — rather than clipping its span to a computed footer offset and hoping the
+    // remainder is small — is what lets row group 2 (immediately adjacent to the footer) keep
+    // the same strict-zero assertion as row group 0 below: the footer probe's incidental
+    // overlap with row group 2's tail bytes (explained at FOOTER_PROBE_MAX_BYTES below) is no
+    // longer counted as row-group traffic at all, instead of being tolerated as a percentage of
+    // an unrelated quantity.
     const bytesFromRowGroup = (id: number) =>
-      gets.reduce((sum, request) => sum + overlap(dataSpan(request), groups[id]!), 0);
+      gets
+        .filter((request) => !isEofTerminatingGet(request))
+        .reduce((sum, request) => sum + overlap(requestSpan(request, size), groups[id]!), 0);
     const totalBytes = proxy.requests.reduce((sum, request) => sum + request.bytes, 0);
 
     console.log(
@@ -608,21 +613,35 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
     // incidentally pulls in the tail end of row group 2's own column data: bytes that are never
     // used to answer the query (only row group 1 is joined against) but are genuinely on the
     // wire regardless of pruning. That is structural — a property of the footer-probe size
-    // relative to this object's layout, not a pruning regression — and it cannot be zeroed by
-    // better bookkeeping; it would only disappear on a much larger object, where the same fixed
-    // guess window is a vanishing fraction of the tail row group's size. The bound below is
-    // still a real regression guard: a full or majority read of row group 2 — the exact failure
-    // mode this test exists to catch — would blow well past it.
+    // relative to this object's layout, not a pruning regression. Because that GET is now
+    // excluded from row-group attribution entirely (identified by `end === size`, not tolerated
+    // as a fraction of row group 2's size), row group 2 gets the same strict-zero assertion as
+    // row group 0: nothing attributable to actual row-group scanning may come from it.
     const footerAdjacentRowGroup = groups[groups.length - 1]!;
-    const footerAdjacentRowGroupSize = footerAdjacentRowGroup.end - footerAdjacentRowGroup.start;
-    const footerAdjacentBytes = bytesFromRowGroup(footerAdjacentRowGroup.id);
-    assert.ok(
-      footerAdjacentBytes < footerAdjacentRowGroupSize * 0.25,
-      `row group ${footerAdjacentRowGroup.id} (adjacent to the footer) read ${footerAdjacentBytes} ` +
-        `of its ${footerAdjacentRowGroupSize} bytes (${((footerAdjacentBytes / footerAdjacentRowGroupSize) * 100).toFixed(1)}%); ` +
-        'a value anywhere near its full size would mean it was actually scanned for the query, ' +
-        'not just brushed by the footer-locating tail read',
+    assert.equal(
+      bytesFromRowGroup(footerAdjacentRowGroup.id),
+      0,
+      `no data may be attributed to row group ${footerAdjacentRowGroup.id} (adjacent to the footer) ` +
+        'once the footer-probe GET is excluded from row-group accounting',
     );
+
+    // The exclusion above only holds if the footer probe itself stays small — otherwise a
+    // regression could hide a whole row-group read inside "one GET that happens to end at EOF"
+    // and it would simply vanish from every row-group total instead of being caught. Bound it
+    // directly: FOOTER_PROBE_MAX_BYTES is 4x the observed 16 KiB probe (headroom for an httpfs
+    // version bump) and still far tighter than one column chunk of this object (~73.6 KB on
+    // average across its 5 physical columns, from row group 1's 368,187 bytes / 5), so a
+    // single-column-chunk read smuggled in under "ends at EOF" cannot pass.
+    const FOOTER_PROBE_MAX_BYTES = 64 * 1024;
+    const eofTerminatingGets = gets.filter((request) => isEofTerminatingGet(request));
+    for (const request of eofTerminatingGets) {
+      assert.ok(
+        request.bytes <= FOOTER_PROBE_MAX_BYTES,
+        `an EOF-terminating GET read ${request.bytes} bytes, exceeding the ` +
+          `${FOOTER_PROBE_MAX_BYTES}-byte footer-probe bound — too large to be the footer probe alone`,
+      );
+    }
+
     assert.ok(bytesFromRowGroup(1) > 0, 'the matching row group must actually be read');
   });
 

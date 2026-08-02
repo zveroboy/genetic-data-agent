@@ -11,11 +11,18 @@
  *
  * - **Bounded resources.** `memory_limit` and `threads` are set per session, so one pathological
  *   query cannot take the API process down with it.
- * - **A real deadline.** A query that outlives its deadline is *interrupted* through the
- *   binding's cancellation API, not merely abandoned by a promise race. An abandoned query
- *   keeps burning CPU and S3 bandwidth for as long as it feels like. Configuring the session
- *   itself (loading `httpfs`, attaching credentials) is bounded by the same deadline, for the
- *   same reason.
+ * - **A real deadline, where the underlying work is interruptible.** A query that outlives its
+ *   deadline has `connection.interrupt()` called on it through the binding's cancellation API,
+ *   not merely abandoned by a promise race, and the same mechanism wraps session configuration
+ *   (loading `httpfs`, attaching credentials) so a hang there cannot stall `open()` silently
+ *   forever either. This guarantee is only as good as the wrapped operation's own response to
+ *   `interrupt()`: it has been verified empirically for `connection.run`/`runAndReadAll` driving
+ *   a `range()` scan, which is what the deadline tests below exercise. It has *not* been proven
+ *   for `LOAD` specifically — if a stalled extension load ever fails to observe the interrupt,
+ *   `runWithDeadline` still awaits it and `open()` would hang despite the configured deadline.
+ *   Residual risk is small in practice: `autoinstall_known_extensions`/`autoload_known_extensions`
+ *   are off by default (see below), so `LOAD` normally resolves from the local extension cache
+ *   almost instantly rather than blocking on network I/O.
  * - **Credentials that do not outlive the request.** The S3 secret is dropped and the
  *   connection closed in a `finally`, on every path.
  *
@@ -204,6 +211,11 @@ async function loadHttpfs(
  * Runs `work` under the same interrupt-based deadline the query path uses: a timer arms
  * `connection.interrupt()`, and a failure that lands after it fired is reported through
  * `onDeadlineExceeded` rather than as whatever internal error the interrupt happened to produce.
+ *
+ * This is not a race against a timer promise: `work()` is awaited directly, so the deadline only
+ * bounds elapsed time if whatever `work` does actually rejects once interrupted. An operation
+ * that never observes `connection.interrupt()` (or catches and ignores it) hangs this function,
+ * and its caller, indefinitely regardless of `deadlineMs`.
  */
 async function runWithDeadline<T>(
   connection: DuckDBConnection,
@@ -298,9 +310,11 @@ export function createDuckDbSessionFactory(config: DuckDbSessionConfig): DuckDbS
       }
 
       try {
-        // Configuration itself is bounded by the session deadline: it runs before any query
-        // does, so without its own bound a hanging extension autoload would stall `open()`
-        // indefinitely with no way to cancel it.
+        // Configuration itself runs through the same interrupt-based deadline as a query, so a
+        // hang here is not left to stall `open()` indefinitely with no way to cancel it — but,
+        // per the module doc above, that only actually bounds elapsed time if the stalled
+        // operation observes `connection.interrupt()`, which is proven for a `range()` scan
+        // (the test below) and not specifically for `LOAD`.
         await runWithDeadline(
           connection,
           deadlineMs,

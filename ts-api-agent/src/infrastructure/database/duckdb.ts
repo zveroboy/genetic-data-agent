@@ -131,7 +131,7 @@ const OBJECT_STORE_IO_ERROR_PREFIXES = [
 
 function isObjectStoreIoError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return OBJECT_STORE_IO_ERROR_PREFIXES.some((prefix) => message.includes(prefix));
+  return OBJECT_STORE_IO_ERROR_PREFIXES.some((prefix) => message.startsWith(prefix));
 }
 
 interface ChromosomeGroup {

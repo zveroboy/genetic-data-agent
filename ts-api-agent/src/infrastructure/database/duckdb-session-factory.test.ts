@@ -12,7 +12,7 @@
  * `tests/integration/remote_parquet_pruning.test.ts`.
  */
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { before, describe, it } from 'node:test';
 
 import { DuckDBInstance } from '@duckdb/node-api';
 
@@ -46,6 +46,18 @@ function factory(overrides: { queryDeadlineMs?: number } = {}) {
 }
 
 describe('duckdb session factory', () => {
+  before(async () => {
+    // Warms the local httpfs cache with the production configuration (autoinstall/autoload
+    // off) before any test runs. This is what makes the "leaves autoinstall/autoload on" test
+    // below safe to run on a cold image: by the time it flips both settings to `true` and runs
+    // its own `LOAD httpfs`, the extension is already resident locally (found here, or this
+    // hook itself already failed fast with `HttpfsExtensionUnavailableError`, no network
+    // reached). Without this, that one test would be the only place in the file where a missing
+    // extension resolves to an actual outbound fetch instead of a local failure.
+    const warmup = await factory().open();
+    await warmup.close();
+  });
+
   it('applies the contracted memory, thread and metadata-cache limits', async () => {
     const session = await factory().open();
     try {
@@ -105,6 +117,8 @@ describe('duckdb session factory', () => {
   });
 
   it('leaves autoinstall/autoload on when a caller explicitly allows extension install', async () => {
+    // Does not reach the network even though autoload is on here: the `before()` hook above
+    // already warmed the local httpfs cache, so this `LOAD httpfs` is satisfied locally.
     const session = await createDuckDbSessionFactory({
       s3: S3_CONFIG,
       allowExtensionInstall: true,
@@ -219,6 +233,13 @@ describe('duckdb session factory', () => {
     // (`range(0, 200000000000)`), using the real, unmodified interrupt/deadline machinery.
     const probeInstance = await DuckDBInstance.create(':memory:');
     const probeConnection = await probeInstance.connect();
+    // This patches DuckDBConnection.prototype.run process-globally, not just on
+    // `probeConnection` — every connection in the process is affected for as long as the patch
+    // is installed. That is only safe because node:test runs the subtests in this file
+    // sequentially by default and no `concurrency` option is set anywhere in this file or
+    // describe block: nothing else can be running a query concurrently while the patch and its
+    // `finally` restore are in effect. If concurrency is ever enabled here, this test would need
+    // to stop patching the shared prototype (e.g. wrap the specific connection instance instead).
     const prototype = Object.getPrototypeOf(probeConnection) as { run: (...args: any[]) => any };
     const originalRun = prototype.run;
     prototype.run = function (this: unknown, sql: string, ...rest: any[]) {
