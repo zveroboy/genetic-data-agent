@@ -14,6 +14,7 @@ use std::path::Path;
 
 use flate2::read::MultiGzDecoder;
 
+use crate::bgzf::{self, BgzfReader};
 use crate::models::UserVariant;
 
 /// Columns a VCF data line must have before it can carry a genotype: the eight fixed
@@ -55,16 +56,50 @@ pub enum VcfRecord {
     },
 }
 
-/// Opens a VCF for streaming, transparently decompressing gzip (including the multi-member
-/// BGZF layout that `bgzip` produces) when the first two bytes say so.
-pub fn open_vcf(path: &Path) -> io::Result<VcfRecordReader<Box<dyn BufRead>>> {
+/// Passed as `bgzf_workers` to keep decompression on the calling thread — the sequential decoder,
+/// whatever the file turns out to be.
+pub const SEQUENTIAL_DECOMPRESSION: usize = 1;
+
+/// Opens a VCF for streaming, decompressing it transparently.
+///
+/// Three paths, chosen from the file's own first bytes and never from its extension:
+///
+/// - **BGZF**, when the first member carries the `BC` block-size subfield and `bgzf_workers > 1`.
+///   Blocks are inflated on `bgzf_workers` threads and reassembled in file order; see
+///   [`crate::bgzf`]. This is what `bgzip` writes, so it is what a real GIAB or 1000 Genomes VCF
+///   is.
+/// - **Plain gzip**, for anything else with the gzip magic — including BGZF when the caller asked
+///   for sequential decompression. A single deflate stream cannot be split, so this is
+///   [`MultiGzDecoder`] on the calling thread, exactly as before.
+/// - **Uncompressed**, for everything else.
+///
+/// Which one was taken is logged, because "why is this file slow" should not require a debugger.
+pub fn open_vcf(path: &Path, bgzf_workers: usize) -> io::Result<VcfRecordReader<Box<dyn BufRead>>> {
     let mut buffered = BufReader::new(File::open(path)?);
     let head = buffered.fill_buf()?;
     let gzipped = head.len() >= GZIP_MAGIC.len() && head[..GZIP_MAGIC.len()] == GZIP_MAGIC;
+    let bgzf = gzipped && bgzf::is_bgzf(head);
 
-    let reader: Box<dyn BufRead> = if gzipped {
+    let reader: Box<dyn BufRead> = if bgzf && bgzf_workers > SEQUENTIAL_DECOMPRESSION {
+        tracing::info!(
+            source = %path.display(),
+            decompression = "bgzf-parallel",
+            workers = bgzf_workers,
+            "BGZF detected: decompressing blocks in parallel"
+        );
+        // A second handle rather than `buffered`, because the pipeline reads from byte zero and
+        // `buffered` has already consumed part of the first block into its buffer.
+        Box::new(BgzfReader::new(File::open(path)?, bgzf_workers)?)
+    } else if gzipped {
+        tracing::info!(
+            source = %path.display(),
+            decompression = "gzip-sequential",
+            reason = if bgzf { "sequential decompression requested" } else { "not BGZF: no BC block-size subfield" },
+            "decompressing on the reading thread"
+        );
         Box::new(BufReader::new(MultiGzDecoder::new(buffered)))
     } else {
+        tracing::info!(source = %path.display(), decompression = "none", "input is not compressed");
         Box::new(buffered)
     };
     Ok(VcfRecordReader::new(reader))

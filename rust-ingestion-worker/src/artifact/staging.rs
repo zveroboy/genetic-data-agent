@@ -45,7 +45,7 @@ pub(super) fn stage_variants(
     batch_size: usize,
     progress: &dyn ProgressSink,
 ) -> Result<StagingCounts, Stopped> {
-    let mut reader = open_vcf(&request.source_path)
+    let mut reader = open_vcf(&request.source_path, request.concurrency.bgzf_blocks)
         .map_err(|error| classify_source_error(&request.source_path, &error))?;
 
     report(progress, ProgressEvent::phase(IngestionPhase::Parsing))?;

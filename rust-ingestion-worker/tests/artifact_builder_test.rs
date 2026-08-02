@@ -17,6 +17,7 @@ use rust_ingestion_worker::artifact::{
     build_artifact, canonical_descriptor_block, dataset_checksum_sha256, ArtifactBuildRequest,
     ArtifactError, ArtifactStats, LocalParquetFile, PROCESSOR_VERSION, ROW_GROUP_SIZE,
 };
+use rust_ingestion_worker::bgzf::live_decompression_threads;
 use rust_ingestion_worker::concurrency::ConcurrencyLimits;
 use rust_ingestion_worker::contracts::{
     FailureType, PARQUET_SCHEMA_FINGERPRINT, SORT_ORDER, VARIANTS_SEGMENT,
@@ -24,6 +25,7 @@ use rust_ingestion_worker::contracts::{
 use rust_ingestion_worker::models::{NoopProgressSink, ProgressEvent, ProgressSink};
 use rust_ingestion_worker::vcf::{
     normalize_chromosome, open_vcf, RejectionReason, VcfRecord, VcfRecordReader,
+    SEQUENTIAL_DECOMPRESSION,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -72,7 +74,13 @@ fn data_line(chrom: &str, pos: u32, rsid: &str, reference: &str, alt: &str, gt: 
 }
 
 fn records(path: &Path) -> Vec<VcfRecord> {
-    open_vcf(path)
+    records_with(path, SEQUENTIAL_DECOMPRESSION)
+}
+
+/// [`records`] at a chosen BGZF worker count, for the tests that compare the block-parallel
+/// decompressor against the sequential decoder over the same bytes.
+fn records_with(path: &Path, bgzf_workers: usize) -> Vec<VcfRecord> {
+    open_vcf(path, bgzf_workers)
         .expect("open VCF")
         .map(|record| record.expect("record is readable"))
         .collect()
@@ -203,6 +211,66 @@ impl ProgressSink for InterruptingProgressSink {
             ControlFlow::Continue(())
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// A BGZF writer, built from the specification rather than from the reader
+// ---------------------------------------------------------------------------------------
+
+/// One BGZF member: a gzip member whose `EXTRA` area carries the `BC` subfield declaring the
+/// member's own total size minus one.
+///
+/// ```text
+/// 1f 8b | 08 | 04 | MTIME(4) | XFL | OS | XLEN=6 | 'B' 'C' | 02 00 | BSIZE(2) | deflate | CRC32 | ISIZE
+/// ```
+///
+/// Deliberately hand-assembled here rather than shared with `src/bgzf.rs`: the reader is then
+/// checked against an independently written encoder, not against its own constants.
+fn bgzf_member(payload: &[u8]) -> Vec<u8> {
+    let deflated = {
+        let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).expect("deflate");
+        encoder.finish().expect("finish deflate")
+    };
+    let total = 12 + 6 + deflated.len() + 8;
+    let bsize = u16::try_from(total - 1).expect("a test block fits in BSIZE");
+
+    let mut crc = flate2::Crc::new();
+    crc.update(payload);
+
+    let mut member = Vec::with_capacity(total);
+    member.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x04]); // magic, deflate, FEXTRA
+    member.extend_from_slice(&0u32.to_le_bytes()); // MTIME
+    member.extend_from_slice(&[0x00, 0xff]); // XFL, OS
+    member.extend_from_slice(&6u16.to_le_bytes()); // XLEN
+    member.extend_from_slice(b"BC");
+    member.extend_from_slice(&2u16.to_le_bytes()); // SLEN
+    member.extend_from_slice(&bsize.to_le_bytes());
+    member.extend_from_slice(&deflated);
+    member.extend_from_slice(&crc.sum().to_le_bytes());
+    member.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    member
+}
+
+/// `content` cut into `block_payload`-sized BGZF blocks, terminated by the empty end-of-file
+/// block `bgzip` always writes.
+fn bgzf_file(content: &[u8], block_payload: usize) -> Vec<u8> {
+    let mut file: Vec<u8> = content.chunks(block_payload).flat_map(bgzf_member).collect();
+    file.extend_from_slice(&bgzf_member(b""));
+    file
+}
+
+/// Serialises the tests that start a BGZF decompression pipeline.
+///
+/// [`live_decompression_threads`] is a process-wide count — useful as a metric, useless as a
+/// per-test assertion while another test's pipeline is running. The tests that assert on it take
+/// this lock, and so does every other test here that starts a pipeline.
+static ONE_BGZF_PIPELINE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+fn exclusive_bgzf() -> std::sync::MutexGuard<'static, ()> {
+    ONE_BGZF_PIPELINE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Reads one scalar out of DuckDB, independently of the code under test.
@@ -376,6 +444,76 @@ mod vcf {
         encoder.finish().expect("finish gz");
 
         assert_eq!(variants(&gzipped), variants(&demo_vcf_path()));
+    }
+
+    /// A `bgzip`-compressed VCF — which is what a real GIAB or 1000 Genomes file is — must parse
+    /// to exactly the same records whether its blocks were inflated on one thread or on many.
+    ///
+    /// The fixture is assembled from the BGZF layout in this test file rather than by calling
+    /// the reader's own helpers, so the two sides of the format are written independently.
+    #[test]
+    fn parses_a_bgzip_compressed_vcf_identically_at_every_worker_count() {
+        let _exclusive = exclusive_bgzf();
+        let directory = TempDir::new().expect("temp dir");
+
+        // Enough records that the body spans many 4 KiB blocks: a reassembly that lost or
+        // reordered a block could not pass.
+        let mut body = String::from(VCF_HEADER);
+        for index in 0..20_000u32 {
+            body.push_str(&data_line(
+                ["1", "2", "12", "X", "MT"][index as usize % 5],
+                10_000 + index * 7,
+                &format!("rs{index}"),
+                "A",
+                "C",
+                "0/1",
+            ));
+        }
+
+        let plain = directory.path().join("plain.vcf");
+        std::fs::write(&plain, &body).expect("write plain VCF");
+
+        let bgzipped = directory.path().join("bgzipped.vcf.gz");
+        std::fs::write(&bgzipped, bgzf_file(body.as_bytes(), 4_096)).expect("write BGZF VCF");
+
+        let expected = records(&plain);
+        assert!(expected.len() > 19_000, "the fixture must be substantial");
+
+        for workers in [SEQUENTIAL_DECOMPRESSION, 2, 4, 16] {
+            assert_eq!(
+                records_with(&bgzipped, workers),
+                expected,
+                "the BGZF VCF parsed differently at {workers} workers"
+            );
+        }
+    }
+
+    /// Plain gzip must keep working exactly as it did: it is a single deflate stream and cannot
+    /// be split, so asking for parallel decompression must fall back rather than fail or change
+    /// the records.
+    #[test]
+    fn plain_gzip_falls_back_to_the_sequential_decoder_unchanged() {
+        let _exclusive = exclusive_bgzf();
+        let directory = TempDir::new().expect("temp dir");
+        let gzipped = directory.path().join("plain_gzip.vcf.gz");
+        let plain = std::fs::read(demo_vcf_path()).expect("read demo VCF");
+        let mut encoder =
+            GzEncoder::new(File::create(&gzipped).expect("create gz"), Compression::default());
+        encoder.write_all(&plain).expect("compress");
+        encoder.finish().expect("finish gz");
+
+        let expected = records(&demo_vcf_path());
+        for workers in [SEQUENTIAL_DECOMPRESSION, 2, 16] {
+            assert_eq!(
+                records_with(&gzipped, workers),
+                expected,
+                "plain gzip changed at {workers} workers"
+            );
+        }
+        // And uncompressed input is untouched by the setting too.
+        for workers in [SEQUENTIAL_DECOMPRESSION, 16] {
+            assert_eq!(records_with(&demo_vcf_path(), workers), expected);
+        }
     }
 
     /// `bgzip` writes a *concatenation* of independent gzip members rather than one stream, so
@@ -573,7 +711,7 @@ mod vcf {
         let path = write_vcf(directory.path(), "bytes.vcf", &body);
         let expected = VCF_HEADER.len() + body.len();
 
-        let mut reader = open_vcf(&path).expect("open");
+        let mut reader = open_vcf(&path, SEQUENTIAL_DECOMPRESSION).expect("open");
         assert!(reader.next().is_some());
         assert!(reader.next().is_none());
         assert_eq!(reader.bytes_read(), expected as u64);
@@ -1216,6 +1354,108 @@ mod artifact_builder {
             assert_eq!(parallel.variant_count, sequential.variant_count);
             assert_eq!(parallel.rejected_record_count, sequential.rejected_record_count);
         }
+    }
+
+    /// Parallel BGZF decompression must not turn "one bounded batch in memory" into "as many
+    /// blocks as the pipeline can read ahead of the parser".
+    ///
+    /// The batch bound is asserted exactly as the plain-source acceptance test asserts it, over a
+    /// `bgzip`-compressed source with every stage at its default bound, and the decompression
+    /// threads must all be gone by the time the build returns.
+    #[test]
+    fn a_bgzip_source_keeps_the_batch_bound_and_leaves_no_threads_behind() {
+        let _exclusive = exclusive_bgzf();
+        const RECORDS: u32 = 60_000;
+        const BATCH: usize = 1_000;
+
+        let directory = TempDir::new().expect("temp dir");
+        let mut body = String::from(VCF_HEADER);
+        for index in 0..RECORDS {
+            body.push_str(&data_line(
+                ["1", "2", "12", "X", "MT"][index as usize % 5],
+                10_000 + index * 13,
+                ".",
+                "A",
+                "C",
+                "0/1",
+            ));
+        }
+        let source = directory.path().join("bounded.vcf.gz");
+        std::fs::write(&source, bgzf_file(body.as_bytes(), 4_096)).expect("write BGZF VCF");
+
+        let before = live_decompression_threads();
+        let sink = RecordingProgressSink::default();
+        let (stats, _) = build_with(
+            &directory,
+            &source,
+            &sink,
+            BATCH,
+            ConcurrencyLimits::default(),
+        )
+        .expect("build succeeds");
+
+        assert_eq!(stats.variant_count, u64::from(RECORDS));
+        let batches: Vec<usize> = sink
+            .events()
+            .iter()
+            .map(|event| event.batch_records)
+            .filter(|records| *records > 0)
+            .collect();
+        assert_eq!(
+            batches.iter().sum::<usize>(),
+            RECORDS as usize,
+            "every accepted record must be reported in exactly one batch"
+        );
+        assert!(
+            batches.iter().max().copied().unwrap_or(0) <= BATCH,
+            "a batch of {:?} records exceeds the {BATCH}-record bound",
+            batches.iter().max()
+        );
+        assert_eq!(
+            live_decompression_threads(),
+            before,
+            "the build returned with BGZF decompression threads still running"
+        );
+    }
+
+    /// Cancelling mid-parse must still stop promptly when the parse is being fed by a running
+    /// decompression pipeline, and must not leave that pipeline running.
+    #[test]
+    fn cancelling_a_bgzip_build_stops_it_and_joins_the_decompression_threads() {
+        let _exclusive = exclusive_bgzf();
+        let directory = TempDir::new().expect("temp dir");
+        let mut body = String::from(VCF_HEADER);
+        for index in 0..200_000u32 {
+            body.push_str(&data_line("1", 10_000 + index * 13, ".", "A", "C", "0/1"));
+        }
+        let source = directory.path().join("cancelled.vcf.gz");
+        std::fs::write(&source, bgzf_file(body.as_bytes(), 4_096)).expect("write BGZF VCF");
+
+        let before = live_decompression_threads();
+        // PARSING, then one WRITING_DUCKDB per batch: stopping at the third abandons the build
+        // while the decompression pipeline is certainly still filling its read-ahead.
+        let sink = InterruptingProgressSink::new(3);
+        let (stats, parquet_dir) = build_interruptibly_with(
+            &directory,
+            &source,
+            &sink,
+            1_000,
+            ConcurrencyLimits::default(),
+        )
+        .expect("an interrupted build is not a failure");
+
+        assert!(stats.is_none(), "an interrupted build produces no statistics");
+        assert_eq!(
+            sink.seen().len(),
+            3,
+            "the build must stop at the boundary that asked it to"
+        );
+        assert!(!parquet_dir.exists(), "an interrupted build must not have exported");
+        assert_eq!(
+            live_decompression_threads(),
+            before,
+            "a cancelled build left BGZF decompression threads running"
+        );
     }
 
     /// A sink that returns `ControlFlow::Break` must actually stop the build at that boundary —

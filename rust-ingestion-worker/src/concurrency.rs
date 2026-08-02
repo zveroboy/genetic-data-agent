@@ -43,6 +43,13 @@ pub struct ConcurrencyLimits {
     /// which is what the cap is protecting. Measurements in
     /// `.superpowers/sdd/parallelism-report.md`.
     pub export_partitions: usize,
+    /// BGZF blocks inflated at once, when the source is `bgzip` output.
+    ///
+    /// `1` means the sequential `MultiGzDecoder`, which is also what a plain-gzip or uncompressed
+    /// source always gets whatever this says. Above 1 the decompression moves off the parsing
+    /// thread entirely, which is where most of the win comes from — see
+    /// `.superpowers/sdd/parallelism-report.md`.
+    pub bgzf_blocks: usize,
 }
 
 impl ConcurrencyLimits {
@@ -51,7 +58,17 @@ impl ConcurrencyLimits {
     pub const SEQUENTIAL: Self = Self {
         validate_files: 1,
         export_partitions: 1,
+        bgzf_blocks: 1,
     };
+
+    /// Capped low on purpose. Measured on a 2 GB-uncompressed genome the staging stage went
+    /// 4.43 s at one worker to 3.38 s at *two*, and then did not move at four, eight or sixteen.
+    /// Most of that win is pipelining rather than parallelism: inflating 2 GB costs ~1.3 s and
+    /// the parse-and-append it feeds costs ~3.3 s, so one dedicated inflate thread already stays
+    /// ahead of the consumer. This leaves a little headroom above the measured knee for hardware
+    /// where inflation is slower relative to parsing, without provisioning threads that would
+    /// only ever block.
+    const MAX_BGZF_BLOCKS: usize = 4;
 
     /// Where concurrent `COPY` statements stopped paying when measured: they subdivide DuckDB's
     /// one internal thread pool rather than adding to it, so beyond this the stage does not get
@@ -66,6 +83,7 @@ impl ConcurrencyLimits {
         Self {
             validate_files: cores,
             export_partitions: cores.min(Self::MAX_EXPORT_PARTITIONS),
+            bgzf_blocks: cores.min(Self::MAX_BGZF_BLOCKS),
         }
     }
 }
