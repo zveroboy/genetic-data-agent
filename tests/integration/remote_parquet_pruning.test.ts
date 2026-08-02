@@ -494,11 +494,11 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
     const b = await repositories.get(second!.datasetId)!.synthesizeVariant('CYP1A2');
 
     assert.deepEqual(
-      a.variants.map((variant) => [variant.rsid, variant.user_genotype]),
+      a.variants.map((variant) => [variant.rsid, variant.userGenotype]),
       [['rs762551', 'A/C']],
     );
     assert.deepEqual(
-      b.variants.map((variant) => [variant.rsid, variant.user_genotype]),
+      b.variants.map((variant) => [variant.rsid, variant.userGenotype]),
       [['rs762551', 'C/C']],
     );
     assert.notEqual(
@@ -573,7 +573,7 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
     );
 
     assert.deepEqual(
-      result.variants.map((variant) => [variant.rsid, variant.gene, variant.user_genotype]),
+      result.variants.map((variant) => [variant.rsid, variant.gene, variant.userGenotype]),
       [['rs4149056', 'SLCO1B1', 'T/C']],
     );
     assert.deepEqual(result.provenance.filesScanned, [`s3://${ARTIFACT_BUCKET}/${chrom12.key}`]);
@@ -642,6 +642,25 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
       );
     }
 
+    // The per-request bound above only stops one large probe; it does nothing against several
+    // small ones. Two or three EOF-terminating GETs, each individually under
+    // FOOTER_PROBE_MAX_BYTES, are all excluded from `bytesFromRowGroup` by construction (Finding
+    // 1, fix pass 2) and would sail past the per-request check individually — while together
+    // reading deep into row group 2 (any one 64 KiB tail read already reaches back
+    // FOOTER_PROBE_MAX_BYTES bytes from EOF, well inside its 356,546-byte span) with every
+    // assertion above still green. httpfs locates the footer with exactly one speculative tail
+    // read per query — observed as exactly 1 across every real-MinIO run of this test to date
+    // (fix passes 1 and 2, and this pass) — so assert that invariant directly instead of only
+    // bounding each probe's individual size.
+    assert.equal(
+      eofTerminatingGets.length,
+      1,
+      `expected exactly one EOF-terminating GET (httpfs's single speculative footer probe), got ` +
+        `${eofTerminatingGets.length}: ${JSON.stringify(eofTerminatingGets)} — an unbounded count ` +
+        `of individually-small EOF-terminating GETs could otherwise smuggle a meaningful slice of ` +
+        `a row group past both the per-request size bound and the row-group exclusion`,
+    );
+
     assert.ok(bytesFromRowGroup(1) > 0, 'the matching row group must actually be read');
   });
 
@@ -654,7 +673,7 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
     const result = await repositories.get(spec.datasetId)!.synthesizeVariant('G6PD');
 
     assert.deepEqual(
-      result.variants.map((variant) => [variant.rsid, variant.gene, variant.user_genotype]),
+      result.variants.map((variant) => [variant.rsid, variant.gene, variant.userGenotype]),
       [['rs1050828', 'G6PD', 'C/T']],
     );
     assert.deepEqual(result.provenance.filesScanned, [`s3://${ARTIFACT_BUCKET}/${chromX.key}`]);
