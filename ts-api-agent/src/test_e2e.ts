@@ -66,6 +66,9 @@ async function runE2eTest() {
     console.log(`\n[E2E Test] Step 3: Querying AI Agent with question: "${question}"...`);
     const response = await askBioinformaticsAgent(question, {
       genotypeRepository,
+      // The same snapshot the repository resolves against: routing the question and reading the
+      // genotype have to agree about what is askable.
+      referenceVocabulary: await coordinateResolver.vocabulary(),
       dryRunLocal: true,
     });
 

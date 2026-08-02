@@ -28,6 +28,7 @@ import {
 } from '../../application/ingestion-contracts.ts';
 import {
   type ClinVarCoordinateResolver,
+  type ReferenceVocabularyEntry,
   TargetNotResolvableError,
   type VariantTarget,
 } from './clinvar-coordinate-resolver.ts';
@@ -222,6 +223,15 @@ class FakeCoordinateResolver implements ClinVarCoordinateResolver {
       throw new TargetNotResolvableError(targetId, this.referenceVersion);
     }
     return this.#targets;
+  }
+
+  async vocabulary(): Promise<readonly ReferenceVocabularyEntry[]> {
+    return this.#targets.map((target) => ({
+      gene: target.gene,
+      rsid: target.rsid,
+      phenotype: target.phenotype,
+      clinicalSignificance: target.clinicalSignificance,
+    }));
   }
 
   async close(): Promise<void> {}

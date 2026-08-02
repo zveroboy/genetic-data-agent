@@ -119,12 +119,22 @@ footer probe), bounded under 64 KiB. Total bytes read is also checked, more loos
 
 With no `CEREBRAS_API_KEY` set, `/ask` maps the question to a target gene, queries the genotype,
 and composes the answer from the reference annotation. That is a real code path, not a stub: it
-is what the demo below exercises. The mapping is five keyword families (caffeine, lactose,
-statins, warfarin, SSRIs); a question outside all five still gets a real, evidenced answer, but
-against the default target, `rs762551`/CYP1A2 — the answer names the rsID and gene it actually
-queried, so this is never presented as an answer to a question it wasn't. With a key set, Cerebras
-(`llama-3.3-70b`) drives the same `query_genotype` tool and writes the prose; the genotype and its
-provenance are produced the same way either way.
+is what the demo below exercises.
+
+The mapping is **derived from the reference snapshot**, not from a keyword list in the agent
+(`ts-api-agent/src/infrastructure/ai/question-routing.ts`). Four tiers, first match wins: an rsID
+in the question, a gene symbol in the question, a curated lay term declared next to the target it
+belongs to (`ReferenceTarget.layTerms` — "coffee", "dairy", "blood thinner": the words ClinVar's
+own prose will never contain), and finally the table's own condition vocabulary, where a term
+counts only if exactly one gene carries it. Adding a row to the reference table therefore makes
+that row askable with no code change.
+
+There is no default target. A question that matches nothing is told so and shown the genes the
+snapshot can answer about; a question that fits two genes equally names both and asks. Neither
+reads the genome at all.
+
+With a key set, Cerebras (`llama-3.3-70b`) drives the same `query_genotype` tool and writes the
+prose; the genotype and its provenance are produced the same way either way.
 
 Every answer carries provenance: dataset id, dataset content checksum, artifact/layout/schema
 versions, schema fingerprint, reference build and version, and **the exact object URIs scanned**.

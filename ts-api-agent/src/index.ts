@@ -41,7 +41,10 @@ import { readClosedJsonObject } from './http/closed-json-body.ts';
 import { provenanceEnvelope } from './http/provenance-envelope.ts';
 import { nodeListener } from './http/node-listener.ts';
 import type { AgentResponse } from './infrastructure/ai/agent.ts';
-import type { ClinVarCoordinateResolver } from './infrastructure/database/clinvar-coordinate-resolver.ts';
+import type {
+  ClinVarCoordinateResolver,
+  ReferenceVocabularyEntry,
+} from './infrastructure/database/clinvar-coordinate-resolver.ts';
 import type { DuckDbSessionFactory } from './infrastructure/database/duckdb-session-factory.ts';
 import { createGenotypeRepositoryFactory } from './infrastructure/database/duckdb.ts';
 import type { GenotypeRepository } from './infrastructure/database/duckdb.ts';
@@ -54,12 +57,21 @@ export interface DatasetCatalogPort {
 }
 
 /**
- * The agent, as the HTTP layer needs it: a question plus the one dataset it may read.
+ * The agent, as the HTTP layer needs it: a question, the one dataset it may read, and the
+ * askable surface of the reference snapshot that dataset was ingested against.
+ *
+ * The vocabulary is passed in rather than looked up by the agent for the same reason the
+ * repository is: the agent has no ambient access to anything. It decides which target a question
+ * means from the table it will then query, so the two can never disagree about what is askable.
+ *
  * `askBioinformaticsAgent` satisfies this signature.
  */
 export type BioinformaticsAgent = (
   question: string,
-  options: { genotypeRepository: GenotypeRepository },
+  options: {
+    genotypeRepository: GenotypeRepository;
+    referenceVocabulary: readonly ReferenceVocabularyEntry[];
+  },
 ) => Promise<AgentResponse>;
 
 export interface AppDependencies {
@@ -262,7 +274,12 @@ export function createApp(dependencies: AppDependencies): Hono {
     try {
       const dataset = await datasetResolver.resolve(datasetId);
       const genotypeRepository = await repositoryFactory.open(datasetId);
-      const response = await askAgent(question, { genotypeRepository });
+      // Read from the same open snapshot the repository resolves coordinates against — and
+      // cached there, so this is not a per-request DuckDB round trip. Fetched after the
+      // repository is opened, which is what has already proven the dataset and the snapshot
+      // describe the same reference version.
+      const referenceVocabulary = await coordinateResolver.vocabulary();
+      const response = await askAgent(question, { genotypeRepository, referenceVocabulary });
 
       return c.json({
         datasetId,

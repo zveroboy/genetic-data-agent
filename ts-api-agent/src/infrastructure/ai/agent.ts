@@ -1,6 +1,10 @@
-import { TargetNotResolvableError } from '../database/clinvar-coordinate-resolver.ts';
+import {
+  TargetNotResolvableError,
+  type ReferenceVocabularyEntry,
+} from '../database/clinvar-coordinate-resolver.ts';
 import type { GenotypeProvenance, GenotypeRepository } from '../database/duckdb.ts';
 import { TargetNotPresentError } from '../database/parquet-dataset-resolver.ts';
+import { answerableGenes, routeQuestion } from './question-routing.ts';
 import { createQueryGenotypeTool, searchMedicalLiteratureTool } from './tools.ts';
 
 export const SYSTEM_PROMPT = `You are an expert bioinformatics AI assistant.
@@ -28,7 +32,37 @@ export interface AskBioinformaticsAgentOptions {
    * data, and a repository is only obtainable for a dataset with a published manifest.
    */
   genotypeRepository: GenotypeRepository;
+  /**
+   * The askable surface of the opened reference snapshot, read from the snapshot itself.
+   *
+   * Required, not optional. The deterministic path has to decide which target a question means,
+   * and the only honest source for that is the table it will then query; defaulting to an empty
+   * vocabulary would make every question unanswerable, and defaulting to a built-in list is the
+   * hardcoded router this replaced.
+   */
+  referenceVocabulary: readonly ReferenceVocabularyEntry[];
   dryRunLocal?: boolean;
+}
+
+/**
+ * What to say when the question does not name a target, without naming one anyway.
+ *
+ * The old code defaulted to CYP1A2, so "what should I have for lunch?" came back as a confident
+ * statement about caffeine metabolism. It named the gene it had queried, so it was not a
+ * fabrication — but a user reads the genotype, not the gene symbol, and there is no reading of
+ * that exchange in which the system answered the question it was asked. Saying so, and listing
+ * what *can* be answered, costs one sentence.
+ */
+function couldNotRouteAnswer(
+  vocabulary: readonly ReferenceVocabularyEntry[],
+  detail: string,
+): string {
+  const genes = answerableGenes(vocabulary);
+  return (
+    `${detail} Nothing was read from your genome. ` +
+    `This reference snapshot can answer about ${genes.join(', ')} — name a gene or an rsID, or ` +
+    'ask about a drug or condition one of them covers.'
+  );
 }
 
 /**
@@ -113,31 +147,52 @@ export async function askBioinformaticsAgent(
   // published dataset never read. Falling back to the deterministic local path instead means an
   // unrelated ambient variable degrades to a fully evidenced answer, not a silent non-answer.
   if (options.dryRunLocal || !process.env.CEREBRAS_API_KEY) {
-    let targetId = 'rs762551';
-    const q = question.toLowerCase();
+    const vocabulary = options.referenceVocabulary;
+    // Derived from the reference snapshot, never from a keyword list kept in this file. The
+    // routing decision happens *before* anything is read: it selects one gene symbol or rsID,
+    // which then goes through the ordinary resolve path, so it can never widen a scan or reach
+    // a coordinate the reference does not place.
+    const routing = routeQuestion(question, vocabulary);
 
-    if (q.includes('coffee') || q.includes('caffeine')) {
-      targetId = 'CYP1A2';
-    } else if (q.includes('lactose') || q.includes('milk') || q.includes('dairy')) {
-      targetId = 'LCT';
-    } else if (q.includes('statin') || q.includes('cholesterol') || q.includes('muscle')) {
-      targetId = 'SLCO1B1';
-    } else if (q.includes('warfarin') || q.includes('blood thinner') || q.includes('vkorc1') || q.includes('cyp2c9')) {
-      targetId = 'VKORC1';
-    } else if (q.includes('ssri') || q.includes('antidepressant')) {
-      targetId = 'CYP2D6';
+    // The literature search is the question's own words, so it is worth running whether or not
+    // a gene was identified — it is the one thing an unroutable question can still be given.
+    const literatureHits = await searchLiterature(question, 'agent-internal');
+    const literatureSuffix =
+      literatureHits.length > 0
+        ? `\n\n📚 Medical Literature (PubMed RAG): "${literatureHits[0].title}" (PMID: ${literatureHits[0].pmid})`
+        : '';
+    const literatureTool = literatureHits.length > 0 ? ['search_medical_literature'] : [];
+
+    if (routing.kind !== 'resolved') {
+      const detail =
+        routing.kind === 'ambiguous'
+          ? `Your question could be about ${routing.candidates.join(' or ')} — ` +
+            `'${routing.matchedTerms.join("', '")}' fits more than one of them, so I did not guess.`
+          : 'I could not tell which gene your question is about.';
+      return {
+        answer: couldNotRouteAnswer(vocabulary, detail) + literatureSuffix,
+        evidence: [],
+        literatureHits,
+        toolsUsed: [...literatureTool],
+      };
     }
 
-    const { evidence, provenance, note } = await queryGenotype(genotypeTool, targetId);
-    const literatureHits = await searchLiterature(question, 'agent-internal');
+    const { evidence, provenance, note } = await queryGenotype(genotypeTool, routing.targetId);
 
-    let answer = note ?? 'No clinical variant data found.';
+    // "No rows came back" is not "you carry the reference allele", and the difference matters:
+    // NA12878 has no call at CYP2D6 rs3892097 because that region is outside GIAB's
+    // high-confidence set — the position was never assessed. Telling the two apart properly
+    // (absent from the callset vs. called with different alleles) is an open problem; saying
+    // which one this is *not* costs nothing and keeps the answer honest meanwhile.
+    let answer =
+      note ??
+      `No genotype for '${routing.targetId}' in this dataset: the reference places it, but the ` +
+        'dataset reports no matching call at those coordinates. That is not a statement that ' +
+        'you carry the reference allele — a position can be missing because it was never assessed.';
     if (evidence.length > 0) {
       const v = evidence[0];
       answer = `Based on your genotype (${v.userGenotype} for rsID ${v.rsid} in gene ${v.gene}), clinical significance is ${v.clinicalSignificance} (${v.phenotype}). Note: ${v.evidenceNote}`;
-      if (literatureHits.length > 0) {
-        answer += `\n\n📚 Medical Literature (PubMed RAG): "${literatureHits[0].title}" (PMID: ${literatureHits[0].pmid})`;
-      }
+      answer += literatureSuffix;
     }
 
     return {
@@ -145,7 +200,7 @@ export async function askBioinformaticsAgent(
       evidence,
       ...(provenance === undefined ? {} : { provenance }),
       literatureHits,
-      toolsUsed: ['query_genotype', ...(literatureHits.length > 0 ? ['search_medical_literature'] : [])],
+      toolsUsed: ['query_genotype', ...literatureTool],
     };
   }
 

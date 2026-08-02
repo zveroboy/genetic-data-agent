@@ -107,11 +107,32 @@ export class TargetResolutionLimitExceededError extends Error {
   }
 }
 
+/**
+ * One answerable thing the snapshot describes, without its coordinates.
+ *
+ * This is the *askable surface*: which handles resolve (`gene`, `rsid`) and what the reference
+ * itself says a variant is about (`phenotype`, `clinicalSignificance`). It exists so that
+ * deciding which target a natural-language question means can be derived from the table instead
+ * of from a hand-kept list that the table's growth silently invalidates.
+ *
+ * Deliberately coordinate-free: nothing that consumes it is allowed to turn a question into a
+ * scan. Picking a target here is always followed by a normal `resolve`, which is what enforces
+ * the `(referenceBuild, chrom, pos, ref, alt)` join.
+ */
+export interface ReferenceVocabularyEntry {
+  readonly gene: string;
+  readonly rsid: string | null;
+  readonly phenotype: string;
+  readonly clinicalSignificance: string;
+}
+
 export interface ClinVarCoordinateResolver {
   readonly referenceVersion: string;
   readonly referenceBuild: string;
   /** At least one coordinate, or a throw. Never an empty list. */
   resolve(targetId: string, referenceBuild: string): Promise<readonly VariantTarget[]>;
+  /** Every gene/rsID the snapshot can place, with the text the snapshot carries for it. */
+  vocabulary(): Promise<readonly ReferenceVocabularyEntry[]>;
   close(): Promise<void>;
 }
 
@@ -167,6 +188,10 @@ export async function openClinVarCoordinateResolver(
   }
 
   let closed = false;
+  // Read once and kept: the snapshot is opened READ_ONLY and its identity is fixed for the life
+  // of this resolver, so the askable surface cannot change under us. Caching it keeps question
+  // routing off the per-request DuckDB path entirely.
+  let cachedVocabulary: readonly ReferenceVocabularyEntry[] | null = null;
 
   return {
     referenceVersion: snapshot.referenceVersion,
@@ -263,6 +288,39 @@ export async function openClinVarCoordinateResolver(
           left.ref.localeCompare(right.ref, 'en') ||
           left.alt.localeCompare(right.alt, 'en'),
       );
+    },
+
+    async vocabulary(): Promise<readonly ReferenceVocabularyEntry[]> {
+      if (closed) {
+        throw new ReferenceSnapshotError(options.databasePath, 'has already been closed');
+      }
+      if (cachedVocabulary !== null) return cachedVocabulary;
+
+      // Scoped to this snapshot's own version/build, like `resolve` — a row belonging to some
+      // other labelled snapshot must not be advertised as answerable by this one. Ordered so the
+      // list a user is shown is stable across restarts.
+      const rows = (
+        await connection.runAndReadAll(
+          `
+            SELECT gene, rsid, phenotype, clinical_significance
+            FROM ${REFERENCE_COORDINATES_TABLE}
+            WHERE reference_version = $1
+              AND reference_build = $2
+            ORDER BY gene, rsid;
+          `,
+          [snapshot.referenceVersion, snapshot.referenceBuild],
+        )
+      ).getRowObjects();
+
+      cachedVocabulary = Object.freeze(
+        rows.map((row) => ({
+          gene: String(row.gene),
+          rsid: row.rsid === null ? null : String(row.rsid),
+          phenotype: String(row.phenotype),
+          clinicalSignificance: String(row.clinical_significance),
+        })),
+      );
+      return cachedVocabulary;
     },
 
     async close(): Promise<void> {

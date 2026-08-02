@@ -87,6 +87,42 @@ describe('clinvar coordinate resolver', () => {
     ]);
   });
 
+  it('publishes the askable surface of the snapshot, without coordinates', async () => {
+    // What question routing is derived from. It must be the snapshot's own content — one entry
+    // per row, carrying the text the table carries — because a router built from anything else
+    // is the hand-kept second copy that went stale in the first place.
+    const vocabulary = await resolver.vocabulary();
+    const tsvRows = fs.readFileSync(FIXTURE_TSV, 'utf8').trim().split('\n').slice(1);
+
+    assert.equal(vocabulary.length, tsvRows.length);
+    assert.deepEqual(
+      vocabulary.find((entry) => entry.rsid === 'rs4244285'),
+      {
+        gene: 'CYP2C19',
+        rsid: 'rs4244285',
+        phenotype: 'Clopidogrel response; MEPHENYTOIN, POOR METABOLISM OF; PROGUANIL, POOR METABOLISM OF',
+        clinicalSignificance: 'Likely benign / other',
+      },
+    );
+    // No chrom, pos, ref or alt: routing decides *which* target, never where it is. Placing it
+    // stays the job of `resolve`, which is what enforces the join against user Parquet.
+    for (const entry of vocabulary) {
+      assert.deepEqual(Object.keys(entry).sort(), [
+        'clinicalSignificance',
+        'gene',
+        'phenotype',
+        'rsid',
+      ]);
+    }
+  });
+
+  it('reads the vocabulary once and serves the same frozen list after', async () => {
+    const first = await resolver.vocabulary();
+    const second = await resolver.vocabulary();
+    assert.equal(first, second, 'the snapshot is read-only; re-reading it per question is waste');
+    assert.throws(() => (first as { length: number }).length--, TypeError);
+  });
+
   it('resolves an rsID to the same coordinates, keeping the rsID as provenance', async () => {
     const [byRsid] = await resolver.resolve('rs4149056', 'GRCh38');
     const [byGene] = await resolver.resolve('SLCO1B1', 'GRCh38');

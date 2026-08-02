@@ -58,6 +58,23 @@ export interface ReferenceTarget {
    * the lactose question resolves. Recording the divergence keeps the row honest.
    */
   readonly geneNote?: string;
+  /**
+   * Everyday words a patient uses for this gene that ClinVar's own prose will never contain.
+   *
+   * ClinVar names conditions and drugs — "LACTASE PERSISTENCE", "Warfarin response",
+   * "simvastatin acid response". Nobody asks "am I lactase persistent?"; they ask about milk,
+   * about blood thinners, about coffee. Those words exist nowhere in the source, so the only
+   * honest place for them is here, declared per target, next to the rsID they belong to — data,
+   * so that adding a target and its vocabulary is one edit in one file rather than a code change
+   * in the agent.
+   *
+   * Deliberately *small*. Everything ClinVar already says about a variant is matched from the
+   * derived table itself (`infrastructure/ai/question-routing.ts`); this layer only covers the
+   * lay-term gap, and each entry below is a term of art with a documented pharmacogenomic
+   * association, not a guess. A phrase matches when every one of its words appears in the
+   * question.
+   */
+  readonly layTerms?: readonly string[];
 }
 
 /**
@@ -69,26 +86,74 @@ export interface ReferenceTarget {
  * prevent.
  */
 export const REFERENCE_TARGETS: readonly ReferenceTarget[] = Object.freeze([
-  { rsid: 'rs762551', gene: 'CYP1A2' },
-  { rsid: 'rs4149056', gene: 'SLCO1B1' },
-  { rsid: 'rs9923231', gene: 'VKORC1' },
+  {
+    rsid: 'rs762551',
+    gene: 'CYP1A2',
+    // CYP1A2 is the principal caffeine 1-demethylase; rs762551 is the *1F allele used to
+    // classify fast vs. slow caffeine metabolism. ClinVar names no condition for it at all.
+    layTerms: ['coffee', 'caffeine', 'espresso', 'energy drink'],
+  },
+  {
+    rsid: 'rs4149056',
+    gene: 'SLCO1B1',
+    // ClinVar spells the drugs ("simvastatin acid response", "rosuvastatin response"); it never
+    // spells the class, and "statin myopathy" is how the question is actually asked.
+    layTerms: ['statin', 'cholesterol medication', 'muscle pain', 'myopathy'],
+  },
+  {
+    rsid: 'rs9923231',
+    gene: 'VKORC1',
+    // ClinVar does say "Warfarin response" here — but it says it for APOE too, so the plain
+    // term is not discriminating. VKORC1 -1639G>A is *the* warfarin dosing variant (CPIC), so
+    // the lay layer pins the ambiguity to the gene the question means.
+    layTerms: ['warfarin', 'blood thinner', 'anticoagulant', 'coumadin'],
+  },
   { rsid: 'rs3892097', gene: 'CYP2D6' },
-  { rsid: 'rs4244285', gene: 'CYP2C19' },
-  { rsid: 'rs1050828', gene: 'G6PD' },
+  {
+    rsid: 'rs4244285',
+    gene: 'CYP2C19',
+    // CYP2C19*2, the loss-of-function allele. CPIC gives CYP2C19 for citalopram, escitalopram
+    // and sertraline — the SSRIs — and ClinVar's CLNDN for this record lists only clopidogrel,
+    // mephenytoin and proguanil, so no amount of table matching would reach it from "SSRI".
+    layTerms: ['ssri', 'antidepressant', 'citalopram', 'escitalopram', 'sertraline'],
+  },
+  { rsid: 'rs1050828', gene: 'G6PD', layTerms: ['fava bean', 'primaquine'] },
   {
     rsid: 'rs4988235',
     gene: 'LCT',
     geneNote:
       'queried as LCT; ClinVar places it in the MCM6 intron that regulates LCT expression',
+    // ClinVar says "LACTASE PERSISTENCE" — the enzyme, not the sugar, and not the food.
+    layTerms: ['lactose', 'milk', 'dairy', 'lactase'],
   },
-  { rsid: 'rs1801133', gene: 'MTHFR' },
+  { rsid: 'rs1801133', gene: 'MTHFR', layTerms: ['folate', 'folic acid', 'homocysteine'] },
   { rsid: 'rs429358', gene: 'APOE' },
   { rsid: 'rs7412', gene: 'APOE' },
-  { rsid: 'rs6025', gene: 'F5' },
+  { rsid: 'rs6025', gene: 'F5', layTerms: ['factor v leiden', 'blood clot'] },
   { rsid: 'rs80357906', gene: 'BRCA1' },
   { rsid: 'rs80359550', gene: 'BRCA2' },
   { rsid: 'rs1042522', gene: 'TP53' },
 ]);
+
+/**
+ * The lay-term layer, collapsed to `gene → phrases`.
+ *
+ * Two targets can share a gene (APOE has two rsIDs), so the phrases are unioned per symbol: the
+ * lay layer answers "which gene is this question about", and the reference table then decides
+ * which coordinates that gene has.
+ */
+export function layTermsByGene(
+  targets: readonly ReferenceTarget[] = REFERENCE_TARGETS,
+): ReadonlyMap<string, readonly string[]> {
+  const byGene = new Map<string, string[]>();
+  for (const target of targets) {
+    if (target.layTerms === undefined || target.layTerms.length === 0) continue;
+    const bucket = byGene.get(target.gene);
+    if (bucket === undefined) byGene.set(target.gene, [...target.layTerms]);
+    else for (const term of target.layTerms) if (!bucket.includes(term)) bucket.push(term);
+  }
+  return byGene;
+}
 
 /** One parsed ClinVar VCF record, with the verbatim line kept for the committed extract. */
 export interface ClinVarRecord {
@@ -238,6 +303,15 @@ const UNINFORMATIVE_DISEASE_NAMES = new Set(['not_specified', 'not_provided', '.
 /** How many `CLNDN` terms a phenotype cell carries; BRCA1/BRCA2 list well over twenty. */
 const MAX_PHENOTYPE_TERMS = 4;
 
+/**
+ * What a phenotype cell says when ClinVar names no condition at all.
+ *
+ * Exported because it is a *label*, not vocabulary: anything matching a question against the
+ * table's condition text has to skip it, or "what does this variant mean?" matches the row that
+ * has nothing to say.
+ */
+export const NO_CONDITION_PHENOTYPE = 'No condition named in ClinVar for this variant';
+
 /** ClinVar spells spaces as `_` inside INFO values. */
 function humanize(value: string): string {
   return value.replaceAll('_', ' ').trim();
@@ -262,7 +336,7 @@ export function derivePhenotype(record: ClinVarRecord): string {
     terms.push(readable);
   }
   if (terms.length === 0) {
-    return 'No condition named in ClinVar for this variant';
+    return NO_CONDITION_PHENOTYPE;
   }
   const shown = terms.slice(0, MAX_PHENOTYPE_TERMS);
   const remaining = terms.length - shown.length;

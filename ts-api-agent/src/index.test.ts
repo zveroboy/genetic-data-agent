@@ -48,6 +48,7 @@ import { DATASET_KEYS } from './domain/datasets.ts';
 import {
   ReferenceBuildMismatchError,
   type ClinVarCoordinateResolver,
+  type ReferenceVocabularyEntry,
   TargetNotResolvableError,
   type VariantTarget,
 } from './infrastructure/database/clinvar-coordinate-resolver.ts';
@@ -220,9 +221,24 @@ function variantTarget(): VariantTarget {
 class FakeCoordinateResolver implements ClinVarCoordinateResolver {
   readonly referenceVersion = 'demo-clinvar-grch38-v2';
   readonly referenceBuild = 'GRCh38';
+  /** Every `vocabulary()` call, so a test can prove the route reads the snapshot's own surface. */
+  vocabularyReads = 0;
 
   async resolve(): Promise<readonly VariantTarget[]> {
     return [variantTarget()];
+  }
+
+  async vocabulary(): Promise<readonly ReferenceVocabularyEntry[]> {
+    this.vocabularyReads += 1;
+    const target = variantTarget();
+    return [
+      {
+        gene: target.gene,
+        rsid: target.rsid,
+        phenotype: target.phenotype,
+        clinicalSignificance: target.clinicalSignificance,
+      },
+    ];
   }
 
   async close(): Promise<void> {}
@@ -261,8 +277,11 @@ interface Harness {
   readonly ingestion: FakeIngestionClient;
   readonly sessions: FakeSessionFactory;
   readonly store: FakeObjectStore;
-  /** Every question the injected agent was asked, with the dataset it was scoped to. */
-  readonly asked: { question: string; datasetId: string }[];
+  /**
+   * Every question the injected agent was asked, with the dataset it was scoped to and the
+   * reference vocabulary it was handed — the surface it is allowed to route a question against.
+   */
+  readonly asked: { question: string; datasetId: string; vocabularyGenes: string[] }[];
 }
 
 /**
@@ -284,12 +303,16 @@ function harness(
   sessions.rows = options.rows ?? [PARQUET_ROW];
 
   const ingestion = new FakeIngestionClient();
-  const asked: { question: string; datasetId: string }[] = [];
+  const asked: { question: string; datasetId: string; vocabularyGenes: string[] }[] = [];
 
   const askAgent: BioinformaticsAgent =
     options.askAgent ??
-    (async (question, { genotypeRepository }): Promise<AgentResponse> => {
-      asked.push({ question, datasetId: genotypeRepository.datasetId });
+    (async (question, { genotypeRepository, referenceVocabulary }): Promise<AgentResponse> => {
+      asked.push({
+        question,
+        datasetId: genotypeRepository.datasetId,
+        vocabularyGenes: referenceVocabulary.map((entry) => entry.gene),
+      });
       const result = await genotypeRepository.synthesizeVariant('SLCO1B1');
       return {
         answer: `Answered '${question}' from ${result.variants.length} variant(s).`,
@@ -650,8 +673,15 @@ describe('POST /ask', () => {
     assert.equal(response.status, 200);
     const body = (await response.json()) as Record<string, any>;
 
+    // The agent is handed the question, the dataset it may read, and the reference snapshot's
+    // askable surface — the last of these is what lets it decide *which* target the question is
+    // about without a keyword list of its own.
     assert.deepEqual(asked, [
-      { question: 'Am I at risk of statin myopathy?', datasetId: DATASET_ID },
+      {
+        question: 'Am I at risk of statin myopathy?',
+        datasetId: DATASET_ID,
+        vocabularyGenes: ['SLCO1B1'],
+      },
     ]);
 
     assert.deepEqual(body.variants, [
