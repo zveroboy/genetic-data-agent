@@ -46,6 +46,7 @@ import {
 } from './parquet-dataset-resolver.ts';
 import {
   ReferenceSnapshotMismatchError,
+  RemoteDatasetUnavailableError,
   createGenotypeRepositoryFactory,
 } from './duckdb.ts';
 
@@ -403,6 +404,42 @@ describe('genotype repository', () => {
 
     await assert.rejects(() => repository.synthesizeVariant('SLCO1B1'), /engine exploded/);
     assert.equal(sessions.closeCount, 1, 'the session must be closed in a finally');
+  });
+
+  it('maps a mid-scan object-store IO fault onto RemoteDatasetUnavailable, not a raw DuckDB error', async () => {
+    const { factory, sessions } = harness();
+    sessions.failWith = new Error(
+      "IO Error: Connection error for HTTP HEAD to 'http://127.0.0.1:1/genomic-artifacts/...'",
+    );
+    const repository = await factory.open(DATASET_ID);
+
+    const error = await repository.synthesizeVariant('SLCO1B1').then(
+      () => null,
+      (thrown: unknown) => thrown as Error,
+    );
+
+    assert.ok(error instanceof RemoteDatasetUnavailableError, `unexpected error: ${error}`);
+    assert.equal(error.name, 'RemoteDatasetUnavailable');
+    assert.equal(error.datasetId, DATASET_ID);
+    assert.equal(error.cause, sessions.failWith);
+    assert.equal(sessions.closeCount, 1, 'the session must still be closed in a finally');
+  });
+
+  it('leaves a genuine SQL fault distinct from an object-store outage', async () => {
+    const { factory, sessions } = harness();
+    // DuckDB's own exception categories: a Binder/Parser/Catalog fault means the query itself
+    // is wrong, not that the object store failed. It must never be reported as the same error
+    // as a transport/IO fault.
+    sessions.failWith = new Error("Binder Error: column 'gt_raw' not found");
+    const repository = await factory.open(DATASET_ID);
+
+    const error = await repository.synthesizeVariant('SLCO1B1').then(
+      () => null,
+      (thrown: unknown) => thrown as Error,
+    );
+
+    assert.equal(error, sessions.failWith, 'a SQL fault must propagate unchanged, not be wrapped');
+    assert.ok(!(error instanceof RemoteDatasetUnavailableError));
   });
 
   it('exposes no global user-data repository', async () => {

@@ -19,8 +19,10 @@ import { fileURLToPath } from 'node:url';
 
 import { REFERENCE_BUILD, REFERENCE_VERSION } from '../../domain/datasets.ts';
 import {
+  MAX_TARGETS_PER_QUERY,
   ReferenceBuildMismatchError,
   TargetNotResolvableError,
+  TargetResolutionLimitExceededError,
   type ClinVarCoordinateResolver,
   normalizeChromosome,
   openClinVarCoordinateResolver,
@@ -179,6 +181,87 @@ describe('clinvar coordinate resolver', () => {
 
   it('rejects an empty target id without querying the snapshot', async () => {
     await assert.rejects(() => resolver.resolve('   ', 'GRCh38'), TargetNotResolvableError);
+  });
+});
+
+describe('target resolution limit', () => {
+  let workDir: string;
+  let resolver: ClinVarCoordinateResolver;
+
+  before(async () => {
+    workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clinvar-limit-'));
+
+    // A synthetic gene with one more declared coordinate than `MAX_TARGETS_PER_QUERY` allows,
+    // so the truncation-vs-signal behaviour can be pinned without depending on the demo
+    // snapshot ever containing a gene this large.
+    const header = [
+      'reference_version',
+      'reference_build',
+      'chrom',
+      'pos',
+      'rsid',
+      'ref',
+      'alt',
+      'gene',
+      'phenotype',
+      'clinical_significance',
+      'evidence_note',
+    ].join('\t');
+    const geneRows = (gene: string, count: number, chrom: string) =>
+      Array.from({ length: count }, (_unused, index) =>
+        [
+          REFERENCE_VERSION,
+          REFERENCE_BUILD,
+          chrom,
+          String(1_000_000 + index),
+          `rs${gene}${index}`,
+          'A',
+          'G',
+          gene,
+          'Synthetic phenotype',
+          'Uncertain Significance',
+          'Synthetic row for the target-resolution-limit test.',
+        ].join('\t'),
+      );
+    // One gene one row over the cap (must signal), one gene at exactly the cap (must not).
+    const rows = [
+      ...geneRows('MANYVAR', MAX_TARGETS_PER_QUERY + 1, 'chr1'),
+      ...geneRows('EXACTLIMIT', MAX_TARGETS_PER_QUERY, 'chr2'),
+    ];
+    const tsvPath = path.join(workDir, 'overflow_coordinates.tsv');
+    fs.writeFileSync(tsvPath, [header, ...rows].join('\n') + '\n');
+
+    const snapshot = await buildReferenceDatabase({
+      tsvPath,
+      databasePath: path.join(workDir, 'overflow.duckdb'),
+      referenceVersion: REFERENCE_VERSION,
+      referenceBuild: REFERENCE_BUILD,
+    });
+    assert.equal(snapshot.rowCount, 2 * MAX_TARGETS_PER_QUERY + 1);
+    resolver = await openClinVarCoordinateResolver({ databasePath: snapshot.path });
+  });
+
+  after(async () => {
+    await resolver?.close();
+    if (workDir) fs.rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it('signals overflow instead of silently truncating to the limit', async () => {
+    const error = await resolver.resolve('MANYVAR', 'GRCh38').then(
+      () => null,
+      (thrown: unknown) => thrown as Error,
+    );
+
+    assert.ok(error instanceof TargetResolutionLimitExceededError, `unexpected error: ${error}`);
+    assert.equal(error.name, 'TargetResolutionLimitExceeded');
+    assert.equal(error.targetId, 'MANYVAR');
+    assert.equal(error.limit, MAX_TARGETS_PER_QUERY);
+    assert.equal(error.referenceVersion, REFERENCE_VERSION);
+  });
+
+  it('still resolves a gene at exactly the limit, without signalling overflow', async () => {
+    const targets = await resolver.resolve('EXACTLIMIT', 'GRCh38');
+    assert.equal(targets.length, MAX_TARGETS_PER_QUERY, 'a gene at exactly the cap must answer in full');
   });
 });
 

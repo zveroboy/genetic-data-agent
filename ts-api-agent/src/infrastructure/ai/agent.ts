@@ -3,6 +3,7 @@ import { qdrantRepository } from '../vector/qdrant.ts';
 import { TargetNotResolvableError } from '../database/clinvar-coordinate-resolver.ts';
 import type { GenotypeProvenance, GenotypeRepository } from '../database/duckdb.ts';
 import { TargetNotPresentError } from '../database/parquet-dataset-resolver.ts';
+import { createQueryGenotypeTool } from './tools.ts';
 
 export const SYSTEM_PROMPT = `You are an expert bioinformatics AI assistant.
 Your primary directive is accuracy. You must NOT invent or hallucinate genetic variants.
@@ -39,13 +40,18 @@ export interface AskBioinformaticsAgentOptions {
  * Both are ordinary, expected results — a target the reference cannot place, and a target the
  * dataset provably does not contain — and both are named explicitly. Any other failure
  * propagates: an S3 outage or a corrupted manifest must not be reported as "no variant found".
+ *
+ * Routed through the same `createQueryGenotypeTool` factory `tools.test.ts` exercises, rather
+ * than calling `repository.synthesizeVariant` directly: the factory is Step 9's mandated way
+ * tools get their repository, and calling it here keeps the tested artifact and the running
+ * path the same code, instead of two implementations that can drift apart.
  */
 async function queryGenotype(
-  repository: GenotypeRepository,
+  tool: ReturnType<typeof createQueryGenotypeTool>,
   targetId: string,
 ): Promise<{ evidence: any[]; provenance?: GenotypeProvenance; note?: string }> {
   try {
-    const result = await repository.synthesizeVariant(targetId);
+    const result = await tool.execute!({ targetId }, { toolCallId: 'agent-internal', messages: [] });
     return { evidence: [...result.variants], provenance: result.provenance };
   } catch (err) {
     if (err instanceof TargetNotResolvableError) {
@@ -69,6 +75,11 @@ export async function askBioinformaticsAgent(
   options: AskBioinformaticsAgentOptions
 ): Promise<AgentResponse> {
   const repository = options.genotypeRepository;
+  // Built once per request, around the dataset-scoped repository the caller opened. Every path
+  // below reaches user genotypes only through this tool's `execute`, never through the
+  // repository directly.
+  const genotypeTool = createQueryGenotypeTool(repository);
+
   // 1. Dry run / local offline mode for instant E2E verification
   if (options.dryRunLocal || (!process.env.CEREBRAS_API_KEY && !process.env.ANTHROPIC_API_KEY)) {
     let targetId = 'rs762551';
@@ -86,7 +97,7 @@ export async function askBioinformaticsAgent(
       targetId = 'CYP2D6';
     }
 
-    const { evidence, provenance, note } = await queryGenotype(repository, targetId);
+    const { evidence, provenance, note } = await queryGenotype(genotypeTool, targetId);
     let literatureHits: any[] = [];
     try {
       const qVector = await generateOllamaEmbedding(question, 'nomic-embed-text');
@@ -211,7 +222,7 @@ export async function askBioinformaticsAgent(
         if (typeof args.targetId !== 'string' || args.targetId.length === 0) {
           throw new Error("the model called 'query_genotype' without a targetId");
         }
-        const queried = await queryGenotype(repository, args.targetId);
+        const queried = await queryGenotype(genotypeTool, args.targetId);
         toolOutput = queried.evidence;
         provenance = queried.provenance;
       }

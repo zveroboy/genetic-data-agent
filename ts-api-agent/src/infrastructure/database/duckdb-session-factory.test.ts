@@ -20,10 +20,11 @@ import {
   DEFAULT_QUERY_DEADLINE_MS,
   DuckDbSessionClosedError,
   type DuckDbS3SessionConfig,
-  QueryDeadlineExceededError,
+  QueryBudgetExceededError,
   SESSION_MEMORY_LIMIT,
   SESSION_SECRET_NAME,
   SESSION_THREADS,
+  SessionConfigurationTimedOutError,
   configureSession,
   createDuckDbSessionFactory,
   duckDbS3SessionConfigFromEnv,
@@ -78,6 +79,44 @@ describe('duckdb session factory', () => {
         [],
         'a serving session must never open or create a per-dataset .duckdb file',
       );
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('disables DuckDB\'s own extension autoinstall/autoload in the production configuration', async () => {
+    // `allowExtensionInstall` is not set, i.e. the production default. DuckDB's
+    // `autoinstall_known_extensions`/`autoload_known_extensions` both default to `true`, which
+    // would let `LOAD httpfs` (or a later `read_parquet('s3://…')`) reach out to
+    // extensions.duckdb.org on a cold image regardless of this module's own `INSTALL` gate.
+    // This is the assertion that would have failed before both settings were forced off.
+    const session = await factory().open();
+    try {
+      const [settings] = await session.query(`
+        SELECT current_setting('autoinstall_known_extensions') AS autoinstall,
+               current_setting('autoload_known_extensions') AS autoload;
+      `);
+
+      assert.equal(settings?.autoinstall, false);
+      assert.equal(settings?.autoload, false);
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('leaves autoinstall/autoload on when a caller explicitly allows extension install', async () => {
+    const session = await createDuckDbSessionFactory({
+      s3: S3_CONFIG,
+      allowExtensionInstall: true,
+    }).open();
+    try {
+      const [settings] = await session.query(`
+        SELECT current_setting('autoinstall_known_extensions') AS autoinstall,
+               current_setting('autoload_known_extensions') AS autoload;
+      `);
+
+      assert.equal(settings?.autoinstall, true);
+      assert.equal(settings?.autoload, true);
     } finally {
       await session.close();
     }
@@ -160,8 +199,8 @@ describe('duckdb session factory', () => {
           (thrown: unknown) => thrown as Error,
         );
 
-      assert.ok(error instanceof QueryDeadlineExceededError, `unexpected error: ${error}`);
-      assert.equal(error.name, 'QueryDeadlineExceeded');
+      assert.ok(error instanceof QueryBudgetExceededError, `unexpected error: ${error}`);
+      assert.equal(error.name, 'QueryBudgetExceeded');
       assert.equal(error.deadlineMs, 250);
       assert.ok(
         Date.now() - started < 10_000,
@@ -169,6 +208,41 @@ describe('duckdb session factory', () => {
       );
     } finally {
       await session.close();
+    }
+  });
+
+  it('bounds session configuration by the same interrupt-based deadline as queries', async () => {
+    // Nothing in `configureSession` (LOAD, SET, CREATE SECRET) naturally hangs under test —
+    // the extension is already installed and CREATE SECRET touches no network. To prove the
+    // deadline really reaches configuration and not just the post-`open()` query path, the
+    // CREATE SECRET statement is substituted for a query already proven interruptible above
+    // (`range(0, 200000000000)`), using the real, unmodified interrupt/deadline machinery.
+    const probeInstance = await DuckDBInstance.create(':memory:');
+    const probeConnection = await probeInstance.connect();
+    const prototype = Object.getPrototypeOf(probeConnection) as { run: (...args: any[]) => any };
+    const originalRun = prototype.run;
+    prototype.run = function (this: unknown, sql: string, ...rest: any[]) {
+      if (sql.includes('CREATE SECRET')) {
+        return originalRun.call(this, 'SELECT count(*) AS n FROM range(0, 200000000000) t(i) WHERE i % 7 = 3;');
+      }
+      return originalRun.call(this, sql, ...rest);
+    };
+
+    try {
+      const error = await createDuckDbSessionFactory({ s3: S3_CONFIG, queryDeadlineMs: 250 })
+        .open()
+        .then(
+          () => null,
+          (thrown: unknown) => thrown as Error,
+        );
+
+      assert.ok(error instanceof SessionConfigurationTimedOutError, `unexpected error: ${error}`);
+      assert.equal(error.name, 'SessionConfigurationTimedOut');
+      assert.equal((error as SessionConfigurationTimedOutError).deadlineMs, 250);
+    } finally {
+      prototype.run = originalRun;
+      probeConnection.disconnectSync();
+      probeInstance.closeSync();
     }
   });
 

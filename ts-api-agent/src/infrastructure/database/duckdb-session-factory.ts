@@ -13,13 +13,20 @@
  *   query cannot take the API process down with it.
  * - **A real deadline.** A query that outlives its deadline is *interrupted* through the
  *   binding's cancellation API, not merely abandoned by a promise race. An abandoned query
- *   keeps burning CPU and S3 bandwidth for as long as it feels like.
+ *   keeps burning CPU and S3 bandwidth for as long as it feels like. Configuring the session
+ *   itself (loading `httpfs`, attaching credentials) is bounded by the same deadline, for the
+ *   same reason.
  * - **Credentials that do not outlive the request.** The S3 secret is dropped and the
  *   connection closed in a `finally`, on every path.
  *
  * The extension is expected to be present already: `LOAD httpfs` is attempted first and
  * `INSTALL` is only reached when a caller explicitly opts in, so a runtime image with a
- * preinstalled extension never needs Internet access on the first `/ask`.
+ * preinstalled extension never needs Internet access on the first `/ask`. That guarantee would
+ * be hollow on its own: DuckDB's `autoinstall_known_extensions` and `autoload_known_extensions`
+ * both default to `true`, so a bare `LOAD` — or even `read_parquet('s3://…')` — reaches out to
+ * `extensions.duckdb.org` on a cold image regardless of `allowExtensionInstall`. Both settings
+ * are forced off before `LOAD` unless the caller opts in, so the "never needs Internet access"
+ * claim is actually enforced rather than merely aspirational.
  */
 import { DuckDBInstance } from '@duckdb/node-api';
 import type { DuckDBConnection } from '@duckdb/node-api';
@@ -68,13 +75,31 @@ export interface DuckDbSessionFactory {
   open(): Promise<DuckDbSession>;
 }
 
-/** Raised when a query is cancelled for exceeding the session's deadline. */
-export class QueryDeadlineExceededError extends Error {
+/**
+ * Raised when a query is cancelled for exceeding the session's deadline.
+ *
+ * Named to agree with Task 8's API contract, which names this failure `QueryBudgetExceeded`.
+ */
+export class QueryBudgetExceededError extends Error {
   readonly deadlineMs: number;
 
   constructor(deadlineMs: number) {
     super(`query exceeded its ${deadlineMs} ms deadline and was interrupted`);
-    this.name = 'QueryDeadlineExceeded';
+    this.name = 'QueryBudgetExceeded';
+    this.deadlineMs = deadlineMs;
+  }
+}
+
+/** Raised when configuring a session (loading `httpfs`, applying limits, attaching S3
+ * credentials) does not finish inside the session's deadline. Configuration runs before any
+ * query does, so without its own bound a hanging extension autoload could stall `open()`
+ * indefinitely with no cancellation. */
+export class SessionConfigurationTimedOutError extends Error {
+  readonly deadlineMs: number;
+
+  constructor(deadlineMs: number) {
+    super(`session configuration exceeded its ${deadlineMs} ms deadline and was interrupted`);
+    this.name = 'SessionConfigurationTimedOut';
     this.deadlineMs = deadlineMs;
   }
 }
@@ -149,6 +174,17 @@ async function loadHttpfs(
   connection: DuckDBConnection,
   allowExtensionInstall: boolean,
 ): Promise<void> {
+  // DuckDB's own extension autoinstall/autoload default to `true` regardless of anything this
+  // module does with `INSTALL`/`LOAD` explicitly. Left alone, `LOAD httpfs` below — and even a
+  // bare `read_parquet('s3://…')` later in the session — would silently fetch from
+  // `extensions.duckdb.org` on a machine without the extension already present. That is the
+  // network dependency this module's documentation claims does not exist, so both settings are
+  // forced off unless the caller has explicitly opted into extension installation.
+  await connection.run(`
+    SET autoinstall_known_extensions = ${allowExtensionInstall ? 'true' : 'false'};
+    SET autoload_known_extensions = ${allowExtensionInstall ? 'true' : 'false'};
+  `);
+
   try {
     await connection.run('LOAD httpfs;');
     return;
@@ -161,6 +197,33 @@ async function loadHttpfs(
     await connection.run('INSTALL httpfs; LOAD httpfs;');
   } catch (error) {
     throw new HttpfsExtensionUnavailableError((error as Error).message);
+  }
+}
+
+/**
+ * Runs `work` under the same interrupt-based deadline the query path uses: a timer arms
+ * `connection.interrupt()`, and a failure that lands after it fired is reported through
+ * `onDeadlineExceeded` rather than as whatever internal error the interrupt happened to produce.
+ */
+async function runWithDeadline<T>(
+  connection: DuckDBConnection,
+  deadlineMs: number,
+  work: () => Promise<T>,
+  onDeadlineExceeded: () => Error,
+): Promise<T> {
+  let interrupted = false;
+  const timer = setTimeout(() => {
+    interrupted = true;
+    connection.interrupt();
+  }, deadlineMs);
+
+  try {
+    return await work();
+  } catch (error) {
+    if (interrupted) throw onDeadlineExceeded();
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -235,7 +298,15 @@ export function createDuckDbSessionFactory(config: DuckDbSessionConfig): DuckDbS
       }
 
       try {
-        await configureSession(connection, config);
+        // Configuration itself is bounded by the session deadline: it runs before any query
+        // does, so without its own bound a hanging extension autoload would stall `open()`
+        // indefinitely with no way to cancel it.
+        await runWithDeadline(
+          connection,
+          deadlineMs,
+          () => configureSession(connection, config),
+          () => new SessionConfigurationTimedOutError(deadlineMs),
+        );
       } catch (error) {
         // Configuration failed mid-way; the secret may or may not exist. Drop it regardless
         // before tearing the session down, then surface the original failure.
@@ -251,27 +322,21 @@ export function createDuckDbSessionFactory(config: DuckDbSessionConfig): DuckDbS
         async query(sql: string, values: readonly DuckDbParam[] = []) {
           if (closed) throw new DuckDbSessionClosedError();
 
-          let interrupted = false;
-          const timer = setTimeout(() => {
-            interrupted = true;
-            connection.interrupt();
-          }, deadlineMs);
-
-          try {
-            const reader = await connection.runAndReadAll(sql, [...values]);
-            return reader.getRowObjectsJS().map((row) => {
-              const converted: Record<string, unknown> = {};
-              for (const [column, value] of Object.entries(row)) {
-                converted[column] = toJsonCompatible(value);
-              }
-              return converted;
-            });
-          } catch (error) {
-            if (interrupted) throw new QueryDeadlineExceededError(deadlineMs);
-            throw error;
-          } finally {
-            clearTimeout(timer);
-          }
+          return runWithDeadline(
+            connection,
+            deadlineMs,
+            async () => {
+              const reader = await connection.runAndReadAll(sql, [...values]);
+              return reader.getRowObjectsJS().map((row) => {
+                const converted: Record<string, unknown> = {};
+                for (const [column, value] of Object.entries(row)) {
+                  converted[column] = toJsonCompatible(value);
+                }
+                return converted;
+              });
+            },
+            () => new QueryBudgetExceededError(deadlineMs),
+          );
         },
 
         async close() {

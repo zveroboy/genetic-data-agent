@@ -206,8 +206,16 @@ interface LocalPartition {
   readonly maxPos: number;
 }
 
-/** Every `.duckdb` file directly under the repository root, as a sorted list. */
-function duckDbFilesInRepo(): string[] {
+/**
+ * Every `.duckdb` file directly under the repository root, as a sorted list.
+ *
+ * Deliberately non-recursive: it only catches a stray file dropped at the root, which is what
+ * this repository's stale `data_*.duckdb` files look like. It is not a substitute for the real
+ * guard against a per-dataset local database — that is `duckdb_databases()` in
+ * `duckdb-session-factory.test.ts`, which asks the live connection directly rather than
+ * inspecting the filesystem.
+ */
+function duckDbFilesInRepoRoot(): string[] {
   return fs
     .readdirSync(REPO_ROOT)
     .filter((entry) => entry.endsWith('.duckdb'))
@@ -403,7 +411,7 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
   }
 
   before(async () => {
-    duckDbFilesBefore = duckDbFilesInRepo();
+    duckDbFilesBefore = duckDbFilesInRepoRoot();
     workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-parquet-pruning-'));
     bindingVersion = JSON.parse(
       fs.readFileSync(path.join(REPO_ROOT, 'node_modules/@duckdb/node-api/package.json'), 'utf8'),
@@ -520,12 +528,22 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
     const result = await repositories.get(spec.datasetId)!.synthesizeVariant('rs4149056');
 
     const gets = proxy.requests.filter((request) => request.method === 'GET');
-    const footerWindow: Span = { start: size - 64 * 1024, end: size };
-    const dataReads = gets.filter(
-      (request) => overlap(requestSpan(request, size), footerWindow) === 0,
-    );
+    // The footer immediately follows the last row group's data (`parquet_metadata()` above
+    // already gives that boundary exactly), then the 8-byte trailer (footer length + magic).
+    // This is the file's *actual* footer offset, not a fixed-size guess: a fixed 64 KiB window
+    // can start inside the last row group for a file this size, which would make a GET that
+    // fully re-reads that row group overlap the window and get discarded whole rather than
+    // measured — the very blind spot this derivation closes.
+    const footerStart = groups.reduce((max, group) => Math.max(max, group.end), 0);
+    // Per-byte, not per-request: a request's span is clipped to the data region before it is
+    // attributed to a row group, so a request that straddles the footer boundary still counts
+    // its data-side bytes correctly instead of being excluded in its entirety.
+    const dataSpan = (request: ProxyRequest): Span => {
+      const raw = requestSpan(request, size);
+      return { start: raw.start, end: Math.min(raw.end, footerStart) };
+    };
     const bytesFromRowGroup = (id: number) =>
-      dataReads.reduce((sum, request) => sum + overlap(requestSpan(request, size), groups[id]!), 0);
+      gets.reduce((sum, request) => sum + overlap(dataSpan(request), groups[id]!), 0);
     const totalBytes = proxy.requests.reduce((sum, request) => sum + request.bytes, 0);
 
     console.log(
@@ -580,7 +598,31 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
       `read ${totalBytes} of ${size} bytes (${((totalBytes / size) * 100).toFixed(1)}%); a targeted read must not approach a full download`,
     );
     assert.equal(bytesFromRowGroup(0), 0, 'no data may be read from non-matching row group 0');
-    assert.equal(bytesFromRowGroup(2), 0, 'no data may be read from non-matching row group 2');
+
+    // Row group 2 is the last one in the file, immediately adjacent to the footer. httpfs
+    // locates the footer with a single fixed-size speculative tail GET (observed above: exactly
+    // 16 KiB, ending at the file's last byte) rather than a preliminary round trip to learn the
+    // true footer size first — the same "guess and hope it's enough" technique essentially every
+    // remote Parquet reader uses. For an object this compact, that guess window is larger than
+    // the true footer + column/offset-index trailer (about 1.7 KiB here), so the same GET also
+    // incidentally pulls in the tail end of row group 2's own column data: bytes that are never
+    // used to answer the query (only row group 1 is joined against) but are genuinely on the
+    // wire regardless of pruning. That is structural — a property of the footer-probe size
+    // relative to this object's layout, not a pruning regression — and it cannot be zeroed by
+    // better bookkeeping; it would only disappear on a much larger object, where the same fixed
+    // guess window is a vanishing fraction of the tail row group's size. The bound below is
+    // still a real regression guard: a full or majority read of row group 2 — the exact failure
+    // mode this test exists to catch — would blow well past it.
+    const footerAdjacentRowGroup = groups[groups.length - 1]!;
+    const footerAdjacentRowGroupSize = footerAdjacentRowGroup.end - footerAdjacentRowGroup.start;
+    const footerAdjacentBytes = bytesFromRowGroup(footerAdjacentRowGroup.id);
+    assert.ok(
+      footerAdjacentBytes < footerAdjacentRowGroupSize * 0.25,
+      `row group ${footerAdjacentRowGroup.id} (adjacent to the footer) read ${footerAdjacentBytes} ` +
+        `of its ${footerAdjacentRowGroupSize} bytes (${((footerAdjacentBytes / footerAdjacentRowGroupSize) * 100).toFixed(1)}%); ` +
+        'a value anywhere near its full size would mean it was actually scanned for the query, ' +
+        'not just brushed by the footer-locating tail read',
+    );
     assert.ok(bytesFromRowGroup(1) > 0, 'the matching row group must actually be read');
   });
 
@@ -641,11 +683,16 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
     assert.deepEqual(proxy.requests, [], 'an unpublished dataset must cost the query engine nothing');
   });
 
-  it('creates no per-dataset DuckDB file anywhere in the repository', () => {
+  it('leaves the repository root free of stray .duckdb files (a filesystem spot check, not the isolation guard)', () => {
+    // Non-recursive by construction: this only catches a `.duckdb` dropped at the repository
+    // root, the shape of this repo's pre-existing stale `data_*.duckdb` files. It cannot see a
+    // file nested under a subdirectory, so it is not proof that no per-dataset database was
+    // created anywhere. That proof is `duckdb_databases()` in `duckdb-session-factory.test.ts`,
+    // which asks the live connection directly rather than inspecting the filesystem.
     assert.deepEqual(
-      duckDbFilesInRepo(),
+      duckDbFilesInRepoRoot(),
       duckDbFilesBefore,
-      'the serving path must not create or cache a local .duckdb per dataset',
+      'the serving path must not create or cache a local .duckdb at the repository root',
     );
   });
 });

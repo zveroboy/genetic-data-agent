@@ -97,6 +97,43 @@ export class ReferenceSnapshotMismatchError extends Error {
   }
 }
 
+/**
+ * Raised when the remote object store fails mid-scan — a transport/IO fault, not a SQL fault.
+ * Named to agree with Task 8's API contract, which names this failure `RemoteDatasetUnavailable`.
+ *
+ * Without this, an S3 outage during `read_parquet` propagates from `session.query` as a raw
+ * DuckDB IO error, indistinguishable from a SQL fault (a malformed query, a schema mismatch). A
+ * caller that wants to retry an outage but not a bug needs the two told apart.
+ */
+export class RemoteDatasetUnavailableError extends Error {
+  readonly datasetId: string;
+
+  constructor(datasetId: string, detail: string, options?: { cause?: unknown }) {
+    super(`dataset '${datasetId}' could not be read from the object store: ${detail}`, options);
+    this.name = 'RemoteDatasetUnavailable';
+    this.datasetId = datasetId;
+  }
+}
+
+/**
+ * DuckDB's own error messages are prefixed with the exception category (`IO Error: …`,
+ * `HTTP Error: …`, `Binder Error: …`, …). The transport/IO categories are the ones a genuine
+ * object-store outage produces; everything else — a binder, parser, catalog or constraint fault
+ * — is a real SQL fault and must stay distinct, not get folded into "the store is unavailable".
+ */
+const OBJECT_STORE_IO_ERROR_PREFIXES = [
+  'IO Error:',
+  'HTTP Error:',
+  'Connection Error:',
+  'Network Error:',
+  'TLS Error:',
+];
+
+function isObjectStoreIoError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return OBJECT_STORE_IO_ERROR_PREFIXES.some((prefix) => message.includes(prefix));
+}
+
 interface ChromosomeGroup {
   readonly chrom: string;
   readonly objects: readonly ParquetObject[];
@@ -159,6 +196,16 @@ function buildGroupQuery(group: ChromosomeGroup): { sql: string; values: DuckDbP
     .join('\n      UNION ALL ');
 
   const positions = group.targets.map((target) => target.pos);
+  if (positions.length === 0) {
+    // Every group is derived from `selectCandidateObjects`, which only ever includes an object
+    // because *some* target's chrom matched it — so a group can never be built for a chrom with
+    // no targets. Made explicit rather than left implicit: `Math.min(...[])`/`Math.max(...[])`
+    // would silently produce `Infinity`/`-Infinity` bounds instead of failing loudly.
+    throw new Error(
+      `internal invariant violated: chromosome group '${group.chrom}' has candidate objects ` +
+        'but no targets to bound a scan with',
+    );
+  }
   const fileList = group.objects
     .map((object) => `'${parquetObjectUri(object)}'`)
     .join(',\n        ');
@@ -265,7 +312,22 @@ export function createGenotypeRepositoryFactory(
           try {
             for (const group of groupByChromosome(candidates, targets)) {
               const { sql, values } = buildGroupQuery(group);
-              rows.push(...(await session.query(sql, values)));
+              try {
+                rows.push(...(await session.query(sql, values)));
+              } catch (error) {
+                // A transport/IO fault reading the object store mid-scan is a distinct outcome
+                // from a SQL fault: the query was fine, the store was not. Everything that is
+                // not recognizably an IO fault propagates unchanged, so a real bug in the
+                // generated SQL is never misreported as "the dataset is unavailable".
+                if (isObjectStoreIoError(error)) {
+                  throw new RemoteDatasetUnavailableError(
+                    dataset.datasetId,
+                    (error as Error).message,
+                    { cause: error },
+                  );
+                }
+                throw error;
+              }
             }
           } finally {
             await session.close();

@@ -83,6 +83,30 @@ export class TargetNotResolvableError extends Error {
   }
 }
 
+/**
+ * Raised when a target resolves to more coordinates than `MAX_TARGETS_PER_QUERY` allows.
+ *
+ * The limit exists so one gene cannot expand into an unbounded scan; silently truncating to the
+ * limit would instead yield a quietly partial answer for a reference gene with more declared
+ * variants than the cap. This is signalled instead.
+ */
+export class TargetResolutionLimitExceededError extends Error {
+  readonly targetId: string;
+  readonly referenceVersion: string;
+  readonly limit: number;
+
+  constructor(targetId: string, referenceVersion: string, limit: number) {
+    super(
+      `'${targetId}' resolves to more than ${limit} coordinates in reference snapshot ` +
+        `'${referenceVersion}'; refusing to answer with a silently truncated subset`,
+    );
+    this.name = 'TargetResolutionLimitExceeded';
+    this.targetId = targetId;
+    this.referenceVersion = referenceVersion;
+    this.limit = limit;
+  }
+}
+
 export interface ClinVarCoordinateResolver {
   readonly referenceVersion: string;
   readonly referenceBuild: string;
@@ -163,6 +187,10 @@ export async function openClinVarCoordinateResolver(
 
       // Gene symbol *or* rsID, both case-insensitively, both as bound parameters — the target
       // id is the one value on this path that came from outside.
+      //
+      // Fetches one row past the limit so overflow can be detected: capping the SQL `LIMIT` at
+      // exactly `MAX_TARGETS_PER_QUERY` would make "there were 64" and "there were 6,400"
+      // indistinguishable, and the latter would be answered as if it were the former.
       const rows = (
         await connection.runAndReadAll(
           `
@@ -172,11 +200,19 @@ export async function openClinVarCoordinateResolver(
               AND reference_build = $2
               AND (upper(gene) = upper($3) OR lower(rsid) = lower($3))
             ORDER BY chrom, pos, ref, alt
-            LIMIT ${MAX_TARGETS_PER_QUERY};
+            LIMIT ${MAX_TARGETS_PER_QUERY + 1};
           `,
           [snapshot.referenceVersion, snapshot.referenceBuild, trimmed],
         )
       ).getRowObjects();
+
+      if (rows.length > MAX_TARGETS_PER_QUERY) {
+        throw new TargetResolutionLimitExceededError(
+          targetId,
+          snapshot.referenceVersion,
+          MAX_TARGETS_PER_QUERY,
+        );
+      }
 
       const targets: VariantTarget[] = [];
       const seen = new Set<string>();
