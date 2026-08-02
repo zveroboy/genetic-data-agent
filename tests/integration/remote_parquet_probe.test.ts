@@ -283,7 +283,14 @@ describe('remote parquet probe (targeted S3 read feasibility gate)', () => {
       SELECT rsid, gt_raw
       FROM read_parquet(
         ['${CHROM12_URI}'],
-        hive_partitioning = true
+        hive_partitioning = true,
+        -- Mandatory per contracts/ingestion-v1.md#reading-the-dataset: bare
+        -- hive_partitioning = true infers this all-numeric-chromosome fixture's \`chrom\`
+        -- column as BIGINT, and \`chrom = 'X'\` on that inferred type raises a DuckDB
+        -- Conversion Error (and, on the Node binding, a BIGINT \`chrom\` breaks \`=== '12'\`
+        -- comparisons and JSON.stringify). Do not simplify this back to bare
+        -- hive_partitioning — it happens to pass here only because '12' is castable to BIGINT.
+        hive_types_autocast = 0
       )
       WHERE chrom = '12' AND pos = ${TARGET_POS};
     `);
@@ -378,7 +385,13 @@ describe('remote parquet probe (targeted S3 read feasibility gate)', () => {
       await db.all(`
         EXPLAIN ANALYZE
         SELECT rsid, gt_raw
-        FROM read_parquet(['${CHROM12_URI}'], hive_partitioning = true)
+        FROM read_parquet(
+          ['${CHROM12_URI}'],
+          hive_partitioning = true,
+          -- Mandatory per contracts/ingestion-v1.md#reading-the-dataset — see the comment on
+          -- the first probe query above for why bare hive_partitioning must not be used.
+          hive_types_autocast = 0
+        )
         WHERE chrom = '12' AND pos = ${TARGET_POS};
       `)
     )
@@ -423,7 +436,10 @@ describe('remote parquet probe (targeted S3 read feasibility gate)', () => {
       SELECT rsid, gt_raw
       FROM read_parquet(
         ['${CHROM1_URI}', '${CHROM12_URI}'],
-        hive_partitioning = true
+        hive_partitioning = true,
+        -- Mandatory per contracts/ingestion-v1.md#reading-the-dataset — see the comment on
+        -- the first probe query above for why bare hive_partitioning must not be used.
+        hive_types_autocast = 0
       )
       WHERE chrom = '12' AND pos = ${TARGET_POS};
     `);

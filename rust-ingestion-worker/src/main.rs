@@ -274,18 +274,25 @@ mod tests {
     }
 
     /// Even `--force-clean` does not license deleting the directory the process is running in.
+    ///
+    /// This asserts the pure predicate `clear_previous_run` relies on, rather than calling
+    /// `clear_previous_run` itself against the real `env::current_dir()`: a `clear_previous_run`
+    /// call against the actual current directory (or its parent) would recursively
+    /// `remove_dir_all` the crate — or the repository's parent — the day this guard regresses.
+    /// Every `clear_previous_run` call in this module's tests stays pointed at `TempDir` paths.
     #[test]
     fn never_clears_the_current_directory_even_with_the_flag() {
         let current = env::current_dir().expect("current directory");
-        let error = clear_previous_run(&current, true, true)
-            .expect_err("the current directory is never a valid output path");
         assert!(
-            error.to_string().contains("current directory"),
-            "unexpected error: {error}"
+            contains_current_directory(&current),
+            "the current directory must be recognised as itself"
         );
 
         let parent = current.parent().expect("a parent directory").to_path_buf();
-        assert!(clear_previous_run(&parent, true, true).is_err(), "nor an ancestor of it");
+        assert!(
+            contains_current_directory(&parent),
+            "an ancestor of the current directory must also be recognised"
+        );
     }
 
     #[test]

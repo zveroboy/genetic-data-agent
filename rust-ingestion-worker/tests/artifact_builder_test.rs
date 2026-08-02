@@ -319,7 +319,6 @@ mod vcf {
             ]
             .concat(),
         );
-        assert_ne!(second.len(), 0);
         std::fs::write(&path, [first, second].concat()).expect("write concatenated members");
 
         let parsed = variants(&path);
@@ -649,9 +648,12 @@ mod artifact_builder {
             return;
         }
 
-        let error = build_in(&directory, &source, &RecordingProgressSink::default(), 1_000)
-            .expect_err("an unreadable source cannot produce a dataset");
+        // Restore permissions on both the success and failure path before asserting: an
+        // `expect_err` that panics on an unexpected `Ok` would otherwise skip the restore and
+        // leave the locked-down file behind in the `TempDir`.
+        let result = build_in(&directory, &source, &RecordingProgressSink::default(), 1_000);
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).expect("restore");
+        let error = result.expect_err("an unreadable source cannot produce a dataset");
 
         assert_eq!(error.failure_type(), FailureType::ArtifactWriteFailed);
         assert!(error.failure_type().is_retryable(), "a permission error must be retryable");
@@ -939,6 +941,13 @@ mod artifact_builder {
         }
 
         // --- the consequence a query layer would actually hit --------------------------------
+        // Deliberately a glob (`whole(&autosomes)`), never `one_autosome`: a *single-file* scan
+        // with `hive_partitioning = true` (autocast on, so `chrom` infers `BIGINT`) plus a
+        // string predicate on `chrom` aborts a DuckDB debug build with
+        // `Assertion failed: (root_schema->children.size() > primary_index), function
+        // GetColumnStatistics, file parquet_reader.cpp, line 1345` (SIGABRT), which
+        // `hive_types_autocast = 0` avoids entirely. Do not swap this back to a single-file
+        // target without checking that abort no longer reproduces.
         let predicate = |options: &str| {
             connection
                 .query_row(
@@ -1101,7 +1110,7 @@ fn gzip_member(text: &str) -> Vec<u8> {
 /// bytes, so it is deterministic and must never be retried.
 fn corrupt_gzip(text: &str) -> Vec<u8> {
     let mut bytes = gzip_member(text);
-    // The first ten bytes are the gzip header, which must stay valid so the corruption is
+    // The first twelve bytes are the gzip header, which must stay valid so the corruption is
     // discovered mid-stream rather than at open time.
     for byte in bytes.iter_mut().skip(12).take(8) {
         *byte ^= 0xff;
