@@ -6,12 +6,23 @@
 #   make seed          # the two allowlisted source objects into s3://genomic-data/samples/
 #   make demo          # ingest demo-small, wait for the manifest, ask a question
 #
+# Developing, rather than demoing: `make up` builds the application images, and the Rust one
+# compiles DuckDB from source (~7 minutes cold). You do not need any of that to work on the code
+# — `make up-infra` starts only the backing services, and the API and both workers then run from
+# source on the host, where a restart is instant and a debugger can attach:
+#
+#   make up-infra      # temporal, minio, minio-provision, qdrant — no application images
+#   make seed
+#   make api           # in its own terminal
+#   make worker        # in its own terminal
+#   cargo run --manifest-path rust-ingestion-worker/Cargo.toml --bin temporal_worker
+#
 # `cargo` is installed through rustup and is not on a login shell's PATH on every machine; if a
 # Rust target fails with "command not found", export it first:
 #
 #   export PATH="$$(rustup which cargo | xargs dirname):$$PATH"
 
-.PHONY: all up down ps logs seed demo reference-snapshot temporal-dev worker api trigger \
+.PHONY: all up up-infra down ps logs seed demo reference-snapshot temporal-dev worker api trigger \
         build build-rust build-ts test test-ts test-rust test-integration test-rust-integration \
         test-e2e download-real-data cleanup-orphans clean
 
@@ -26,6 +37,22 @@ all: build test
 
 up:
 	docker compose up -d --build
+
+# The backing services only — no application images, so nothing here compiles Rust or Node.
+# `minio-provision` is included because it is what creates the buckets and the scoped read-only
+# identity the API expects; without it the first ingestion fails on a missing bucket.
+#
+# The compose ports are published on 127.0.0.1, so a host-run API and worker reach these
+# directly. TEMPORAL_HOST, QDRANT_HOST and S3_ARTIFACT_BUCKET already default to them, but the
+# three S3 credentials have no defaults on purpose — the object store is never guessed at — so
+# export them before `make api` / `make worker`:
+#
+#   export S3_ENDPOINT=http://localhost:9000 S3_ACCESS_KEY=admin S3_SECRET_KEY=password123
+#
+# `make api` also needs the reference snapshot, which the image builds for itself but a host run
+# does not: `make reference-snapshot` once, first.
+up-infra:
+	docker compose up -d temporal minio minio-provision qdrant
 
 down:
 	docker compose down
