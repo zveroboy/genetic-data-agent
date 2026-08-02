@@ -218,7 +218,14 @@ fn build_or_stop(
             ..ProgressEvent::phase(IngestionPhase::ExportingParquet)
         },
     )?;
-    timed("export", || export_parquet(&staging, &request.parquet_output_dir))?;
+    timed("export", || {
+        export_parquet(
+            &staging,
+            &request.parquet_output_dir,
+            progress,
+            request.concurrency,
+        )
+    })?;
 
     // The staging database is closed before the export is inspected, so validation reads the
     // files exactly as a consumer would.

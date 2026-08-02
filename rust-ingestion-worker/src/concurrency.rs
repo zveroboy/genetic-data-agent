@@ -33,12 +33,30 @@ pub struct ConcurrencyLimits {
     /// Exported Parquet files hashed and validated at once. Each worker holds its own DuckDB
     /// connection and one 64 KiB read buffer.
     pub validate_files: usize,
+    /// Partitions whose `COPY … ORDER BY` may be in flight at once, each on its own connection
+    /// to the same staging database.
+    ///
+    /// Capped below the core count. These statements share DuckDB's own thread pool rather than
+    /// getting one each, and on a 22-partition genome the stage stopped improving at eight
+    /// workers (0.31 s sequential, 0.09 s at four, 0.06 s at eight, 0.06 s at sixteen). Past the
+    /// plateau the only thing more workers add is more concurrent sort buffers inside DuckDB,
+    /// which is what the cap is protecting. Measurements in
+    /// `.superpowers/sdd/parallelism-report.md`.
+    pub export_partitions: usize,
 }
 
 impl ConcurrencyLimits {
     /// Every stage sequential: the behaviour the pipeline had before any stage was parallelised.
     /// Kept as a measurable baseline and as a per-deployment escape hatch.
-    pub const SEQUENTIAL: Self = Self { validate_files: 1 };
+    pub const SEQUENTIAL: Self = Self {
+        validate_files: 1,
+        export_partitions: 1,
+    };
+
+    /// Where concurrent `COPY` statements stopped paying when measured: they subdivide DuckDB's
+    /// one internal thread pool rather than adding to it, so beyond this the stage does not get
+    /// faster and only the number of simultaneous sort buffers grows.
+    const MAX_EXPORT_PARTITIONS: usize = 8;
 
     /// One worker per core the process may actually use. `available_parallelism` respects
     /// cgroup CPU limits, so a container with a fractional CPU quota does not get a pool sized
@@ -47,6 +65,7 @@ impl ConcurrencyLimits {
         let cores = available_parallelism().map_or(1, NonZeroUsize::get);
         Self {
             validate_files: cores,
+            export_partitions: cores.min(Self::MAX_EXPORT_PARTITIONS),
         }
     }
 }
@@ -70,12 +89,18 @@ pub(crate) fn workers_for(limit: usize, items: usize) -> usize {
 /// state is created, and nothing is shared. That is what makes a sequential run a real baseline
 /// rather than the parallel machinery throttled to one worker.
 ///
-/// **Exactly `workers` states are created**, up front, and handed out by checkout. `rayon`'s own
-/// `map_init` is deliberately not used: it initialises once per *split*, not once per thread, so
-/// a 22-item job on a 16-thread pool can call the initialiser 22 times. When `S` is a DuckDB
-/// connection that is the difference between sixteen engine instances and one per partition.
-/// The checkout can never block: at most `workers` closures run at once, so a state is always
-/// free.
+/// **Exactly `workers` states are created**, up front and *on the calling thread*, and handed out
+/// by checkout. Two consequences, both load-bearing:
+///
+/// - `rayon`'s own `map_init` is not used. It initialises once per *split*, not once per thread,
+///   so a 22-item job on a 16-thread pool can call the initialiser 22 times. When `S` is a DuckDB
+///   connection that is the difference between sixteen engine instances and one per partition.
+/// - `init` is `FnMut` and needs no `Send`/`Sync` bound, because it never crosses a thread. That
+///   is what lets the export stage create its states with `Connection::try_clone`, which borrows
+///   a `Connection` — a type that is `Send` but deliberately not `Sync`.
+///
+/// The checkout can never block or fail: at most `workers` closures run at once, so a state is
+/// always free.
 ///
 /// **Ordering is not incidental.** The dataset checksum is taken over descriptors sorted by
 /// `(chrom, relativePath)`, and every caller here resolves failures by *position*, so the output
@@ -88,14 +113,14 @@ pub(crate) fn workers_for(limit: usize, items: usize) -> usize {
 pub(crate) fn map_bounded_with<T, S, R, I, F>(
     items: &[T],
     workers: usize,
-    init: I,
+    mut init: I,
     map: F,
 ) -> Result<Vec<R>, String>
 where
     T: Sync,
     R: Send,
     S: Send,
-    I: Fn() -> S + Sync + Send,
+    I: FnMut() -> S,
     F: Fn(&mut S, &T) -> R + Sync + Send,
 {
     if workers <= 1 {
@@ -108,17 +133,12 @@ where
         .build()
         .map_err(|error| format!("cannot build a {workers}-thread pool: {error}"))?;
 
+    // On the calling thread, before any worker exists.
     let free: Mutex<Vec<S>> = Mutex::new((0..workers).map(|_| init()).collect());
-    let checkout = || {
-        // A poisoned lock means some worker panicked while holding it. The vector itself is
-        // never left inconsistent — a state is popped, used, and pushed back — so recovering is
-        // strictly better than turning one panic into a panic in every other worker.
-        let mut free = free.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // `pop` cannot be `None`: the pool runs at most `workers` closures at once and there are
-        // `workers` states. `init()` is the defensive branch, not a fallback that is expected to
-        // run, and it is still bounded by the number of concurrent closures.
-        free.pop().unwrap_or_else(&init)
-    };
+    // A poisoned lock means some worker panicked while holding it. The vector itself is never
+    // left inconsistent — a state is popped, used, and pushed back — so recovering is strictly
+    // better than turning one worker's panic into a panic in every other worker.
+    let locked = || free.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // `install` blocks until every task has finished, so no worker outlives this call, and the
     // pool is dropped on return, which releases its threads.
@@ -126,11 +146,11 @@ where
         items
             .par_iter()
             .map(|item| {
-                let mut state = checkout();
+                // Cannot be `None`: there are `workers` states and the pool runs at most
+                // `workers` of these closures at once.
+                let mut state = locked().pop().expect("a free state per concurrent worker");
                 let result = map(&mut state, item);
-                free.lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(state);
+                locked().push(state);
                 result
             })
             .collect()

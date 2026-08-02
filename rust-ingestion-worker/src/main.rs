@@ -129,6 +129,9 @@ fn cli_concurrency_limits() -> ConcurrencyLimits {
     if let Some(value) = flag("INGEST_VALIDATE_FILES") {
         limits.validate_files = value;
     }
+    if let Some(value) = flag("INGEST_EXPORT_PARTITIONS") {
+        limits.export_partitions = value;
+    }
     limits
 }
 

@@ -1197,7 +1197,10 @@ mod artifact_builder {
         assert_eq!(sequential.local_parquet_files.len(), CHROMS.len());
 
         for validate_files in [2, 4, 16] {
-            let (parallel, parallel_bytes) = run(ConcurrencyLimits { validate_files });
+            let (parallel, parallel_bytes) = run(ConcurrencyLimits {
+                validate_files,
+                ..ConcurrencyLimits::SEQUENTIAL
+            });
             assert_eq!(
                 parallel.dataset_checksum_sha256, sequential.dataset_checksum_sha256,
                 "the dataset checksum changed at validate_files = {validate_files}"

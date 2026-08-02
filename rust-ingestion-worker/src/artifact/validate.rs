@@ -497,7 +497,10 @@ mod tests {
     const BOUNDS: [usize; 3] = [1, 4, 16];
 
     fn limits(validate_files: usize) -> ConcurrencyLimits {
-        ConcurrencyLimits { validate_files }
+        ConcurrencyLimits {
+            validate_files,
+            ..ConcurrencyLimits::SEQUENTIAL
+        }
     }
 
     #[derive(Default)]
