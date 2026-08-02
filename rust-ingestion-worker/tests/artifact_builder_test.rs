@@ -17,6 +17,7 @@ use rust_ingestion_worker::artifact::{
     build_artifact, canonical_descriptor_block, dataset_checksum_sha256, ArtifactBuildRequest,
     ArtifactError, ArtifactStats, LocalParquetFile, PROCESSOR_VERSION, ROW_GROUP_SIZE,
 };
+use rust_ingestion_worker::concurrency::ConcurrencyLimits;
 use rust_ingestion_worker::contracts::{
     FailureType, PARQUET_SCHEMA_FINGERPRINT, SORT_ORDER, VARIANTS_SEGMENT,
 };
@@ -103,7 +104,19 @@ fn rejections(path: &Path) -> Vec<RejectionReason> {
 /// but [`InterruptingProgressSink`] always continues, and the one test that does interrupt calls
 /// [`build_interruptibly_in`] instead.
 fn build_in(directory: &TempDir, source: &Path, sink: &dyn ProgressSink, batch_size: usize) -> Result<(ArtifactStats, PathBuf), ArtifactError> {
-    build_interruptibly_in(directory, source, sink, batch_size).map(|(stats, parquet_dir)| {
+    build_with(directory, source, sink, batch_size, ConcurrencyLimits::default())
+}
+
+/// [`build_in`] at a chosen set of concurrency bounds, for the tests that compare a sequential
+/// run against a parallel one over the same input.
+fn build_with(
+    directory: &TempDir,
+    source: &Path,
+    sink: &dyn ProgressSink,
+    batch_size: usize,
+    concurrency: ConcurrencyLimits,
+) -> Result<(ArtifactStats, PathBuf), ArtifactError> {
+    build_interruptibly_with(directory, source, sink, batch_size, concurrency).map(|(stats, parquet_dir)| {
         (
             stats.expect("this sink never asks the build to stop"),
             parquet_dir,
@@ -117,6 +130,16 @@ fn build_interruptibly_in(
     sink: &dyn ProgressSink,
     batch_size: usize,
 ) -> Result<(Option<ArtifactStats>, PathBuf), ArtifactError> {
+    build_interruptibly_with(directory, source, sink, batch_size, ConcurrencyLimits::default())
+}
+
+fn build_interruptibly_with(
+    directory: &TempDir,
+    source: &Path,
+    sink: &dyn ProgressSink,
+    batch_size: usize,
+    concurrency: ConcurrencyLimits,
+) -> Result<(Option<ArtifactStats>, PathBuf), ArtifactError> {
     let parquet_dir = directory.path().join("parquet");
     let request = ArtifactBuildRequest {
         source_path: source.to_path_buf(),
@@ -126,6 +149,7 @@ fn build_interruptibly_in(
         source_etag: "fixture-etag".to_string(),
         reference_build: "GRCh38".to_string(),
         batch_size,
+        concurrency,
     };
     build_artifact(&request, sink).map(|stats| (stats, parquet_dir))
 }
@@ -1120,6 +1144,74 @@ mod artifact_builder {
             assert_eq!(file.row_count, u64::from(PER_CHROM));
             assert_eq!(file.min_pos, 10_000);
             assert_eq!(file.max_pos, 10_000 + (PER_CHROM - 1) * 100);
+        }
+    }
+
+    /// The whole build, end to end, must produce byte-identical output at every concurrency
+    /// bound — the dataset checksum above all, because it is frozen across two languages.
+    ///
+    /// The per-stage tests in `src/artifact/validate.rs` prove each parallel stage preserves its
+    /// own ordering; this one proves the pipeline does, against a real multi-partition export.
+    #[test]
+    fn the_dataset_is_byte_identical_at_every_concurrency_bound() {
+        const PER_CHROM: u32 = 2_000;
+        const CHROMS: [&str; 6] = ["1", "12", "2", "22", "X", "MT"];
+
+        let source_directory = TempDir::new().expect("temp dir");
+        let source = source_directory.path().join("bounds.vcf");
+        {
+            let mut writer = BufWriter::new(File::create(&source).expect("create"));
+            writer.write_all(VCF_HEADER.as_bytes()).expect("header");
+            for chrom in CHROMS {
+                for index in 0..PER_CHROM {
+                    writer
+                        .write_all(
+                            data_line(chrom, 10_000 + index * 100, ".", "A", "C", "0/1").as_bytes(),
+                        )
+                        .expect("record");
+                }
+            }
+        }
+
+        let run = |concurrency| {
+            let directory = TempDir::new().expect("temp dir");
+            let (stats, parquet_dir) = build_with(
+                &directory,
+                &source,
+                &RecordingProgressSink::default(),
+                1_000,
+                concurrency,
+            )
+            .expect("build succeeds");
+            // The Parquet bytes themselves, not just the descriptors: hashing the descriptor
+            // list would pass even if the files differed and the descriptors were stale.
+            let bytes: Vec<Vec<u8>> = stats
+                .local_parquet_files
+                .iter()
+                .map(|file| std::fs::read(parquet_dir.join(&file.relative_path)).expect("read"))
+                .collect();
+            (stats, bytes)
+        };
+
+        let (sequential, sequential_bytes) = run(ConcurrencyLimits::SEQUENTIAL);
+        assert_eq!(sequential.local_parquet_files.len(), CHROMS.len());
+
+        for validate_files in [2, 4, 16] {
+            let (parallel, parallel_bytes) = run(ConcurrencyLimits { validate_files });
+            assert_eq!(
+                parallel.dataset_checksum_sha256, sequential.dataset_checksum_sha256,
+                "the dataset checksum changed at validate_files = {validate_files}"
+            );
+            assert_eq!(
+                parallel.local_parquet_files, sequential.local_parquet_files,
+                "the descriptor list changed at validate_files = {validate_files}"
+            );
+            assert_eq!(
+                parallel_bytes, sequential_bytes,
+                "the Parquet bytes changed at validate_files = {validate_files}"
+            );
+            assert_eq!(parallel.variant_count, sequential.variant_count);
+            assert_eq!(parallel.rejected_record_count, sequential.rejected_record_count);
         }
     }
 

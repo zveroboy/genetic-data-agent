@@ -23,6 +23,7 @@
 //! The canonicalisation implemented by [`canonical_descriptor_block`] is specified in
 //! `contracts/ingestion-v1.md` and is verified against the golden cross-language fixture.
 
+mod cancel;
 mod checksum;
 mod export;
 mod layout;
@@ -33,9 +34,11 @@ pub use checksum::{canonical_descriptor_block, dataset_checksum_sha256, LocalPar
 
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use duckdb::{params, Connection};
 
+use crate::concurrency::ConcurrencyLimits;
 use crate::contracts::FailureType;
 use crate::models::{ProgressEvent, ProgressSink};
 
@@ -73,6 +76,9 @@ pub struct ArtifactBuildRequest {
     pub reference_build: String,
     /// Records held in memory between flushes into DuckDB. This is the memory bound.
     pub batch_size: usize,
+    /// How much of each independently parallelisable stage may run at once. Every stage still
+    /// produces the same bytes at every setting; see [`ConcurrencyLimits`].
+    pub concurrency: ConcurrencyLimits,
 }
 
 /// The result of a successful build.
@@ -117,6 +123,7 @@ impl ArtifactError {
 ///
 /// Internal to this module. A caller sees the distinction as `Ok(None)` versus `Err(_)`, because
 /// stopping on request is not a failure and must never be reported as one.
+#[derive(Debug)]
 enum Stopped {
     Interrupted,
     Failed(ArtifactError),
@@ -174,7 +181,9 @@ fn build_or_stop(
         .execute_batch(STAGING_SCHEMA)
         .map_err(|error| ArtifactError::WriteFailed(format!("cannot create staging tables: {error}")))?;
 
-    let counts = stage_variants(&staging, request, batch_size, progress)?;
+    let counts = timed("staging", || {
+        stage_variants(&staging, request, batch_size, progress)
+    })?;
 
     if counts.accepted == 0 {
         return Err(ArtifactError::InvalidVcf(format!(
@@ -209,7 +218,7 @@ fn build_or_stop(
             ..ProgressEvent::phase(IngestionPhase::ExportingParquet)
         },
     )?;
-    export_parquet(&staging, &request.parquet_output_dir)?;
+    timed("export", || export_parquet(&staging, &request.parquet_output_dir))?;
 
     // The staging database is closed before the export is inspected, so validation reads the
     // files exactly as a consumer would.
@@ -218,7 +227,14 @@ fn build_or_stop(
         .map_err(|(_, error)| ArtifactError::WriteFailed(format!("cannot close staging database: {error}")))?;
 
     rename_partition_files(&request.parquet_output_dir)?;
-    let local_parquet_files = validate_export(&request.parquet_output_dir, &counts, progress)?;
+    let local_parquet_files = timed("validate", || {
+        validate_export(
+            &request.parquet_output_dir,
+            &counts,
+            progress,
+            request.concurrency,
+        )
+    })?;
 
     let stats = ArtifactStats {
         dataset_checksum_sha256: dataset_checksum_sha256(&local_parquet_files),
@@ -243,6 +259,24 @@ fn build_or_stop(
         },
     )?;
     Ok(stats)
+}
+
+/// Runs one stage and logs how long it took.
+///
+/// This exists so the effect of a concurrency bound is measurable from the shipped binary
+/// rather than from a patched one: `RUST_LOG=info` prints one line per stage, which is what
+/// every before/after number in `.superpowers/sdd/parallelism-report.md` was taken from. It is a
+/// duration on a named stage of a named input — deliberately not a rate.
+fn timed<T, E>(stage: &'static str, run: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    let started = Instant::now();
+    let outcome = run();
+    tracing::info!(
+        stage,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        succeeded = outcome.is_ok(),
+        "ingestion stage finished"
+    );
+    outcome
 }
 
 /// An attempt writes only to paths it created, so an existing one is refused rather than

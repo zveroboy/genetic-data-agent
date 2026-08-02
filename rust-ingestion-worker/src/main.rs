@@ -22,6 +22,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use rust_ingestion_worker::artifact::{build_artifact, ArtifactBuildRequest, DEFAULT_BATCH_SIZE};
+use rust_ingestion_worker::concurrency::ConcurrencyLimits;
 use rust_ingestion_worker::models::NoopProgressSink;
 
 const DEFAULT_STAGING_DB: &str = "genomic_data.duckdb";
@@ -81,6 +82,7 @@ fn main() -> Result<()> {
         source_etag: "local-debug".to_string(),
         reference_build: "GRCh38".to_string(),
         batch_size: DEFAULT_BATCH_SIZE,
+        concurrency: cli_concurrency_limits(),
     };
 
     // `NoopProgressSink` never asks the build to stop, so `None` is unreachable here; the debug
@@ -104,6 +106,30 @@ fn main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The debug CLI's concurrency bounds, taken from the environment so a before/after measurement
+/// can be run against one binary instead of one build per setting.
+///
+/// Defaults to [`ConcurrencyLimits::default`] — the same bounds the Temporal worker uses — so a
+/// plain `rust-ingestion-worker file.vcf.gz` is representative of production. `INGEST_SEQUENTIAL=1`
+/// selects [`ConcurrencyLimits::SEQUENTIAL`], which is the pre-parallel pipeline and the baseline
+/// every measurement in `.superpowers/sdd/parallelism-report.md` is taken against. Individual
+/// stages can be overridden on top of that.
+///
+/// Deliberately confined to this binary: the library takes its bounds as a parameter and reads no
+/// environment of its own, so the worker's behaviour cannot be changed by an ambient variable.
+fn cli_concurrency_limits() -> ConcurrencyLimits {
+    let flag = |name: &str| env::var(name).ok().and_then(|value| value.parse::<usize>().ok());
+
+    let mut limits = match flag("INGEST_SEQUENTIAL") {
+        Some(1) => ConcurrencyLimits::SEQUENTIAL,
+        _ => ConcurrencyLimits::default(),
+    };
+    if let Some(value) = flag("INGEST_VALIDATE_FILES") {
+        limits.validate_files = value;
+    }
+    limits
 }
 
 /// Clears one output path from a previous debug run.

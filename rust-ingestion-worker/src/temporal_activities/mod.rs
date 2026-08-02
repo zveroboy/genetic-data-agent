@@ -54,6 +54,7 @@ use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use crate::artifact::{
     build_artifact, ArtifactBuildRequest, ArtifactError, ArtifactStats, DEFAULT_BATCH_SIZE,
 };
+use crate::concurrency::ConcurrencyLimits;
 use crate::contracts::{
     BuildDatasetArtifactInput, BuildDatasetArtifactResult, FailureType, IngestionPhase,
     CONTRACT_VERSION,
@@ -172,6 +173,9 @@ pub struct IngestionActivities {
     store: Arc<S3ObjectStore>,
     staging_root: PathBuf,
     batch_size: usize,
+    /// Sized once, at worker start, from the cores this process may use — not per attempt, so
+    /// two attempts sharing a worker cannot each build a pool for the whole machine.
+    concurrency: ConcurrencyLimits,
 }
 
 impl IngestionActivities {
@@ -180,6 +184,7 @@ impl IngestionActivities {
             store: Arc::new(store),
             staging_root,
             batch_size: DEFAULT_BATCH_SIZE,
+            concurrency: ConcurrencyLimits::default(),
         }
     }
 
@@ -360,6 +365,7 @@ impl IngestionActivities {
             source_etag: source_etag.to_string(),
             reference_build: input.reference.build.clone(),
             batch_size: self.batch_size,
+            concurrency: self.concurrency,
         };
         let sink = reporter.clone();
 
