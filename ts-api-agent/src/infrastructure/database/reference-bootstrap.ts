@@ -239,7 +239,9 @@ export async function buildReferenceDatabase(
  *
  * The TSV is the demo ClinVar extract that ships with the repository; it is *reference* data,
  * not a fixture standing in for missing user data, and it is the declared source of
- * `demo-clinvar-grch38-v1`. Both paths can be overridden so a real deployment can point at a
+ * `REFERENCE_VERSION`. It is derived from the authoritative ClinVar VCF by
+ * `scripts/generate_clinvar_reference_tsv.ts`, never edited by hand — see
+ * `clinvar-source-records.ts`. Both paths can be overridden so a real deployment can point at a
  * larger snapshot without touching code. The built database lands under `data/reference/`,
  * which is git-ignored: it is derived, not authored.
  */

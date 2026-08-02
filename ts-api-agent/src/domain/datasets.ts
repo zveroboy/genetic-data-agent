@@ -16,8 +16,17 @@ export function isDatasetKey(value: unknown): value is DatasetKey {
 /** Reference genome build every seeded dataset is pinned to. */
 export const REFERENCE_BUILD = 'GRCh38';
 
-/** Versioned ClinVar snapshot every seeded dataset resolves coordinates against. */
-export const REFERENCE_VERSION = 'demo-clinvar-grch38-v1';
+/**
+ * Versioned ClinVar snapshot every seeded dataset resolves coordinates against.
+ *
+ * `v2` is the first snapshot derived from the authoritative ClinVar VCF rather than typed out by
+ * hand (`scripts/generate_clinvar_reference_tsv.ts`). `v1` named a table whose alleles were
+ * inverted for several variants and whose VKORC1 and TP53 rows carried GRCh37 positions, so the
+ * two are genuinely different datasets and must not share a version string: a dataset ingested
+ * against `v1` is rejected by `ReferenceSnapshotMismatch` at `/ask` until it is re-ingested,
+ * which is the check doing its job.
+ */
+export const REFERENCE_VERSION = 'demo-clinvar-grch38-v2';
 
 /** Immutable S3 identity of a seeded source object. Never derived from API input. */
 export interface DatasetSourceObject {

@@ -22,7 +22,7 @@
 #
 #   export PATH="$$(rustup which cargo | xargs dirname):$$PATH"
 
-.PHONY: all up up-infra down ps logs seed demo reference-snapshot temporal-dev worker api trigger \
+.PHONY: all up up-infra down ps logs seed demo reference-snapshot reference-table temporal-dev worker api trigger \
         build build-rust build-ts test test-ts test-rust test-integration test-rust-integration \
         test-e2e download-real-data cleanup-orphans clean
 
@@ -103,6 +103,13 @@ temporal-dev:
 # refuses to start without it; the image builds it at build time.
 reference-snapshot:
 	node ts-api-agent/scripts/build_reference_snapshot.ts
+
+# Re-derives the committed coordinate TSV (and the ClinVar records it came from) from the real
+# ClinVar VCF. Only needed when adopting a new ClinVar release or changing the target list —
+# and then REFERENCE_VERSION must be bumped, because the same version string may never name two
+# different tables. Needs data/clinvar.vcf.gz (~193 MB, git-ignored).
+reference-table:
+	node scripts/generate_clinvar_reference_tsv.ts
 
 api:
 	node ts-api-agent/src/index.ts

@@ -186,7 +186,7 @@ class FakeSessionFactory implements DuckDbSessionFactory {
 function variantTarget(overrides: Partial<VariantTarget> = {}): VariantTarget {
   return {
     referenceBuild: 'GRCh38',
-    referenceVersion: 'demo-clinvar-grch38-v1',
+    referenceVersion: 'demo-clinvar-grch38-v2',
     chrom: '12',
     pos: 21_178_615,
     ref: 'T',
@@ -207,7 +207,7 @@ class FakeCoordinateResolver implements ClinVarCoordinateResolver {
   readonly #targets: readonly VariantTarget[];
 
   constructor(
-    referenceVersion = 'demo-clinvar-grch38-v1',
+    referenceVersion = 'demo-clinvar-grch38-v2',
     referenceBuild = 'GRCh38',
     targets: readonly VariantTarget[] = [variantTarget()],
   ) {
@@ -285,8 +285,10 @@ describe('genotype repository', () => {
 
   it('refuses a reference snapshot that disagrees with the manifest', async () => {
     for (const mismatched of [
-      new FakeCoordinateResolver('demo-clinvar-grch38-v2', 'GRCh38'),
-      new FakeCoordinateResolver('demo-clinvar-grch38-v1', 'GRCh37'),
+      // A stale snapshot (the manifest names v2) and a wrong-build one. Both must be refused:
+      // v1 placed several variants at different coordinates than v2 does.
+      new FakeCoordinateResolver('demo-clinvar-grch38-v1', 'GRCh38'),
+      new FakeCoordinateResolver('demo-clinvar-grch38-v3', 'GRCh37'),
     ]) {
       const { factory, sessions } = harness({ coordinates: mismatched });
 
@@ -337,7 +339,7 @@ describe('genotype repository', () => {
   });
 
   it('groups candidates per chromosome so each scan carries its own literal partition value', async () => {
-    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v1', 'GRCh38', [
+    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v2', 'GRCh38', [
       variantTarget(),
       variantTarget({ chrom: '15', pos: 74_749_576, ref: 'A', alt: 'C', rsid: 'rs762551', gene: 'CYP1A2' }),
     ]);
@@ -370,7 +372,7 @@ describe('genotype repository', () => {
       datasetId: DATASET_ID,
       datasetChecksumSha256: computeDatasetChecksumSha256(ATTEMPT_PREFIX, INVENTORY),
       referenceBuild: 'GRCh38',
-      referenceVersion: 'demo-clinvar-grch38-v1',
+      referenceVersion: 'demo-clinvar-grch38-v2',
       filesScanned: [`s3://${ARTIFACT_BUCKET}/${CHROM_12.key}`],
       targetsResolved: 1,
     });
@@ -378,7 +380,7 @@ describe('genotype repository', () => {
   });
 
   it('propagates an unresolvable target without opening a session or heading an object', async () => {
-    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v1', 'GRCh38', []);
+    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v2', 'GRCh38', []);
     const { factory, sessions, store } = harness({ coordinates });
     const repository = await factory.open(DATASET_ID);
     store.requests.length = 0;
@@ -394,7 +396,7 @@ describe('genotype repository', () => {
   });
 
   it('reports a target outside every declared position range as TargetNotPresent', async () => {
-    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v1', 'GRCh38', [
+    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v2', 'GRCh38', [
       variantTarget({ pos: 1 }),
     ]);
     const { factory, sessions } = harness({ coordinates });

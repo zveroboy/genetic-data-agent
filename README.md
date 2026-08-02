@@ -88,12 +88,25 @@ footer probe), bounded under 64 KiB. Total bytes read is also checked, more loos
 ### Reference data is global; user data is per-dataset
 
 - **ClinVar (coordinates and clinical annotation).** A versioned snapshot,
-  `demo-clinvar-grch38-v1`, built from `tests/fixtures/clinvar_coordinates_grch38.tsv` (15
+  `demo-clinvar-grch38-v2`, built from `tests/fixtures/clinvar_coordinates_grch38.tsv` (14
   targets). It maps a gene symbol or rsID to `(chrom, pos, ref, alt)` plus phenotype, clinical
   significance and an evidence note. Every manifest records which snapshot version its dataset
   was ingested against, and a repository refuses to open when the snapshot on disk is a
   different version or genome build — coordinates from one build against Parquet written for
   another would silently answer the right question about the wrong position.
+
+  That table is **derived, not authored**: `scripts/generate_clinvar_reference_tsv.ts` looks each
+  declared rsID up in the real ClinVar VCF (`data/clinvar.vcf.gz`, git-ignored) and writes both
+  the table and `tests/fixtures/clinvar_source_records.vcf` — the source records it used, kept
+  verbatim. `clinvar-source-records.test.ts` re-derives the table from those records on every
+  `npm test`; `tests/integration/clinvar_reference_source.test.ts` re-derives the records from
+  the full download, and says so loudly when the download is absent. `v1` was hand-written and
+  wrong: several rows named the complementary allele pair, VKORC1 and TP53 carried GRCh37
+  positions under a GRCh38 label, and one rsID (rs2187668, HLA-DQA1) is not in ClinVar at all and
+  has been dropped rather than invented. Because the serving join is strict on the coordinate
+  tuple, each of those rows failed as "no clinical variant data found" rather than as a wrong
+  answer. **A dataset ingested against `v1` must be re-ingested**; until it is, `/ask` rejects it
+  with `ReferenceSnapshotMismatch` (409), which is the check working.
 - **PubMed (literature).** Optional, and not part of the deterministic answer.
   `ts-api-agent/scripts/ingest_pubmed.ts` queries the NCBI E-utilities API for real PMIDs, titles, journals
   and years, and then **synthesizes a short descriptive paragraph from that metadata** — it does

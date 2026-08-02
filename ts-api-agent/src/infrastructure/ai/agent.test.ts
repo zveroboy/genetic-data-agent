@@ -52,7 +52,7 @@ const SUCCESSFUL_RESULT: GenotypeQueryResult = {
     datasetId: 'ds-serving-001',
     datasetChecksumSha256: 'a'.repeat(64),
     referenceBuild: 'GRCh38',
-    referenceVersion: 'demo-clinvar-grch38-v1',
+    referenceVersion: 'demo-clinvar-grch38-v2',
     filesScanned: ['s3://genomic-artifacts/datasets/ds-serving-001/…/chrom=15/part-000.parquet'],
     targetsResolved: 1,
   },
@@ -76,7 +76,7 @@ describe('askBioinformaticsAgent — absorbing "nothing to read" outcomes', () =
 
   it('turns TargetNotResolvableError into an empty-evidence note, not a thrown error', async () => {
     const repository = repositoryThatThrows(
-      new TargetNotResolvableError('NOT_A_GENE', 'demo-clinvar-grch38-v1'),
+      new TargetNotResolvableError('NOT_A_GENE', 'demo-clinvar-grch38-v2'),
     );
 
     const response = await askBioinformaticsAgent('Tell me about NOT_A_GENE', {

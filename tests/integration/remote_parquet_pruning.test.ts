@@ -99,7 +99,7 @@ const CHROM12_POS_BASE = CHROM12_TARGET_POS - CHROM12_TARGET_ROW * CHROM12_POS_S
 
 const CHROM1_ROWS = 100_000;
 
-/** CYP1A2 rs762551, GRCh38 chr15:74749576 A>C — the isolation target. */
+/** CYP1A2 rs762551, GRCh38 chr15:74749576 C>A — the isolation target. */
 const CHROM15_TARGET_POS = 74_749_576;
 
 /** G6PD rs1050828, GRCh38 chrX:154536002 C>T — the non-numeric partition target. */
@@ -277,7 +277,7 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
           pos: (index) => CHROM15_TARGET_POS + index * 1000,
           override: (index) =>
             index === 0
-              ? { rsid: 'rs762551', ref: 'A', alt: 'C', gt: spec.rs762551Genotype }
+              ? { rsid: 'rs762551', ref: 'C', alt: 'A', gt: spec.rs762551Genotype }
               : { ref: 'C', alt: 'T', gt: '0/0' },
         },
         {
@@ -513,11 +513,11 @@ describe('remote parquet serving (dataset isolation and partition pruning)', () 
 
     assert.deepEqual(
       a.variants.map((variant) => [variant.rsid, variant.userGenotype]),
-      [['rs762551', 'A/C']],
+      [['rs762551', 'C/A']],
     );
     assert.deepEqual(
       b.variants.map((variant) => [variant.rsid, variant.userGenotype]),
-      [['rs762551', 'C/C']],
+      [['rs762551', 'A/A']],
     );
     assert.notEqual(
       a.provenance.datasetChecksumSha256,

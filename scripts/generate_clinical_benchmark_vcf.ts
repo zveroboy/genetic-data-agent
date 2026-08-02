@@ -1,47 +1,95 @@
-import fs from 'fs';
-import path from 'path';
+/**
+ * Builds the synthetic clinical benchmark VCF and the rsID-keyed annotation TSV.
+ *
+ * These are demo/benchmark inputs, not reference data. The one thing they must not do is invent
+ * their own idea of where a variant is: every coordinate here is read from
+ * `tests/fixtures/clinvar_coordinates_grch38.tsv`, which
+ * `scripts/generate_clinvar_reference_tsv.ts` derives from the authoritative ClinVar VCF. This
+ * script used to *write* that table from a hand-typed array, which is how the wrong alleles got
+ * in; it is now strictly a consumer of it.
+ *
+ * The only hand-authored input left is the genotype each synthetic sample carries, which is a
+ * property of the fake person the file describes, not of the genome.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import {
-  REFERENCE_BUILD,
-  REFERENCE_VERSION,
-} from '../ts-api-agent/src/domain/datasets.ts';
+import { REFERENCE_BUILD, REFERENCE_VERSION } from '../ts-api-agent/src/domain/datasets.ts';
+import { COORDINATE_TSV_COLUMNS } from '../ts-api-agent/src/infrastructure/database/clinvar-source-records.ts';
 
-// Realistic clinical benchmark variants from NA12878 / NIST Genome in a Bottle & ClinVar
-const CLINICAL_BENCHMARK_VARIANTS = [
-  // Pharmacogenomics (PGx)
-  { chrom: 'chr15', pos: 74749576, rsid: 'rs762551', ref: 'A', alt: 'C', gt: '1/1', gene: 'CYP1A2', phenotype: 'Slow caffeine metabolizer', clinical_significance: 'Risk Factor', evidence_note: 'Decreased CYP1A2 enzyme activity; slower clearance of caffeine.' },
-  { chrom: 'chr12', pos: 21178615, rsid: 'rs4149056', ref: 'T', alt: 'C', gt: '0/1', gene: 'SLCO1B1', phenotype: 'Statins myopathy risk', clinical_significance: 'Risk Factor', evidence_note: 'Intermediate OATP1B1 function; increased blood statin levels and myopathy risk.' },
-  { chrom: 'chr16', pos: 31107689, rsid: 'rs9923231', ref: 'C', alt: 'T', gt: '1/1', gene: 'VKORC1', phenotype: 'High warfarin sensitivity', clinical_significance: 'Drug Response', evidence_note: 'Requires lower initial dose of warfarin blood thinner.' },
-  { chrom: 'chr22', pos: 42128945, rsid: 'rs3892097', ref: 'C', alt: 'T', gt: '0/1', gene: 'CYP2D6', phenotype: 'Intermediate SSRI metabolizer (*4 allele)', clinical_significance: 'Drug Response', evidence_note: 'Reduced metabolism of codeine, SSRIs, and beta-blockers.' },
-  { chrom: 'chr10', pos: 94781859, rsid: 'rs4244285', ref: 'G', alt: 'A', gt: '0/1', gene: 'CYP2C19', phenotype: 'Intermediate Clopidogrel metabolizer (*2 allele)', clinical_significance: 'Drug Response', evidence_note: 'Reduced bioactivation of clopidogrel (Plavix); alternative antiplatelet advised.' },
-  // X-linked on purpose: 'X' is a chromosome name, not a number, and a reference that contained
-  // only autosomes would never exercise the VARCHAR partition-value domain the readers rely on.
-  { chrom: 'chrX', pos: 154536002, rsid: 'rs1050828', ref: 'C', alt: 'T', gt: '0/1', gene: 'G6PD', phenotype: 'G6PD deficiency (A- variant), haemolysis risk', clinical_significance: 'Drug Response', evidence_note: 'Reduced G6PD activity; oxidative drugs such as primaquine and rasburicase can trigger haemolysis.' },
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+const COORDINATES_TSV = path.join(REPO_ROOT, 'tests/fixtures/clinvar_coordinates_grch38.tsv');
 
-  // Nutrition & Metabolism
-  { chrom: 'chr2', pos: 135851076, rsid: 'rs4988235', ref: 'T', alt: 'C', gt: '1/1', gene: 'LCT', phenotype: 'Primary Lactase Deficiency (Lactose Intolerance)', clinical_significance: 'Pathogenic', evidence_note: 'Absence of lactase persistence allele; adult hypolactasia.' },
-  { chrom: 'chr1', pos: 11796321, rsid: 'rs1801133', ref: 'G', alt: 'A', gt: '1/1', gene: 'MTHFR', phenotype: 'Reduced folate metabolism (C677T thermolabile variant)', clinical_significance: 'Risk Factor', evidence_note: '30-60% decrease in MTHFR enzyme efficiency; elevated homocysteine risk without B-vitamin intake.' },
+/**
+ * Genotype the synthetic benchmark sample carries at each target.
+ *
+ * Taken from the real GIAB NA12878/HG001 GRCh38 benchmark call set where it has a call, and
+ * `0/0` where it does not (the benchmark VCF lists only variant sites, so absence inside its
+ * high-confidence regions means homozygous reference). rs1050828 sits on chrX, which the
+ * `1_22` benchmark file does not cover at all, and rs3892097 falls outside the high-confidence
+ * regions — both are `0/0` here as a synthetic stand-in, not as a claim about NA12878.
+ */
+const SAMPLE_GENOTYPES: Readonly<Record<string, string>> = Object.freeze({
+  rs1801133: '0/1',
+  rs6025: '0/0',
+  rs4244285: '0/1',
+  rs4149056: '0/1',
+  rs80359550: '0/0',
+  rs762551: '1/1',
+  rs9923231: '0/1',
+  rs1042522: '0/1',
+  rs80357906: '0/0',
+  rs429358: '0/0',
+  rs7412: '0/0',
+  rs4988235: '1/1',
+  rs3892097: '0/0',
+  rs1050828: '0/0',
+});
 
-  // Cardiovascular & Thrombosis Risk
-  { chrom: 'chr19', pos: 44908684, rsid: 'rs429358', ref: 'T', alt: 'C', gt: '0/1', gene: 'APOE', phenotype: 'APOE-e4 carrier (Elevated Alzheimer & LDL cholesterol risk)', clinical_significance: 'Risk Factor', evidence_note: 'APOE epsilon 4 allele carrier; associated with increased beta-amyloid deposition and cardiovascular risk.' },
-  { chrom: 'chr19', pos: 44908822, rsid: 'rs7412', ref: 'C', alt: 'T', gt: '0/0', gene: 'APOE', phenotype: 'APOE-e3 reference', clinical_significance: 'Benign', evidence_note: 'Normal lipoprotein metabolism.' },
-  { chrom: 'chr1', pos: 169549811, rsid: 'rs6025', ref: 'C', alt: 'T', gt: '0/1', gene: 'F5', phenotype: 'Factor V Leiden carrier (Thrombophilia risk)', clinical_significance: 'Pathogenic', evidence_note: 'Activated protein C resistance; 3-5x increased relative risk for deep vein thrombosis (DVT).' },
+interface CoordinateRow {
+  readonly chrom: string;
+  readonly pos: string;
+  readonly rsid: string;
+  readonly ref: string;
+  readonly alt: string;
+  readonly gene: string;
+  readonly phenotype: string;
+  readonly clinical_significance: string;
+  readonly evidence_note: string;
+  readonly reference_version: string;
+  readonly reference_build: string;
+}
 
-  // Autoimmune & Immunology
-  { chrom: 'chr6', pos: 32632646, rsid: 'rs2187668', ref: 'T', alt: 'C', gt: '1/1', gene: 'HLA-DQA1', phenotype: 'HLA-DQ2.5 haplotype (Celiac disease genetic susceptibility)', clinical_significance: 'Risk Factor', evidence_note: 'Present in over 90% of celiac disease patients; dietary gluten triggers T-cell immune response.' },
+/** Reads the derived coordinate table, refusing a table this build is not pinned to. */
+function readCoordinates(): CoordinateRow[] {
+  const [header, ...body] = fs.readFileSync(COORDINATES_TSV, 'utf8').trimEnd().split('\n');
+  const columns = header!.split('\t');
+  if (columns.join('\t') !== COORDINATE_TSV_COLUMNS.join('\t')) {
+    throw new Error(`${COORDINATES_TSV} does not have the expected columns`);
+  }
+  return body.map((line) => {
+    const cells = line.split('\t');
+    const row = Object.fromEntries(
+      columns.map((column, index) => [column, cells[index] ?? '']),
+    ) as unknown as CoordinateRow;
+    if (row.reference_version !== REFERENCE_VERSION || row.reference_build !== REFERENCE_BUILD) {
+      throw new Error(
+        `${COORDINATES_TSV} declares '${row.reference_version}'/'${row.reference_build}', ` +
+          `but this build is pinned to '${REFERENCE_VERSION}'/'${REFERENCE_BUILD}'`,
+      );
+    }
+    return row;
+  });
+}
 
-  // Oncology & DNA Repair
-  { chrom: 'chr17', pos: 43057051, rsid: 'rs80357906', ref: 'G', alt: 'A', gt: '0/0', gene: 'BRCA1', phenotype: 'Normal BRCA1 allele (No familial cancer mutation detected)', clinical_significance: 'Benign', evidence_note: 'Wild-type tumor suppressor gene sequence.' },
-  { chrom: 'chr13', pos: 32332611, rsid: 'rs80359550', ref: 'C', alt: 'T', gt: '0/0', gene: 'BRCA2', phenotype: 'Normal BRCA2 allele', clinical_significance: 'Benign', evidence_note: 'Wild-type BRCA2 sequence.' },
-  { chrom: 'chr17', pos: 7673802, rsid: 'rs1042522', ref: 'G', alt: 'C', gt: '0/1', gene: 'TP53', phenotype: 'TP53 Arg72Pro polymorphism', clinical_significance: 'Benign / Risk Modifier', evidence_note: 'Common human polymorphism; minor modifier of cellular apoptosis efficiency.' },
-];
-
-function generateVcfContent(): string {
+function generateVcfContent(rows: readonly CoordinateRow[]): string {
   const headerLines = [
     '##fileformat=VCFv4.2',
     '##fileDate=20260731',
     '##source=1000Genomes_NA12878_Clinical_Benchmark_v1.0',
     '##reference=GRCh38/hg38',
+    `##clinvarSnapshot=${REFERENCE_VERSION}`,
     '##INFO=<ID=RS,Number=1,Type=String,Description="dbSNP rsID">',
     '##INFO=<ID=GENE,Number=1,Type=String,Description="HGNC Gene Symbol">',
     '##INFO=<ID=CLNSIG,Number=1,Type=String,Description="ClinVar Clinical Significance">',
@@ -53,10 +101,17 @@ function generateVcfContent(): string {
 
   const variantLines: string[] = [];
 
-  // 1. Add all high-impact clinical variants
-  for (const v of CLINICAL_BENCHMARK_VARIANTS) {
-    const info = `RS=${v.rsid};GENE=${v.gene};CLNSIG=${v.clinical_significance.replace(/\s+/g, '_')}`;
-    variantLines.push(`${v.chrom}\t${v.pos}\t${v.rsid}\t${v.ref}\t${v.alt}\t99.9\tPASS\t${info}\tGT:GQ:DP\t${v.gt}:99:65`);
+  // 1. Every clinical target the derived reference table declares, at its ClinVar coordinate.
+  for (const row of rows) {
+    const gt = SAMPLE_GENOTYPES[row.rsid];
+    if (gt === undefined) {
+      throw new Error(`no synthetic genotype declared for ${row.rsid}; add one to SAMPLE_GENOTYPES`);
+    }
+    const info =
+      `RS=${row.rsid};GENE=${row.gene};CLNSIG=${row.clinical_significance.replace(/\s+/g, '_')}`;
+    variantLines.push(
+      `${row.chrom}\t${row.pos}\t${row.rsid}\t${row.ref}\t${row.alt}\t99.9\tPASS\t${info}\tGT:GQ:DP\t${gt}:99:65`,
+    );
   }
 
   // 2. Generate 500 realistic background polymorphic SNPs across chromosomes chr1-chr22, chrX, chrY
@@ -76,97 +131,39 @@ function generateVcfContent(): string {
   return headerLines.concat(variantLines).join('\n') + '\n';
 }
 
-function generateClinVarTsvContent(): string {
-  const lines = [
-    'rsid\tgene\tphenotype\tclinical_significance\tevidence_note',
-  ];
-
-  for (const v of CLINICAL_BENCHMARK_VARIANTS) {
-    lines.push(`${v.rsid}\t${v.gene}\t${v.phenotype}\t${v.clinical_significance}\t${v.evidence_note}`);
-  }
-
-  return lines.join('\n') + '\n';
-}
-
-/**
- * The versioned ClinVar coordinate snapshot the serving path resolves gene symbols and rsIDs
- * against, before a single byte of user Parquet is read.
- *
- * Unlike `clinvar_benchmark.tsv` — which is keyed by rsID alone and carries no coordinates —
- * every row here declares the exact `(reference_build, chrom, pos, ref, alt)` tuple the query
- * planner needs for partition and row-group pruning, plus the snapshot version it belongs to.
- * `reference_version` and `reference_build` are pinned to the same constants the dataset
- * catalog stamps into every manifest, so a coordinate snapshot and a published dataset can
- * never silently disagree about which genome they describe.
- *
- * Contigs are written in the `chr`-prefixed spelling the source VCF uses; the resolver
- * normalizes them to the `1`..`22`/`X`/`Y`/`MT` partition-value domain at read time.
- *
- * The output is deterministic: same input, same bytes, so the fixture can be committed and
- * regenerated without churn.
- */
-function generateClinVarCoordinatesTsvContent(): string {
-  const columns = [
-    'reference_version',
-    'reference_build',
-    'chrom',
-    'pos',
-    'rsid',
-    'ref',
-    'alt',
-    'gene',
-    'phenotype',
-    'clinical_significance',
-    'evidence_note',
-  ];
-
-  const lines = [columns.join('\t')];
-  for (const v of CLINICAL_BENCHMARK_VARIANTS) {
+function generateClinVarTsvContent(rows: readonly CoordinateRow[]): string {
+  const lines = ['rsid\tgene\tphenotype\tclinical_significance\tevidence_note'];
+  for (const row of rows) {
     lines.push(
-      [
-        REFERENCE_VERSION,
-        REFERENCE_BUILD,
-        v.chrom,
-        String(v.pos),
-        v.rsid,
-        v.ref,
-        v.alt,
-        v.gene,
-        v.phenotype,
-        v.clinical_significance,
-        v.evidence_note,
-      ].join('\t'),
+      [row.rsid, row.gene, row.phenotype, row.clinical_significance, row.evidence_note].join('\t'),
     );
   }
-
   return lines.join('\n') + '\n';
 }
 
 async function run() {
-  const vcfPath = path.resolve(process.cwd(), 'tests/fixtures/na12878_clinical_benchmark.vcf');
-  const tsvPath = path.resolve(process.cwd(), 'tests/fixtures/clinvar_benchmark.tsv');
-  const coordinatesPath = path.resolve(
-    process.cwd(),
-    'tests/fixtures/clinvar_coordinates_grch38.tsv',
+  const vcfPath = path.join(REPO_ROOT, 'tests/fixtures/na12878_clinical_benchmark.vcf');
+  const tsvPath = path.join(REPO_ROOT, 'tests/fixtures/clinvar_benchmark.tsv');
+
+  const rows = readCoordinates();
+  console.log(
+    `[Clinical Benchmark] Using ${rows.length} targets from ${path.relative(REPO_ROOT, COORDINATES_TSV)} ` +
+      `(${REFERENCE_VERSION} / ${REFERENCE_BUILD})`,
   );
 
   console.log('[Clinical Benchmark] Generating realistic NA12878 1000 Genomes VCF...');
-  const vcfData = generateVcfContent();
+  const vcfData = generateVcfContent(rows);
   fs.writeFileSync(vcfPath, vcfData, 'utf-8');
   console.log(`✔ Created VCF benchmark dataset (${vcfData.split('\n').length - 1} total variants): ${vcfPath}`);
 
   console.log('[Clinical Benchmark] Generating ClinVar clinical annotation TSV...');
-  const tsvData = generateClinVarTsvContent();
+  const tsvData = generateClinVarTsvContent(rows);
   fs.writeFileSync(tsvPath, tsvData, 'utf-8');
   console.log(`✔ Created ClinVar TSV dataset: ${tsvPath}`);
 
   console.log(
-    `[Clinical Benchmark] Generating versioned ClinVar coordinate snapshot (${REFERENCE_VERSION} / ${REFERENCE_BUILD})...`,
-  );
-  const coordinatesData = generateClinVarCoordinatesTsvContent();
-  fs.writeFileSync(coordinatesPath, coordinatesData, 'utf-8');
-  console.log(
-    `✔ Created ClinVar coordinate snapshot (${CLINICAL_BENCHMARK_VARIANTS.length} targets): ${coordinatesPath}`,
+    '  The versioned coordinate snapshot is NOT written here; it is derived from ClinVar by\n' +
+      '  scripts/generate_clinvar_reference_tsv.ts and compiled by `make reference-snapshot`.',
   );
 }
 

@@ -56,7 +56,10 @@ import type {
   DuckDbSession,
   DuckDbSessionFactory,
 } from './infrastructure/database/duckdb-session-factory.ts';
-import { RemoteDatasetUnavailableError } from './infrastructure/database/duckdb.ts';
+import {
+  ReferenceSnapshotMismatchError,
+  RemoteDatasetUnavailableError,
+} from './infrastructure/database/duckdb.ts';
 import type { GenotypeRepository } from './infrastructure/database/duckdb.ts';
 import {
   DatasetNotPublishedError,
@@ -201,7 +204,7 @@ class FakeSessionFactory implements DuckDbSessionFactory {
 function variantTarget(): VariantTarget {
   return {
     referenceBuild: 'GRCh38',
-    referenceVersion: 'demo-clinvar-grch38-v1',
+    referenceVersion: 'demo-clinvar-grch38-v2',
     chrom: '12',
     pos: 21_178_615,
     ref: 'T',
@@ -215,7 +218,7 @@ function variantTarget(): VariantTarget {
 }
 
 class FakeCoordinateResolver implements ClinVarCoordinateResolver {
-  readonly referenceVersion = 'demo-clinvar-grch38-v1';
+  readonly referenceVersion = 'demo-clinvar-grch38-v2';
   readonly referenceBuild = 'GRCh38';
 
   async resolve(): Promise<readonly VariantTarget[]> {
@@ -731,13 +734,24 @@ describe('POST /ask', () => {
 
   for (const [error, status] of [
     [new DatasetNotPublishedError(DATASET_ID), 409],
+    // A dataset ingested against an earlier coordinate snapshot. Bumping REFERENCE_VERSION makes
+    // this reachable in production, so it has to surface as a named 409 the caller can act on
+    // ("re-ingest") — never as a 500.
+    [
+      new ReferenceSnapshotMismatchError(
+        DATASET_ID,
+        "it declares reference version 'demo-clinvar-grch38-v1' but the open snapshot is " +
+          "'demo-clinvar-grch38-v2'",
+      ),
+      409,
+    ],
     [new ReferenceBuildMismatchError('GRCh37', {
       path: '/tmp/snapshot.duckdb',
-      referenceVersion: 'demo-clinvar-grch38-v1',
+      referenceVersion: 'demo-clinvar-grch38-v2',
       referenceBuild: 'GRCh38',
       rowCount: 1,
     }), 409],
-    [new TargetNotResolvableError('NOT_A_GENE', 'demo-clinvar-grch38-v1'), 422],
+    [new TargetNotResolvableError('NOT_A_GENE', 'demo-clinvar-grch38-v2'), 422],
     [new TargetNotPresentError(DATASET_ID, 'the requested coordinates'), 404],
     [new RemoteDatasetUnavailableError(DATASET_ID, 'IO Error: connection reset'), 503],
     [new QueryBudgetExceededError(10_000), 504],

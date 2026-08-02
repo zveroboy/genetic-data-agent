@@ -88,7 +88,7 @@ interface Fixture {
   readonly label: string;
   readonly datasetKey: DatasetKey;
   readonly sourceKey: string;
-  /** rs762551 (CYP1A2, chr15 74749576 A>C). */
+  /** rs762551 (CYP1A2, chr15 74749576 C>A). */
   readonly cyp1a2: { gt: string; expected: string };
   /** rs4149056 (SLCO1B1, chr12 21178615 T>C). */
   readonly slco1b1: { gt: string; expected: string };
@@ -99,14 +99,14 @@ const FIXTURES: readonly Fixture[] = [
     label: 'alpha',
     datasetKey: 'demo-small',
     sourceKey: 'samples/alpha.vcf',
-    cyp1a2: { gt: '0/0', expected: 'A/A' },
+    cyp1a2: { gt: '0/0', expected: 'C/C' },
     slco1b1: { gt: '0/0', expected: 'T/T' },
   },
   {
     label: 'beta',
     datasetKey: 'na12878-full',
     sourceKey: 'samples/beta.vcf',
-    cyp1a2: { gt: '1/1', expected: 'C/C' },
+    cyp1a2: { gt: '1/1', expected: 'A/A' },
     slco1b1: { gt: '1/1', expected: 'C/C' },
   },
 ];
@@ -119,7 +119,7 @@ function fixtureVcf(fixture: Fixture): string {
     '##fileformat=VCFv4.2\n' +
     `##source=DatasetIsolationIntegrationTest:${fixture.label}\n` +
     '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n' +
-    `15\t74749576\trs762551\tA\tC\t99\tPASS\tGENE=CYP1A2\tGT\t${fixture.cyp1a2.gt}\n` +
+    `15\t74749576\trs762551\tC\tA\t99\tPASS\tGENE=CYP1A2\tGT\t${fixture.cyp1a2.gt}\n` +
     `12\t21178615\trs4149056\tT\tC\t99\tPASS\tGENE=SLCO1B1\tGT\t${fixture.slco1b1.gt}\n` +
     MTHFR_LINE
   );

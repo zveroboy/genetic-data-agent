@@ -187,7 +187,7 @@ describe what the engine actually put on the wire:
 
 ```
 [serving-metrics] {"datasetId":"demo-small-…","datasetChecksumSha256":"…",
-  "referenceVersion":"demo-clinvar-grch38-v1","selectedFileCount":1,"inventorySize":4,
+  "referenceVersion":"demo-clinvar-grch38-v2","selectedFileCount":1,"inventorySize":4,
   "s3RequestCount":6,"bytesRead":384647,"queryLatencyMs":29}
 ```
 

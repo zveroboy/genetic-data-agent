@@ -514,7 +514,7 @@ describe('cross-language genomic ingestion (API → Temporal → Rust → S3 →
       const variant = askResponse.variants.find((entry: any) => entry.rsid === 'rs762551');
       assert.ok(variant, `no rs762551 evidence in ${JSON.stringify(askResponse.variants)}`);
       assert.equal(variant.gene, 'CYP1A2');
-      assert.equal(variant.userGenotype, 'C/C');
+      assert.equal(variant.userGenotype, 'A/A');
 
       const provenance = askResponse.provenance;
       assert.equal(provenance.datasetId, datasetId);

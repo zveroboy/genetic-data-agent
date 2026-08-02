@@ -143,7 +143,7 @@ mod temporal_activity {
             },
             reference: ReferenceSelector {
                 build: "GRCh38".to_string(),
-                version: "demo-clinvar-grch38-v1".to_string(),
+                version: "demo-clinvar-grch38-v2".to_string(),
             },
             target: ArtifactTarget {
                 bucket: "genomic-artifacts".to_string(),

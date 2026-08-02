@@ -324,7 +324,7 @@ describe('a cold, network-isolated ts-api container', () => {
     const variant = body.variants.find((entry: any) => entry.rsid === 'rs762551');
     assert.ok(variant, `no rs762551 evidence in ${JSON.stringify(body.variants)}`);
     assert.equal(variant.gene, 'CYP1A2');
-    assert.equal(variant.userGenotype, 'C/C');
+    assert.equal(variant.userGenotype, 'A/A');
 
     // The provenance must name the dataset that was actually ingested — the container read the
     // real published manifest, not something baked into the image.

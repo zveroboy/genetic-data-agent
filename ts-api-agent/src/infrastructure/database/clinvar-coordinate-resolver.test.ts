@@ -45,7 +45,7 @@ describe('clinvar coordinate resolver', () => {
       referenceVersion: REFERENCE_VERSION,
       referenceBuild: REFERENCE_BUILD,
     });
-    assert.equal(snapshot.referenceVersion, 'demo-clinvar-grch38-v1');
+    assert.equal(snapshot.referenceVersion, REFERENCE_VERSION);
     assert.equal(snapshot.referenceBuild, 'GRCh38');
     assert.ok(snapshot.rowCount > 0, 'the demo reference snapshot must not be empty');
     resolver = await openClinVarCoordinateResolver({ databasePath: snapshot.path });
@@ -57,26 +57,32 @@ describe('clinvar coordinate resolver', () => {
   });
 
   it('declares the reference snapshot it was opened against', () => {
-    assert.equal(resolver.referenceVersion, 'demo-clinvar-grch38-v1');
+    assert.equal(resolver.referenceVersion, REFERENCE_VERSION);
     assert.equal(resolver.referenceBuild, 'GRCh38');
   });
 
   it('resolves a gene symbol to exact GRCh38 coordinates', async () => {
     const targets = await resolver.resolve('CYP1A2', 'GRCh38');
 
+    // Every field below is ClinVar's, not a curator's: VariationID 511079,
+    // NC_000015.10:g.74749576C>A, classified Likely benign with no condition named. The
+    // hand-written table this replaced had the alleles the other way round, which the strict
+    // `(build, chrom, pos, ref, alt)` join turned into a silent "no clinical variant data".
     assert.deepEqual(targets, [
       {
         referenceBuild: 'GRCh38',
-        referenceVersion: 'demo-clinvar-grch38-v1',
+        referenceVersion: REFERENCE_VERSION,
         chrom: '15',
         pos: 74749576,
-        ref: 'A',
-        alt: 'C',
+        ref: 'C',
+        alt: 'A',
         rsid: 'rs762551',
         gene: 'CYP1A2',
-        phenotype: 'Slow caffeine metabolizer',
-        clinicalSignificance: 'Risk Factor',
-        evidenceNote: 'Decreased CYP1A2 enzyme activity; slower clearance of caffeine.',
+        phenotype: 'No condition named in ClinVar for this variant',
+        clinicalSignificance: 'Likely benign',
+        evidenceNote:
+          'ClinVar VariationID 511079; review status: criteria provided, multiple submitters, ' +
+          'no conflicts; gene CYP1A2; 1000 Genomes allele frequency 0.62979.',
       },
     ]);
   });
@@ -166,7 +172,7 @@ describe('clinvar coordinate resolver', () => {
       assert.ok(error instanceof TargetNotResolvableError, `unexpected error for ${unknown}: ${error}`);
       assert.equal(error.name, 'TargetNotResolvable');
       assert.equal(error.targetId, unknown);
-      assert.equal(error.referenceVersion, 'demo-clinvar-grch38-v1');
+      assert.equal(error.referenceVersion, REFERENCE_VERSION);
     }
   });
 

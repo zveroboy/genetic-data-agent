@@ -425,8 +425,10 @@ mod vcf {
         assert_eq!(parsed[0].chrom, "15");
         assert_eq!(parsed[0].pos, 74_749_576);
         assert_eq!(parsed[0].rsid.as_deref(), Some("rs762551"));
-        assert_eq!(parsed[0].ref_allele, "A");
-        assert_eq!(parsed[0].alt_allele, "C");
+        // GRCh38 chr15:74749576 is C>A in ClinVar (VariationID 511079); the fixture used to
+        // carry the complementary pair, which the strict coordinate join could never match.
+        assert_eq!(parsed[0].ref_allele, "C");
+        assert_eq!(parsed[0].alt_allele, "A");
         assert_eq!(parsed[0].gt_raw, "1/1");
         assert_eq!(
             parsed.iter().map(|variant| variant.chrom.as_str()).collect::<Vec<_>>(),

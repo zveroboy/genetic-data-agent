@@ -30,7 +30,7 @@ const RESULT: GenotypeQueryResult = {
     datasetId: 'ds-serving-001',
     datasetChecksumSha256: 'a'.repeat(64),
     referenceBuild: 'GRCh38',
-    referenceVersion: 'demo-clinvar-grch38-v1',
+    referenceVersion: 'demo-clinvar-grch38-v2',
     filesScanned: ['s3://genomic-artifacts/datasets/ds-serving-001/…/chrom=12/part-000.parquet'],
     targetsResolved: 1,
   },
@@ -71,7 +71,7 @@ describe('query_genotype tool', () => {
     })) as GenotypeQueryResult;
 
     assert.equal(result.provenance.datasetChecksumSha256, 'a'.repeat(64));
-    assert.equal(result.provenance.referenceVersion, 'demo-clinvar-grch38-v1');
+    assert.equal(result.provenance.referenceVersion, 'demo-clinvar-grch38-v2');
     assert.equal(result.provenance.filesScanned.length, 1);
     assert.doesNotThrow(() => JSON.stringify(result));
   });
