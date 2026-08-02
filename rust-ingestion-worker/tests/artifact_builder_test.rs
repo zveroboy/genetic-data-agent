@@ -19,7 +19,7 @@ use rust_ingestion_worker::artifact::{
 use rust_ingestion_worker::contracts::{
     FailureType, PARQUET_SCHEMA_FINGERPRINT, SORT_ORDER, VARIANTS_SEGMENT,
 };
-use rust_ingestion_worker::models::{ProgressEvent, ProgressSink};
+use rust_ingestion_worker::models::{NoopProgressSink, ProgressEvent, ProgressSink};
 use rust_ingestion_worker::vcf::{
     normalize_chromosome, open_vcf, RejectionReason, VcfRecord, VcfRecordReader,
 };
@@ -300,6 +300,35 @@ mod vcf {
         encoder.finish().expect("finish gz");
 
         assert_eq!(variants(&gzipped), variants(&demo_vcf_path()));
+    }
+
+    /// `bgzip` writes a *concatenation* of independent gzip members rather than one stream, so
+    /// the reader uses `MultiGzDecoder`. A plain `GzDecoder` stops after the first member and
+    /// would silently truncate a BGZF VCF to its first block, which is why this is tested
+    /// separately from the single-member case above.
+    #[test]
+    fn reads_every_member_of_a_multi_member_gzipped_vcf() {
+        let directory = TempDir::new().expect("temp dir");
+        let path = directory.path().join("multi_member.vcf.gz");
+
+        let first = gzip_member(&format!("{VCF_HEADER}{}", data_line("1", 100, "rs1", "A", "C", "0/1")));
+        let second = gzip_member(
+            &[
+                data_line("2", 200, "rs2", "G", "T", "1|1"),
+                data_line("X", 300, "rs3", "C", "A", "0/1"),
+            ]
+            .concat(),
+        );
+        assert_ne!(second.len(), 0);
+        std::fs::write(&path, [first, second].concat()).expect("write concatenated members");
+
+        let parsed = variants(&path);
+        assert_eq!(
+            parsed.iter().map(|variant| variant.chrom.as_str()).collect::<Vec<_>>(),
+            ["1", "2", "X"],
+            "a second gzip member must not be silently dropped"
+        );
+        assert_eq!(parsed[2].pos, 300);
     }
 
     /// Gzip is detected from the magic bytes, not the file extension.
@@ -591,6 +620,112 @@ mod artifact_builder {
         assert_eq!(error.failure_type(), FailureType::InvalidVcfFormat);
     }
 
+    /// A source that is not there is an environment problem, not a malformed VCF. Classifying
+    /// it as `InvalidVcfFormat` would permanently fail the workflow on a transient fault and
+    /// tell the user their file is broken when it is not.
+    #[test]
+    fn a_missing_source_file_is_a_retryable_write_failure_not_an_invalid_vcf() {
+        let directory = TempDir::new().expect("temp dir");
+        let missing = directory.path().join("never_downloaded.vcf");
+
+        let error = build_in(&directory, &missing, &RecordingProgressSink::default(), 1_000)
+            .expect_err("a missing source cannot produce a dataset");
+        assert_eq!(error.failure_type(), FailureType::ArtifactWriteFailed);
+        assert!(error.failure_type().is_retryable(), "a missing scratch file must be retryable");
+    }
+
+    /// The same argument for a source the process cannot open.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_source_file_is_a_retryable_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TempDir::new().expect("temp dir");
+        let source = write_vcf(directory.path(), "locked.vcf", &data_line("1", 100, "rs1", "A", "C", "0/1"));
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if File::open(&source).is_ok() {
+            // Running as root, where the mode is not enforced. The unit test over
+            // `io::ErrorKind::PermissionDenied` still covers the classification.
+            return;
+        }
+
+        let error = build_in(&directory, &source, &RecordingProgressSink::default(), 1_000)
+            .expect_err("an unreadable source cannot produce a dataset");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).expect("restore");
+
+        assert_eq!(error.failure_type(), FailureType::ArtifactWriteFailed);
+        assert!(error.failure_type().is_retryable(), "a permission error must be retryable");
+    }
+
+    /// The other direction: a damaged gzip member is a property of the bytes, so it stays a
+    /// non-retryable `InvalidVcfFormat` even though it surfaces as an `io::Error`.
+    #[test]
+    fn a_corrupt_gzip_source_is_a_non_retryable_invalid_vcf() {
+        let directory = TempDir::new().expect("temp dir");
+        let source = directory.path().join("corrupt.vcf.gz");
+        let body: String = (1..200)
+            .map(|pos| data_line("1", pos, "rs1", "A", "C", "0/1"))
+            .collect();
+        std::fs::write(&source, corrupt_gzip(&format!("{VCF_HEADER}{body}"))).expect("write corrupt gz");
+
+        let error = build_in(&directory, &source, &RecordingProgressSink::default(), 1_000)
+            .expect_err("a corrupt gzip stream cannot produce a dataset");
+        assert_eq!(error.failure_type(), FailureType::InvalidVcfFormat);
+        assert!(
+            !error.failure_type().is_retryable(),
+            "corruption is deterministic; retrying the same bytes cannot help"
+        );
+    }
+
+    /// The contract's sort order is `(chrom, pos, ref, alt)`, but every other fixture uses
+    /// distinct positions, so the `ref`/`alt` tiebreak would be unexercised. These records
+    /// share a position, differ only in `ref`/`alt`, and are written in descending key order,
+    /// so an export that sorted by `pos` alone would emit them in the wrong order.
+    #[test]
+    fn orders_records_sharing_a_position_by_the_ref_and_alt_tiebreak() {
+        let directory = TempDir::new().expect("temp dir");
+        let body = [
+            data_line("1", 500, "rs_e", "T", "G", "0/1"),
+            data_line("1", 500, "rs_d", "G", "T", "0/1"),
+            data_line("1", 500, "rs_c", "A", "T", "0/1"),
+            data_line("1", 500, "rs_b", "A", "G", "0/1"),
+            data_line("1", 500, "rs_a", "A", "C", "0/1"),
+            data_line("1", 100, "rs_first", "C", "A", "0/1"),
+        ]
+        .concat();
+        let source = write_vcf(directory.path(), "tied_positions.vcf", &body);
+
+        let (stats, parquet_dir) =
+            build_in(&directory, &source, &RecordingProgressSink::default(), 1_000)
+                .expect("build succeeds");
+        assert_eq!(stats.variant_count, 6);
+        assert_eq!(stats.local_parquet_files.len(), 1);
+
+        let connection = Connection::open_in_memory().expect("connection");
+        let quoted = sql_path(&parquet_dir.join(&stats.local_parquet_files[0].relative_path));
+        let mut statement = connection
+            .prepare(&format!("SELECT pos, ref, alt FROM read_parquet('{quoted}')"))
+            .expect("prepare");
+        let emitted: Vec<(u32, String, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("rows")
+            .map(|row| row.expect("row"))
+            .collect();
+
+        assert_eq!(
+            emitted,
+            [
+                (100, "C".to_string(), "A".to_string()),
+                (500, "A".to_string(), "C".to_string()),
+                (500, "A".to_string(), "G".to_string()),
+                (500, "A".to_string(), "T".to_string()),
+                (500, "G".to_string(), "T".to_string()),
+                (500, "T".to_string(), "G".to_string()),
+            ],
+            "rows sharing a position must be ordered by (ref, alt)"
+        );
+    }
+
     #[test]
     fn commits_dataset_metadata_to_the_staging_database() {
         let directory = TempDir::new().expect("temp dir");
@@ -762,6 +897,74 @@ mod artifact_builder {
         assert_eq!(SORT_ORDER, ["chrom", "pos", "ref", "alt"]);
     }
 
+    /// Evidence for the `hive_types_autocast = 0` clause in `contracts/ingestion-v1.md`.
+    ///
+    /// `hive_partitioning = true` on its own does **not** give `chrom` a stable type: DuckDB
+    /// infers it by trying to cast the partition values it actually scanned, so the very same
+    /// dataset presents `chrom` as `BIGINT` or `VARCHAR` depending on which files the scan
+    /// touched. A consumer that then writes `chrom = 'X'` gets a hard conversion error rather
+    /// than an empty result. Passing `hive_types_autocast = 0` pins it to `VARCHAR` in every
+    /// case, which is what the contract requires of both languages.
+    #[test]
+    fn hive_partitioning_alone_gives_chrom_an_unstable_type() {
+        let autosomes_only = TempDir::new().expect("temp dir");
+        let autosomes = build_partitions(&autosomes_only, &["1", "2", "12"]);
+        let with_allosomes = TempDir::new().expect("temp dir");
+        let mixed = build_partitions(&with_allosomes, &["1", "2", "12", "X", "Y", "MT"]);
+
+        let connection = Connection::open_in_memory().expect("connection");
+        let whole = |root: &Path| sql_path(&root.join("**").join("*.parquet"));
+        // A subset scan of the mixed dataset that happens to select only autosomes.
+        let autosome_subset = sql_path(&mixed.join("chrom=1*").join("*.parquet"));
+
+        // A single-file scan of one autosome partition of the very same mixed dataset.
+        let one_autosome = sql_path(&mixed.join("chrom=12").join("part-000.parquet"));
+
+        // --- without the option: the type follows the data that happened to be scanned -------
+        assert_eq!(hive_chrom_type(&connection, &whole(&autosomes), HIVE_ONLY), "BIGINT");
+        // The same dataset presents chrom differently depending only on how much of it is read.
+        assert_eq!(hive_chrom_type(&connection, &whole(&mixed), HIVE_ONLY), "VARCHAR");
+        assert_eq!(hive_chrom_type(&connection, &autosome_subset, HIVE_ONLY), "BIGINT");
+        assert_eq!(hive_chrom_type(&connection, &one_autosome, HIVE_ONLY), "BIGINT");
+
+        // --- with the option: VARCHAR everywhere, which is the contract ---------------------
+        for target in [whole(&autosomes), whole(&mixed), autosome_subset.clone(), one_autosome] {
+            for options in [HIVE_TYPED, HIVE_DECLARED] {
+                assert_eq!(
+                    hive_chrom_type(&connection, &target, options),
+                    "VARCHAR",
+                    "'{options}' must pin chrom to VARCHAR for '{target}'"
+                );
+            }
+        }
+
+        // --- the consequence a query layer would actually hit --------------------------------
+        let predicate = |options: &str| {
+            connection
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM read_parquet('{}', {options}) WHERE chrom = 'X'",
+                        whole(&autosomes)
+                    ),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| error.to_string())
+        };
+        let failure = predicate(HIVE_ONLY)
+            .expect_err("a BIGINT chrom cannot be compared with 'X'");
+        assert!(
+            failure.contains("Conversion Error") && failure.contains('X'),
+            "expected a conversion error, got: {failure}"
+        );
+        assert_eq!(
+            predicate(HIVE_TYPED),
+            Ok(0),
+            "with the option the same predicate is simply an empty result"
+        );
+        assert_eq!(predicate(HIVE_DECLARED), Ok(0), "the explicit declaration behaves the same");
+    }
+
     /// A partition larger than `ROW_GROUP_SIZE` is split, proving the setting reached DuckDB
     /// rather than falling back to its larger default.
     #[test]
@@ -853,6 +1056,57 @@ fn string_column(connection: &Connection, sql: &str) -> Vec<String> {
         .expect("rows")
         .map(|value| value.expect("value"))
         .collect()
+}
+
+/// The `read_parquet` option sets `contracts/ingestion-v1.md` distinguishes: the one it
+/// forbids, the one it mandates, and the explicit declaration it accepts as equivalent.
+const HIVE_ONLY: &str = "hive_partitioning = true";
+const HIVE_TYPED: &str = "hive_partitioning = true, hive_types_autocast = 0";
+const HIVE_DECLARED: &str = "hive_partitioning = true, hive_types = {'chrom': 'VARCHAR'}";
+
+/// Exports a one-record-per-chromosome dataset and returns its export root.
+fn build_partitions(directory: &TempDir, chroms: &[&str]) -> PathBuf {
+    let body: String = chroms
+        .iter()
+        .enumerate()
+        .map(|(index, chrom)| data_line(chrom, 100 + index as u32, "rs1", "A", "C", "0/1"))
+        .collect();
+    let source = write_vcf(directory.path(), "partitions.vcf", &body);
+    let (_, parquet_dir) = build_in(directory, &source, &NoopProgressSink, 100).expect("build");
+    parquet_dir
+}
+
+/// The DuckDB type `read_parquet` gives the reconstructed `chrom` column under `options`.
+fn hive_chrom_type(connection: &Connection, target: &str, options: &str) -> String {
+    let mut statement = connection
+        .prepare(&format!("DESCRIBE SELECT * FROM read_parquet('{target}', {options})"))
+        .expect("describe");
+    statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .expect("describe rows")
+        .map(|row| row.expect("describe row"))
+        .find(|(name, _)| name == "chrom")
+        .map(|(_, column_type)| column_type)
+        .expect("chrom must be reconstructed from the partition directory")
+}
+
+/// One self-contained gzip member. Concatenating several of these is what `bgzip` produces.
+fn gzip_member(text: &str) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(text.as_bytes()).expect("compress");
+    encoder.finish().expect("finish member")
+}
+
+/// A gzip stream with an intact header and a damaged deflate payload: the failure is in the
+/// bytes, so it is deterministic and must never be retried.
+fn corrupt_gzip(text: &str) -> Vec<u8> {
+    let mut bytes = gzip_member(text);
+    // The first ten bytes are the gzip header, which must stay valid so the corruption is
+    // discovered mid-stream rather than at open time.
+    for byte in bytes.iter_mut().skip(12).take(8) {
+        *byte ^= 0xff;
+    }
+    bytes
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

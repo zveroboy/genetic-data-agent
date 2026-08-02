@@ -11,7 +11,7 @@
 //! `contracts/ingestion-v1.md` and is verified against the golden cross-language fixture.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use duckdb::{params, Connection};
@@ -39,6 +39,17 @@ pub const DEFAULT_BATCH_SIZE: usize = 10_000;
 
 /// The partition directory prefix. `=` appears in an object key only here.
 const PARTITION_PREFIX: &str = "chrom=";
+
+/// The contract's Parquet file name is `part-NNN.parquet`: this prefix, then exactly
+/// [`PART_FILE_DIGITS`] ASCII digits, then this extension.
+const PART_FILE_PREFIX: &str = "part-";
+const PART_FILE_SUFFIX: &str = ".parquet";
+const PART_FILE_DIGITS: usize = 3;
+
+/// One past the largest index `part-NNN` can express. A partition holding more files than this
+/// cannot be named under the contract, so it is refused rather than silently widened to
+/// `part-1000.parquet`.
+const MAX_PARTITION_FILES: usize = 1_000;
 
 /// What the processor needs to build one dataset. Purely local paths and provenance.
 #[derive(Debug, Clone)]
@@ -233,9 +244,8 @@ fn stage_variants(
     batch_size: usize,
     progress: &dyn ProgressSink,
 ) -> Result<StagingCounts, ArtifactError> {
-    let mut reader = open_vcf(&request.source_path).map_err(|error| {
-        ArtifactError::InvalidVcf(format!("cannot read {}: {error}", request.source_path.display()))
-    })?;
+    let mut reader = open_vcf(&request.source_path)
+        .map_err(|error| classify_source_error(&request.source_path, &error))?;
 
     progress.report(&ProgressEvent::phase(IngestionPhase::Parsing));
 
@@ -243,9 +253,7 @@ fn stage_variants(
     let mut batch: Vec<UserVariant> = Vec::with_capacity(batch_size);
 
     while let Some(record) = reader.next() {
-        match record.map_err(|error| {
-            ArtifactError::InvalidVcf(format!("cannot read {}: {error}", request.source_path.display()))
-        })? {
+        match record.map_err(|error| classify_source_error(&request.source_path, &error))? {
             VcfRecord::Variant(variant) => batch.push(variant),
             VcfRecord::Rejected { .. } => counts.rejected += 1,
         }
@@ -261,6 +269,34 @@ fn stage_variants(
         flush_batch(staging, &mut batch, &mut counts, progress)?;
     }
     Ok(counts)
+}
+
+/// Decides whether an I/O failure while reading the source is a property of the *bytes* or of
+/// the *environment*, because the two get opposite retry treatment.
+///
+/// A corrupt gzip member, a truncated one and a stream that is not valid UTF-8 are
+/// deterministic: the same source reproduces them exactly, so they are genuine
+/// [`FailureType::InvalidVcfFormat`] and must not be retried. Everything else — the scratch
+/// file is missing, the directory is not readable, the disk the download landed on returned
+/// `EIO` — says nothing at all about the user's VCF. Reporting those as `InvalidVcfFormat`
+/// would permanently fail the workflow on a transient fault *and* misdiagnose it as malformed
+/// input, so they map onto the retryable [`FailureType::ArtifactWriteFailed`] instead.
+///
+/// The kinds are enumerated positively: an unrecognised kind is treated as transient, which is
+/// the safe direction (a retry that fails again is cheap, a wrongly permanent failure is not).
+fn classify_source_error(path: &Path, error: &io::Error) -> ArtifactError {
+    match error.kind() {
+        // `flate2` reports a corrupt deflate stream or a bad gzip header as `InvalidInput` and
+        // a member that ends early as `UnexpectedEof`; `BufRead::read_line` reports non-UTF-8
+        // input as `InvalidData`. All three are content, not environment.
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {
+            ArtifactError::InvalidVcf(format!("cannot decode {}: {error}", path.display()))
+        }
+        _ => ArtifactError::WriteFailed(format!(
+            "cannot read the local source {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 /// Appends one bounded batch through the DuckDB appender and clears it.
@@ -345,7 +381,7 @@ fn rename_partition_files(output_dir: &Path) -> Result<(), ArtifactError> {
         files.sort_by_key(|path| (trailing_index(path), path.clone()));
 
         for (index, file) in files.iter().enumerate() {
-            let renamed = partition.join(format!("part-{index:03}.parquet"));
+            let renamed = partition.join(part_file_name(index, &partition)?);
             if *file != renamed {
                 std::fs::rename(file, &renamed).map_err(|error| {
                     ArtifactError::WriteFailed(format!(
@@ -358,6 +394,53 @@ fn rename_partition_files(output_dir: &Path) -> Result<(), ArtifactError> {
         }
     }
     Ok(())
+}
+
+/// The contract's `part-NNN.parquet` name for the `index`-th file of a partition.
+///
+/// `{index:03}` pads but does not truncate, so index 1000 would silently produce
+/// `part-1000.parquet` and break the frozen `NNN` shape — and with it `relativePath`, which the
+/// cross-language dataset checksum is computed from. DuckDB writes one file per partition
+/// today, so this is unreachable; it fails loudly rather than degrading quietly if that ever
+/// changes.
+fn part_file_name(index: usize, partition: &Path) -> Result<String, ArtifactError> {
+    if index >= MAX_PARTITION_FILES {
+        return Err(ArtifactError::ValidationFailed(format!(
+            "partition '{}' produced more than {MAX_PARTITION_FILES} Parquet files; the \
+             contract's '{PART_FILE_PREFIX}NNN{PART_FILE_SUFFIX}' name cannot express index {index}",
+            partition.display()
+        )));
+    }
+    Ok(format!(
+        "{PART_FILE_PREFIX}{index:0width$}{PART_FILE_SUFFIX}",
+        width = PART_FILE_DIGITS
+    ))
+}
+
+/// Whether a file name is exactly the contract's `part-NNN.parquet` shape.
+fn is_canonical_part_name(name: &str) -> bool {
+    let Some(digits) = name
+        .strip_prefix(PART_FILE_PREFIX)
+        .and_then(|rest| rest.strip_suffix(PART_FILE_SUFFIX))
+    else {
+        return false;
+    };
+    digits.len() == PART_FILE_DIGITS && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The `chrom=<value>/part-NNN.parquet` descriptor for one exported file.
+///
+/// The name is taken from disk but not trusted: `relative_path` is the single string the
+/// cross-language dataset checksum is most sensitive to, so its shape is asserted here rather
+/// than assumed from the fact that [`rename_partition_files`] just ran.
+fn canonical_relative_path(directory_name: &str, name: &str) -> Result<String, ArtifactError> {
+    if !is_canonical_part_name(name) {
+        return Err(ArtifactError::ValidationFailed(format!(
+            "'{directory_name}/{name}' is not a '{PART_FILE_PREFIX}NNN{PART_FILE_SUFFIX}' file; \
+             the relative path shape is frozen because the dataset checksum is computed from it"
+        )));
+    }
+    Ok(format!("{directory_name}/{name}"))
 }
 
 /// The integer at the end of a file stem, used only to order DuckDB's `data_N` output.
@@ -419,7 +502,7 @@ fn validate_export(
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| ArtifactError::ValidationFailed("non-UTF-8 Parquet file".to_string()))?
                 .to_string();
-            let relative_path = format!("{directory_name}/{name}");
+            let relative_path = canonical_relative_path(directory_name, &name)?;
             files.push(describe_parquet_file(&connection, &file, chrom, relative_path)?);
 
             progress.report(&ProgressEvent {
@@ -450,6 +533,46 @@ fn validate_export(
     Ok(files)
 }
 
+/// The sort key *inside* one partition file: the frozen `sortOrder` without `chrom`, which is
+/// the partition directory rather than a physical column.
+const PHYSICAL_SORT_KEY: [&str; 3] = ["pos", "ref", "alt"];
+
+/// The sortedness check, as `(lag columns, comparison)`, built from [`PHYSICAL_SORT_KEY`] so it
+/// can never cover fewer columns than the contract's sort order.
+///
+/// The comparison is a row value over the *whole* key: comparing `pos` alone would accept an
+/// export whose `COPY` had dropped `ref, alt` from its `ORDER BY`, since any fixture with
+/// distinct positions passes either way.
+fn sortedness_expressions() -> (String, String) {
+    let lag = PHYSICAL_SORT_KEY
+        .iter()
+        .map(|column| {
+            format!(
+                "lag({column}, 1, {}) OVER () AS previous_{column}",
+                sort_key_minimum(column)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let previous = PHYSICAL_SORT_KEY
+        .iter()
+        .map(|column| format!("previous_{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    (lag, format!("({}) >= ({previous})", PHYSICAL_SORT_KEY.join(", ")))
+}
+
+/// The minimum of a sort-key column's domain, used as the `lag` default so the first row of a
+/// file always compares as in order: `pos` is a non-negative `UINTEGER`, and `ref`/`alt` are
+/// `NOT NULL` strings the parser never lets be empty.
+fn sort_key_minimum(column: &str) -> &'static str {
+    if column == "pos" {
+        "0::UINTEGER"
+    } else {
+        "''"
+    }
+}
+
 /// Validates one Parquet file against the frozen schema and collects its statistics.
 fn describe_parquet_file(
     connection: &Connection,
@@ -462,11 +585,12 @@ fn describe_parquet_file(
     assert_zstandard(connection, &quoted, &relative_path)?;
     assert_row_groups(connection, &quoted, &relative_path)?;
 
+    let (lag_columns, sorted_predicate) = sortedness_expressions();
     let (row_count, min_pos, max_pos, sorted, nulls) = connection
         .query_row(
             &format!(
-                "SELECT count(*), min(pos), max(pos), coalesce(bool_and(pos >= previous), true), {}
-                 FROM (SELECT * , lag(pos, 1, 0::UINTEGER) OVER () AS previous FROM read_parquet({quoted}))",
+                "SELECT count(*), min(pos), max(pos), coalesce(bool_and({sorted_predicate}), true), {}
+                 FROM (SELECT *, {lag_columns} FROM read_parquet({quoted}))",
                 not_null_violation_expression()
             ),
             [],
@@ -494,7 +618,7 @@ fn describe_parquet_file(
     }
     if !sorted {
         return Err(ArtifactError::ValidationFailed(format!(
-            "'{relative_path}' is not ordered by pos"
+            "'{relative_path}' is not ordered by (pos, ref, alt)"
         )));
     }
     let (Some(min_pos), Some(max_pos)) = (min_pos, max_pos) else {
@@ -747,5 +871,108 @@ mod tests {
         assert_eq!(trailing_index(Path::new("/x/data_2.parquet")), 2);
         assert_eq!(trailing_index(Path::new("/x/data_10.parquet")), 10);
         assert_eq!(trailing_index(Path::new("/x/part-007.parquet")), 7);
+    }
+
+    /// The in-file sort key is the frozen `sortOrder` minus the partition column, so the
+    /// validation predicate cannot drift away from the contract.
+    #[test]
+    fn the_physical_sort_key_is_the_frozen_sort_order_without_chrom() {
+        let expected: Vec<&str> = crate::contracts::SORT_ORDER
+            .iter()
+            .copied()
+            .filter(|column| *column != "chrom")
+            .collect();
+        assert_eq!(PHYSICAL_SORT_KEY.to_vec(), expected);
+
+        let (lag_columns, sorted_predicate) = sortedness_expressions();
+        assert_eq!(
+            lag_columns,
+            "lag(pos, 1, 0::UINTEGER) OVER () AS previous_pos, \
+             lag(ref, 1, '') OVER () AS previous_ref, \
+             lag(alt, 1, '') OVER () AS previous_alt"
+        );
+        assert_eq!(
+            sorted_predicate,
+            "(pos, ref, alt) >= (previous_pos, previous_ref, previous_alt)",
+            "the sortedness check must compare the whole sort key, not pos alone"
+        );
+    }
+
+    /// `part-NNN` cannot express a four-digit index, so it must refuse rather than widen.
+    #[test]
+    fn part_file_names_are_three_digits_and_refuse_to_widen() {
+        let partition = Path::new("/x/chrom=1");
+        assert_eq!(part_file_name(0, partition).unwrap(), "part-000.parquet");
+        assert_eq!(part_file_name(7, partition).unwrap(), "part-007.parquet");
+        assert_eq!(part_file_name(999, partition).unwrap(), "part-999.parquet");
+
+        let error = part_file_name(1_000, partition).expect_err("part-1000 breaks the NNN shape");
+        assert_eq!(error.failure_type(), FailureType::ArtifactValidationFailed);
+    }
+
+    #[test]
+    fn only_the_contract_file_name_shape_becomes_a_relative_path() {
+        assert_eq!(
+            canonical_relative_path("chrom=X", "part-000.parquet").unwrap(),
+            "chrom=X/part-000.parquet"
+        );
+
+        for rejected in [
+            "data_0.parquet",          // DuckDB's own name, if the rename were ever skipped
+            "part-0.parquet",          // unpadded
+            "part-0000.parquet",       // widened past NNN
+            "part-00a.parquet",        // not digits
+            "part-000.parquet.tmp",    // a staging leftover
+            "part-000.PARQUET",        // wrong case
+            "part-000",                // no extension
+            ".part-000.parquet",       // hidden file
+            "",
+        ] {
+            let Err(error) = canonical_relative_path("chrom=1", rejected) else {
+                panic!("'{rejected}' must not reach a relativePath");
+            };
+            assert_eq!(
+                error.failure_type(),
+                FailureType::ArtifactValidationFailed,
+                "'{rejected}' must be a validation failure"
+            );
+        }
+    }
+
+    /// Transient local I/O must stay retryable; only deterministic content problems are
+    /// `InvalidVcfFormat`.
+    #[test]
+    fn classifies_local_io_failures_as_retryable_and_content_failures_as_not() {
+        let path = Path::new("/x/source.vcf");
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Other,
+        ] {
+            let error = classify_source_error(path, &io::Error::new(kind, "boom"));
+            assert_eq!(
+                error.failure_type(),
+                FailureType::ArtifactWriteFailed,
+                "{kind:?} is environmental and must be retryable"
+            );
+            assert!(error.failure_type().is_retryable(), "{kind:?} must be retryable");
+        }
+
+        for kind in [
+            io::ErrorKind::InvalidInput,   // flate2: corrupt deflate stream / bad gzip header
+            io::ErrorKind::InvalidData,    // read_line: stream is not valid UTF-8
+            io::ErrorKind::UnexpectedEof,  // a gzip member that ends early
+        ] {
+            let error = classify_source_error(path, &io::Error::new(kind, "boom"));
+            assert_eq!(
+                error.failure_type(),
+                FailureType::InvalidVcfFormat,
+                "{kind:?} is deterministic and must not be retried"
+            );
+            assert!(!error.failure_type().is_retryable(), "{kind:?} must not be retryable");
+        }
     }
 }

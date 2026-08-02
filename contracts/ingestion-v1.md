@@ -88,8 +88,9 @@ that exact prefix, including one that omits `variants/`. The segment is named
   attempt segment is `attempt-{attempt}`: it must not become an accidental Hive column.
 - `partitionSpec` is `["chrom"]`; `sortOrder` is `["chrom", "pos", "ref", "alt"]`.
 - The physical Parquet schema is `pos`, `rsid`, `ref`, `alt`, `gt_raw`. `chrom` is not a
-  physical column: it is restored from the partition directory via
-  `read_parquet(..., hive_partitioning = true)`.
+  physical column: it is restored from the partition directory by the reader — see
+  [Reading the dataset](#reading-the-dataset) for the option set that is mandatory when doing
+  so.
 
 `schemaFingerprint` is the SHA-256 of the canonical column description
 
@@ -98,6 +99,43 @@ pos:UINTEGER:NOT NULL;rsid:VARCHAR:NULL;ref:VARCHAR:NOT NULL;alt:VARCHAR:NOT NUL
 ```
 
 which is `89e4e0a61728e9776376f7550d09426acba14bd486c68a918e66fb11d437d7de`.
+
+### Reading the dataset
+
+`chrom` is a **`VARCHAR`** on both sides of the language boundary. Its domain is `1`..`22`,
+`X`, `Y`, `MT` — the same allowlist the producer normalises to — and it is never a number,
+because `X`, `Y` and `MT` are not numbers.
+
+Every consumer that reconstructs `chrom` from the partition directory MUST therefore disable
+DuckDB's Hive type autodetection:
+
+```sql
+read_parquet('…/**/*.parquet', hive_partitioning = true, hive_types_autocast = 0)
+-- or, equivalently, an explicit declaration:
+read_parquet('…/**/*.parquet', hive_partitioning = true, hive_types = {'chrom': 'VARCHAR'})
+```
+
+`hive_partitioning = true` **on its own is not sufficient and MUST NOT be used.** With
+autocast left on, DuckDB infers the Hive column's type by attempting to cast the partition
+values that the scan actually touched, so `chrom`'s type follows the data rather than the
+schema:
+
+| Files the scan reads                                          | `hive_partitioning = true` | with `hive_types_autocast = 0` |
+| ------------------------------------------------------------- | -------------------------- | ------------------------------ |
+| A dataset whose partitions are all autosomes                   | `BIGINT`                    | `VARCHAR`                       |
+| A dataset that also has a `chrom=X`, `chrom=Y` or `chrom=MT`   | `VARCHAR`                   | `VARCHAR`                       |
+| A narrower glob or a single file selecting only autosome partitions *of that same mixed dataset* | `BIGINT` | `VARCHAR`      |
+
+The consequences are silent and scan-dependent. `WHERE chrom = 'X'` against an autosome-only
+scan raises `Conversion Error: Could not convert string 'X' to INT64` rather than returning no
+rows; `chrom` read back from such a scan arrives as a number and fails a strict string
+comparison or a `chrom`-keyed join against annotation data; and one and the same query changes
+behaviour between two datasets, or between a whole-dataset scan and a single-partition scan of
+the *identical* dataset. Nothing about this is reported as an error at read time.
+
+This is verified against the real engine by
+`rust-ingestion-worker/tests/artifact_builder_test.rs::artifact_builder::hive_partitioning_alone_gives_chrom_an_unstable_type`,
+which builds both dataset shapes and asserts every cell of the table above.
 
 ## Payloads
 

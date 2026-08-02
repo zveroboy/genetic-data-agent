@@ -5,9 +5,12 @@
 //! queue and must not grow into a second Temporal entry point.
 //!
 //! ```text
-//! rust-ingestion-worker <vcf-path> [staging-db-path] [parquet-output-dir]
+//! rust-ingestion-worker [--force-clean] <vcf-path> [staging-db-path] [parquet-output-dir]
 //! rust-ingestion-worker --query <gene-or-rsid> [staging-db-path]
 //! ```
+//!
+//! Output paths the CLI derived itself are cleared before a run. A path typed on the command
+//! line is never cleared implicitly — see [`clear_previous_run`].
 
 use anyhow::{bail, Context, Result};
 use duckdb::{params, Connection};
@@ -23,6 +26,9 @@ use rust_ingestion_worker::models::NoopProgressSink;
 
 const DEFAULT_STAGING_DB: &str = "genomic_data.duckdb";
 const DEFAULT_VCF: &str = "tests/fixtures/demo_user.vcf";
+
+/// Opt-in to clearing an output path the operator typed rather than one the CLI derived.
+const FORCE_CLEAN_FLAG: &str = "--force-clean";
 
 #[derive(Serialize)]
 struct QueryResultRow {
@@ -46,19 +52,26 @@ fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .init();
 
-    let source_path = PathBuf::from(args.get(1).cloned().unwrap_or_else(|| DEFAULT_VCF.to_string()));
-    let staging_db_path =
-        PathBuf::from(args.get(2).cloned().unwrap_or_else(|| DEFAULT_STAGING_DB.to_string()));
-    let parquet_output_dir = args
-        .get(3)
-        .map(PathBuf::from)
+    let force_clean = args.iter().skip(1).any(|argument| argument == FORCE_CLEAN_FLAG);
+    let positional: Vec<&String> =
+        args.iter().skip(1).filter(|argument| *argument != FORCE_CLEAN_FLAG).collect();
+
+    let source_path =
+        PathBuf::from(positional.first().map_or(DEFAULT_VCF, |value| value.as_str()));
+    let supplied_staging_db = positional.get(1).map(|value| PathBuf::from(value.as_str()));
+    let staging_db_path = supplied_staging_db
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_STAGING_DB));
+    let supplied_output_dir = positional.get(2).map(|value| PathBuf::from(value.as_str()));
+    let parquet_output_dir = supplied_output_dir
+        .clone()
         .unwrap_or_else(|| staging_db_path.with_extension("parquet.d"));
 
-    // The processor refuses to reuse a path, because a Temporal attempt must never append to
-    // a previous attempt's output. A debug run against explicit paths is different: the
-    // operator asked for these paths, so the CLI clears them first.
-    remove_if_present(&staging_db_path)?;
-    remove_if_present(&parquet_output_dir)?;
+    // The processor refuses to reuse a path, because a Temporal attempt must never append to a
+    // previous attempt's output. A debug run is allowed to clear the previous run first — but
+    // only for the paths this CLI derived. See `clear_previous_run`.
+    clear_previous_run(&staging_db_path, supplied_staging_db.is_some(), force_clean)?;
+    clear_previous_run(&parquet_output_dir, supplied_output_dir.is_some(), force_clean)?;
 
     let request = ArtifactBuildRequest {
         source_path,
@@ -90,9 +103,30 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn remove_if_present(path: &Path) -> Result<()> {
+/// Clears one output path from a previous debug run.
+///
+/// This calls `remove_dir_all`, so it is the one genuinely destructive thing the CLI does. A
+/// path the CLI *derived* is safe to clear: it is `<staging-db>.parquet.d` next to a database
+/// this binary also owns. A path the *operator typed* is not — `rust-ingestion-worker in.vcf
+/// out.duckdb .` would otherwise recursively erase the working directory. So a supplied path is
+/// only ever cleared with an explicit `--force-clean`, and never when it contains the process's
+/// current directory, which no debug run has any reason to delete.
+fn clear_previous_run(path: &Path, operator_supplied: bool, force_clean: bool) -> Result<()> {
     if !path.try_exists().with_context(|| format!("cannot inspect {}", path.display()))? {
         return Ok(());
+    }
+    if operator_supplied && !force_clean {
+        bail!(
+            "{} already exists. It was given on the command line, so it is not deleted \
+             implicitly; remove it yourself or re-run with {FORCE_CLEAN_FLAG}.",
+            path.display()
+        );
+    }
+    if contains_current_directory(path) {
+        bail!(
+            "refusing to recursively delete {}: it is, or contains, the current directory",
+            path.display()
+        );
     }
     if path.is_dir() {
         fs::remove_dir_all(path)
@@ -100,6 +134,18 @@ fn remove_if_present(path: &Path) -> Result<()> {
         fs::remove_file(path)
     }
     .with_context(|| format!("cannot clear the previous run's {}", path.display()))
+}
+
+/// Whether `path` is the current directory or an ancestor of it. Unresolvable paths are
+/// treated as dangerous, because that is the safe direction for a recursive delete.
+fn contains_current_directory(path: &Path) -> bool {
+    let (Ok(resolved), Ok(current)) = (fs::canonicalize(path), env::current_dir()) else {
+        return true;
+    };
+    let Ok(current) = fs::canonicalize(current) else {
+        return true;
+    };
+    current.starts_with(resolved)
 }
 
 /// Joins staged variants against the ClinVar annotation fixture. Debug-only.
@@ -179,5 +225,72 @@ fn load_annotation_fixture(conn: &Connection) {
             [],
         );
         return;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// The regression this guard exists for: `rust-ingestion-worker in.vcf out.duckdb .` must
+    /// not recursively delete the operator's working directory.
+    #[test]
+    fn refuses_to_clear_an_operator_supplied_path_without_the_flag() {
+        let directory = TempDir::new().expect("temp dir");
+        let victim = directory.path().join("precious");
+        fs::create_dir(&victim).expect("create");
+        fs::write(victim.join("keep.txt"), b"keep me").expect("seed");
+
+        let error = clear_previous_run(&victim, true, false)
+            .expect_err("a supplied path must not be deleted implicitly");
+        assert!(
+            error.to_string().contains(FORCE_CLEAN_FLAG),
+            "the error must point at the opt-in flag: {error}"
+        );
+        assert!(victim.join("keep.txt").exists(), "nothing may have been deleted");
+    }
+
+    /// A path the CLI derived itself is still cleared, so the debug workflow is unchanged.
+    #[test]
+    fn clears_a_derived_path_without_the_flag() {
+        let directory = TempDir::new().expect("temp dir");
+        let derived = directory.path().join("genomic_data.parquet.d");
+        fs::create_dir(&derived).expect("create");
+        fs::write(derived.join("part-000.parquet"), b"stale").expect("seed");
+
+        clear_previous_run(&derived, false, false).expect("a derived path is cleared");
+        assert!(!derived.exists());
+    }
+
+    #[test]
+    fn clears_an_operator_supplied_path_once_the_flag_is_given() {
+        let directory = TempDir::new().expect("temp dir");
+        let supplied = directory.path().join("explicit.d");
+        fs::create_dir(&supplied).expect("create");
+
+        clear_previous_run(&supplied, true, true).expect("--force-clean clears it");
+        assert!(!supplied.exists());
+    }
+
+    /// Even `--force-clean` does not license deleting the directory the process is running in.
+    #[test]
+    fn never_clears_the_current_directory_even_with_the_flag() {
+        let current = env::current_dir().expect("current directory");
+        let error = clear_previous_run(&current, true, true)
+            .expect_err("the current directory is never a valid output path");
+        assert!(
+            error.to_string().contains("current directory"),
+            "unexpected error: {error}"
+        );
+
+        let parent = current.parent().expect("a parent directory").to_path_buf();
+        assert!(clear_previous_run(&parent, true, true).is_err(), "nor an ancestor of it");
+    }
+
+    #[test]
+    fn a_missing_path_is_nothing_to_clear() {
+        let directory = TempDir::new().expect("temp dir");
+        clear_previous_run(&directory.path().join("absent"), true, false).expect("no-op");
     }
 }
