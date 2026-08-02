@@ -20,7 +20,8 @@
  * manifest validation, candidate selection and object verification are the production ones.
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -787,19 +788,30 @@ describe('the runtime path', () => {
   // `index.ts` would miss exactly that case, so both sources are scanned here.
   //
   // `index.ts` used to carry the closed-body reader, the provenance envelope, the error-status
-  // policy and the Node↔Hono bridge inline; they now live under `http/`. Every one of those
-  // files is concatenated into the same entry below so the two checks below still cover every
-  // byte that used to be part of `index.ts`'s text, not just what is left of it.
+  // policy and the Node↔Hono bridge inline; they now live under `http/`. That directory is
+  // walked rather than named file-by-file, so a sixth `src/http/` module added later is scanned
+  // automatically instead of silently escaping this check the way a hard-coded list would.
+  function collectHttpModules(): string[] {
+    const httpDir = fileURLToPath(new URL('./http/', import.meta.url));
+    const files: string[] = [];
+    const walk = (directory: string): void => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const full = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+        } else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts')) {
+          files.push(full);
+        }
+      }
+    };
+    walk(httpDir);
+    return files;
+  }
+
   const scannedFiles = [
     {
       name: 'index.ts',
-      urls: [
-        new URL('./index.ts', import.meta.url),
-        new URL('./http/error-status.ts', import.meta.url),
-        new URL('./http/closed-json-body.ts', import.meta.url),
-        new URL('./http/provenance-envelope.ts', import.meta.url),
-        new URL('./http/node-listener.ts', import.meta.url),
-      ],
+      urls: [new URL('./index.ts', import.meta.url), ...collectHttpModules().map((file) => new URL(`file://${file}`))],
     },
     {
       name: 'infrastructure/temporal/temporal-ingestion-client.ts',

@@ -198,11 +198,11 @@ somebody's clinical profile.
 
 | Status | Error | Meaning |
 | --- | --- | --- |
-| 400 | `UnknownDatasetKey`, `MissingDatasetId`, `MissingQuestion`, `MalformedRequestBody`, `UnrecognizedRequestField` | the request named something the API does not accept |
+| 400 | `UnknownDatasetKey`, `MissingDatasetId`, `MissingQuestion`, `MalformedRequestBody`, `UnrecognizedRequestField`, `DatasetResolutionFailed` (`DATASET_ID_UNSAFE`) | the request named something the API does not accept — including a dataset id that is not a single safe path segment, which never named a dataset in the first place |
 | 404 | `IngestionRunNotFound`, `TargetNotPresent` | no such run; or the dataset provably does not contain the target |
-| 409 | `DatasetNotPublished`, `ObjectVerificationFailed`, `ReferenceSnapshotMismatch`, `DatasetResolutionFailed` | the dataset exists as an id but cannot be served as published |
-| 422 | `TargetNotResolvable` | the reference snapshot cannot place the gene or rsID |
-| 503 | `IngestionServiceUnavailable`, `RemoteDatasetUnavailable`, `HttpfsExtensionUnavailable` | an upstream gave out; retryable |
+| 409 | `DatasetNotPublished`, `ObjectVerificationFailed`, `ReferenceSnapshotMismatch`, `ReferenceBuildMismatch`, `DatasetPublicationConflict`, `DatasetResolutionFailed` (any other code) | the dataset exists as an id but cannot be served as published |
+| 422 | `TargetNotResolvable`, `TargetResolutionLimitExceeded` | the reference snapshot cannot place the gene or rsID, or resolves it to more coordinates than one query may return |
+| 503 | `IngestionServiceUnavailable`, `RemoteDatasetUnavailable`, `ReferenceSnapshotUnavailable`, `HttpfsExtensionUnavailable` | an upstream gave out; retryable |
 | 504 | `QueryBudgetExceeded`, `SessionConfigurationTimedOut` | the query deadline fired |
 
 ---
@@ -309,7 +309,8 @@ curl -sS -X POST localhost:3000/ask -H 'content-type: application/json' \
 | --- | --- | --- |
 | `PORT` | `3000` | API |
 | `TEMPORAL_HOST` | `localhost:7233` | API, control-plane Worker |
-| `TEMPORAL_ADDRESS` / `TEMPORAL_NAMESPACE` | `localhost:7233` / `default` | Rust Worker |
+| `TEMPORAL_ADDRESS` | `localhost:7233` | Rust Worker |
+| `TEMPORAL_NAMESPACE` | `default` | Rust Worker, control-plane Worker (`worker.ts`) |
 | `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` | — (required) | all three |
 | `S3_REGION`, `S3_FORCE_PATH_STYLE` | `us-east-1`, `true` | all three |
 | `S3_ARTIFACT_BUCKET` | `genomic-artifacts` | API, control-plane Worker |
@@ -326,21 +327,27 @@ curl -sS -X POST localhost:3000/ask -H 'content-type: application/json' \
 ## 5. Tests
 
 ```bash
-npm test                  # TypeScript unit tests + Rust unit tests; no infrastructure
+npm test                  # TS unit tests + Rust unit tests + typecheck of tests/integration/**; no infrastructure
 npm run test:integration  # MinIO + a Temporal dev server + the real Rust worker + Docker
 ```
 
 `npm test` needs `cargo` on `PATH`; rustup installs it outside a login shell's path on some
 machines (`export PATH="$(rustup which cargo | xargs dirname):$PATH"`).
 
+The 12 MinIO-backed Rust object-store adapter tests in
+`rust-ingestion-worker/tests/minio_object_store_test.rs` are `#[ignore]`d by `cargo test` for
+hermeticity; run them with `make test-rust-integration` (brings up MinIO itself) — `make
+test-integration` runs this before the suites below.
+
 | Suite | Proves |
 | --- | --- |
-| `cross_language_ingestion` | the whole slice from `POST /api/ingestions` to `/ask`; that the manifest was written only after every declared object existed; that every partition of a 3.9M-variant ingest is *physically* sorted by `(pos, ref, alt)` |
+| `cross_language_ingestion` | the whole slice from `POST /api/ingestions` to `/ask`; that the manifest was written only after every declared object existed; that every partition of the `na12878-full` ingest — the real 3,893,341-variant GIAB VCF when `data/na12878_hg001.vcf.gz` is present, otherwise a synthetic source of comparable volume (see the note below the suite table) — is *physically* sorted by `(pos, ref, alt)` |
 | `dataset_isolation` | two datasets with opposite genotypes never leak a row, a URI or an S3 request into each other; a corrupted or removed partition is an explicit refusal, not partial evidence |
-| `remote_parquet_pruning` | from an HTTP proxy's request log: a chromosome-12 target reads one object, part of it, and never touches chromosome 1 |
+| `remote_parquet_probe` | feasibility gate: an in-memory DuckDB session can query an explicit remote S3 Parquet URI with `chrom`/`pos` predicates, pruned, without downloading the whole object |
+| `remote_parquet_pruning` | from an HTTP proxy's request log: a chromosome-12 target reads one object, part of it, and never touches chromosome 1 or 15 |
 | `offline_container_serving` | a cold container with no route off the host answers `/ask` from remote Parquet |
 | `temporal_rust_probe` | retry and cancellation semantics against real Temporal history |
-| `serving-invariants` (unit) | the *absence* of a second way to answer across `ts-api-agent/src` and `rust-ingestion-worker/src`: no local database, no glob, no fixture fallback, no subprocess, no bare `hive_partitioning`. `tests/integration/**` is outside both collections and is not swept. |
+| `serving-invariants` (unit) | the *absence* of a second way to answer across `ts-api-agent/src` and `rust-ingestion-worker/src`: no local database, no glob, no fixture fallback, no subprocess, no bare `hive_partitioning`. `tests/integration/**` is outside both collections and is not swept — it is typechecked instead (`tsconfig.integration.json`, run by `npm test`). |
 
 Every suite creates its own buckets under a per-run name and removes exactly those. None of them
 deletes anything it did not create.

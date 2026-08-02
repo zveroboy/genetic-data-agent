@@ -37,7 +37,9 @@ The client sends only the catalog key. Arbitrary S3 URIs, HTTP URLs, filesystem 
 
 ### Test-only data
 
-`na12878_clinical_benchmark.vcf` is a synthetic clinical-patient fixture. It must not be presented as a real NA12878-derived clinical truth dataset.
+`na12878_clinical_benchmark.vcf` is a synthetic clinical-patient fixture, generated on demand by
+`scripts/generate_clinical_benchmark_vcf.ts` rather than committed to the repository. It must not
+be presented as a real NA12878-derived clinical truth dataset.
 
 ## Components
 

@@ -60,6 +60,11 @@
 - `rust-ingestion-worker/src/bin/temporal_worker.rs` — activity-only Worker bootstrap.
 - `rust-ingestion-worker/src/main.rs` — retain only explicit CLI/debug behavior; do not masquerade as a Temporal worker.
 
+> This section records the plan's original intent and file names, not the current tree. `8d91375`
+> later split `src/artifact.rs` into `src/artifact/{mod,staging,export,validate,checksum,layout}.rs`,
+> `src/temporal_activities.rs` into `src/temporal_activities/{mod,attempt,heartbeat,inventory}.rs`,
+> and `src/models.rs` into `src/models/mod.rs`, along their named seams.
+
 ### Integration and operations
 
 - `tests/integration/cross_language_ingestion.test.ts` — TS Workflow to Rust Activity proof.
@@ -302,6 +307,9 @@ git commit -m "feat: define versioned ingestion contracts"
 - Modify: `rust-ingestion-worker/Cargo.toml`
 - Delete after migration: `rust-ingestion-worker/src/activities/mod.rs`
 
+(`src/artifact.rs` and `src/models.rs` above record this task's original file names; `8d91375`
+later split each along its named seam — see the note under "Rust data plane" in File Structure.)
+
 **Interfaces:**
 - Consumes: `ArtifactBuildRequest { source_path, staging_db_path, parquet_output_dir, dataset_id, source_etag }`.
 - Produces: `ArtifactStats { dataset_checksum_sha256, local_parquet_files, variant_count, rejected_record_count, reference_build }`, where each local descriptor has `relative_path`, `chrom`, checksum, size, row count, min/max positions, and schema fingerprint but no S3 key or ETag.
@@ -477,6 +485,9 @@ git commit -m "feat: add versioned S3 artifact publication"
 - Remove: `rust-ingestion-worker/src/bin/temporal_probe_worker.rs`
 - Remove: `ts-api-agent/src/application/temporal_probe_workflow.ts`
 - Remove: `ts-api-agent/src/application/temporal_probe_worker.ts`
+
+(`src/temporal_activities.rs` above records this task's original file name; `8d91375` later
+split it along its named seam — see the note under "Rust data plane" in File Structure.)
 
 **Interfaces:**
 - Consumes: `BuildDatasetArtifactInput` from Task 2.

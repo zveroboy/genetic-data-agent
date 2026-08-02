@@ -310,6 +310,7 @@ Enforced by `assertCanonicalArtifactInventory` before anything is published or q
 | `ATTEMPT_PREFIX_OUTSIDE_ALLOWED_PREFIX` | An attempt prefix not strictly below the allowed prefix.     |
 | `KEY_OUTSIDE_ALLOWED_PREFIX`            | An object key outside `{attemptPrefix}variants/`, including one omitting `variants/`. |
 | `BUCKET_MISMATCH`                       | A descriptor in an unexpected bucket.                        |
+| `ARTIFACT_VERSION_MISMATCH`             | An activity input targeting an artifact version this Worker does not publish. |
 | `DUPLICATE_KEY`                         | The same key declared more than once.                        |
 | `NONCANONICAL_ORDER`                    | Descriptors not ordered by `(chrom, relativePath)`.          |
 | `PARTITION_MISMATCH`                    | `chrom` contradicting the `chrom=<value>` directory.         |

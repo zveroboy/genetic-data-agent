@@ -100,7 +100,6 @@ ENV NODE_ENV=production \
 COPY --from=build --chown=node:node /app/node_modules /app/node_modules
 COPY --from=build --chown=node:node /app/package.json /app/package-lock.json /app/
 COPY --from=build --chown=node:node /app/ts-api-agent /app/ts-api-agent
-COPY --from=build --chown=node:node /app/tests/fixtures /app/tests/fixtures
 COPY --from=build --chown=node:node /app/data/reference /app/data/reference
 COPY --from=build --chown=node:node /home/node/.duckdb /home/node/.duckdb
 

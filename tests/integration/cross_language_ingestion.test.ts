@@ -479,8 +479,8 @@ describe('cross-language genomic ingestion (API → Temporal → Rust → S3 →
       ]);
       const sorted = [...relativePaths].sort((left, right) =>
         Buffer.compare(
-          Buffer.from(`${left[0]} ${left[1]}`),
-          Buffer.from(`${right[0]} ${right[1]}`),
+          Buffer.from(`${left[0]}\0${left[1]}`),
+          Buffer.from(`${right[0]}\0${right[1]}`),
         ),
       );
       assert.deepEqual(relativePaths, sorted);

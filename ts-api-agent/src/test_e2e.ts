@@ -15,6 +15,7 @@
  * `dryRunLocal` pins the deterministic answer path so the check is about the *data* — what was
  * read, from which objects, against which reference snapshot — and not about a model's wording.
  */
+import { artifactBucketFromEnv } from './application/artifact-bucket.ts';
 import { askBioinformaticsAgent } from './infrastructure/ai/agent.ts';
 import { openClinVarCoordinateResolver } from './infrastructure/database/clinvar-coordinate-resolver.ts';
 import {
@@ -29,7 +30,10 @@ import {
 } from './infrastructure/database/reference-bootstrap.ts';
 import { S3ObjectStore } from './infrastructure/object-store/s3-object-store.ts';
 
-const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET ?? 'genomic-artifacts';
+// Shared with `index.ts` and `worker.ts` via `artifactBucketFromEnv`, so this script cannot read
+// `ARTIFACT_BUCKET` while the rest of the system reads `S3_ARTIFACT_BUCKET` and silently drift
+// apart on a rename.
+const ARTIFACT_BUCKET = artifactBucketFromEnv();
 
 async function runE2eTest() {
   const datasetId = process.env.DATASET_ID;

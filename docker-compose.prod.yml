@@ -141,8 +141,15 @@ services:
 
   # Optional: `docker compose --profile literature up -d ollama`. Not part of the ingestion or
   # serving path — `search_medical_literature` degrades to "unavailable" without it.
+  #
+  # Pinned for the same reason every other image in this stack is: a floating `latest` can change
+  # what a deployment runs without a corresponding commit here. To find the current digest:
+  # `docker pull ollama/ollama:<tag>` for a candidate tag from
+  # https://hub.docker.com/r/ollama/ollama/tags, then `docker inspect ollama/ollama:<tag> --format
+  # '{{.Id}}'` and `docker run --rm ollama/ollama:<tag> --version` to confirm it before moving the
+  # pin.
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.32.5
     container_name: genomic-ollama
     profiles: ["literature"]
     restart: unless-stopped
