@@ -27,7 +27,10 @@ const execFileAsync = promisify(execFile);
 const S3_ENDPOINT = process.env.S3_ENDPOINT ?? 'http://localhost:9000';
 const S3_ACCESS_KEY = process.env.S3_ACCESS_KEY ?? 'admin';
 const S3_SECRET_KEY = process.env.S3_SECRET_KEY ?? 'password123';
-const BUCKET = 'probe';
+// Per-run bucket name: this test runs against a shared MinIO instance (the developer's own
+// docker-compose service), so it must never guess at / clobber a pre-existing "probe" bucket.
+// Each run gets its own bucket and cleans it up in `after`.
+const BUCKET = `probe-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const CHROM12_KEY = 'variants/chrom=12/part-000.parquet';
 const CHROM1_KEY = 'variants/chrom=1/part-000.parquet';
 const CHROM12_URI = `s3://${BUCKET}/${CHROM12_KEY}`;
@@ -208,7 +211,6 @@ describe('remote parquet probe (targeted S3 read feasibility gate)', () => {
       cwd: path.resolve(import.meta.dirname, '../..'),
     });
     await waitFor('minio', async () => (await fetch(`${S3_ENDPOINT}/minio/health/live`)).ok);
-    await awsS3(['s3', 'rb', `s3://${BUCKET}`, '--force']).catch(() => undefined);
     await awsS3(['s3', 'mb', `s3://${BUCKET}`]);
 
     // Build both chromosome objects locally: ZSTD, three ordered 100k-row row groups.
@@ -268,10 +270,13 @@ describe('remote parquet probe (targeted S3 read feasibility gate)', () => {
   after(async () => {
     await proxy.stop();
     if (workDir) fs.rmSync(workDir, { recursive: true, force: true });
+    // Clean up only the bucket this run created — never a pre-existing one.
+    await awsS3(['s3', 'rb', `s3://${BUCKET}`, '--force']).catch(() => undefined);
   });
 
   it('reads only the matching row group of the explicitly selected chromosome-12 object', async () => {
     const db = await openConfiguredDuckDb();
+    try {
     proxy.reset();
 
     const rows = await db.all(`
@@ -285,11 +290,26 @@ describe('remote parquet probe (targeted S3 read feasibility gate)', () => {
 
     const size = objectSize[CHROM12_KEY];
     const footerSpan: Span = { start: objectFooterStart[CHROM12_KEY], end: size };
-    const ranged = proxy.requests.filter((r) => r.rangeStart !== undefined);
+    /** DuckDB's footer probe is a single small tail window, not an arbitrary large range. */
+    const FOOTER_WINDOW_BYTES = 64 * 1024;
+
+    // Every request against the measured object must be a HEAD or a *ranged* GET. A plain
+    // full-object GET would otherwise slip past the footer/data classification below (it
+    // wouldn't be counted as either) while still downloading the whole object.
+    for (const r of proxy.requests) {
+      assert.ok(
+        r.method === 'HEAD' || r.rangeStart !== undefined,
+        `expected only HEAD or ranged GET requests against the measured object, got unranged ${r.method} ${r.path}`,
+      );
+    }
+
+    // Classify every GET (ranged or not — requestSpan falls back to the full object span for
+    // an unranged request, so nothing is silently dropped from both buckets).
+    const gets = proxy.requests.filter((r) => r.method === 'GET');
     // A request that reaches into the thrift footer is a metadata read; DuckDB fetches a
     // tail window that can incidentally include the last bytes of the final row group.
-    const footerReads = ranged.filter((r) => overlap(requestSpan(r, size), footerSpan) > 0);
-    const dataReads = ranged.filter((r) => overlap(requestSpan(r, size), footerSpan) === 0);
+    const footerReads = gets.filter((r) => overlap(requestSpan(r, size), footerSpan) > 0);
+    const dataReads = gets.filter((r) => overlap(requestSpan(r, size), footerSpan) === 0);
     const bytesFromRowGroup = (reads: ProxyRequest[], id: number) =>
       reads.reduce((sum, r) => sum + overlap(requestSpan(r, size), rowGroups[id]), 0);
     const totalBytes = proxy.requests.reduce((sum, r) => sum + r.bytes, 0);
@@ -318,8 +338,17 @@ describe('remote parquet probe (targeted S3 read feasibility gate)', () => {
     assert.ok(footerReads.length > 0, 'expected at least one footer/metadata read');
     assert.ok(dataReads.length > 0, 'expected at least one column-chunk data read');
     assert.ok(
-      totalBytes < size / 2,
-      `read ${totalBytes} of ${size} bytes; expected materially less than the whole object`,
+      footerReads.every((r) => requestSpan(r, size).start >= size - FOOTER_WINDOW_BYTES),
+      'every footer read must start within the last 64 KiB of the object — a read that starts ' +
+        'earlier is not a footer probe, it is a large range that happens to also overlap the ' +
+        'footer, and must not be let through the footer/data classification uncounted',
+    );
+    assert.ok(
+      // Observed on this fixture: 202,652 / 567,222 = 35.7%. 45% leaves comfortable margin
+      // for run-to-run byte-count jitter while still tripping on a fetch-strategy regression
+      // (e.g. downloading a whole row group's worth of extra data, or the whole object).
+      totalBytes < size * 0.45,
+      `read ${totalBytes} of ${size} bytes (${((totalBytes / size) * 100).toFixed(1)}%); expected close to the observed ~35.7% ratio`,
     );
     assert.equal(
       bytesFromRowGroup(dataReads, 0),
@@ -335,10 +364,14 @@ describe('remote parquet probe (targeted S3 read feasibility gate)', () => {
       bytesFromRowGroup(dataReads, 1) > 0,
       'column chunks must be read from the matching row group 1',
     );
+    } finally {
+      db.close();
+    }
   });
 
   it('captures the EXPLAIN ANALYZE profile of the targeted remote read', async () => {
     const db = await openConfiguredDuckDb();
+    try {
     proxy.reset();
 
     const profile = (
@@ -354,15 +387,36 @@ describe('remote parquet probe (targeted S3 read feasibility gate)', () => {
 
     console.log(`\n[remote-parquet-gate] EXPLAIN ANALYZE\n${profile}`);
     assert.match(profile, /PARQUET_SCAN|READ_PARQUET/i);
+    // The report leans on these specific numbers from the profile as corroboration of the
+    // proxy-measured counts — assert them, not just that the plan mentions Parquet at all.
+    assert.match(
+      profile,
+      /Total Files Read:\s*1\b/,
+      'expected the profile to confirm exactly one file was read',
+    );
+    assert.match(
+      profile,
+      new RegExp(`pos\\s*=\\s*${TARGET_POS}`),
+      'expected the profile to show the pos predicate as a pushed-down filter',
+    );
+    const getCount = proxy.requests.filter((r) => r.method === 'GET').length;
+    assert.ok(
+      getCount > 0 && getCount <= 6,
+      `expected a small, bounded number of GET requests for a targeted read, got ${getCount}`,
+    );
     assert.deepEqual(
       proxy.requests.filter((r) => r.path.includes('/chrom=1/')),
       [],
       'profiling the targeted read must not touch chromosome 1 either',
     );
+    } finally {
+      db.close();
+    }
   });
 
   it('documents the extra cost of passing an unpruned file list', async () => {
     const db = await openConfiguredDuckDb();
+    try {
     proxy.reset();
 
     const rows = await db.all(`
@@ -397,5 +451,8 @@ describe('remote parquet probe (targeted S3 read feasibility gate)', () => {
       chrom1Requests.length > 0,
       'an unpruned file list is expected to cost requests against chromosome 1',
     );
+    } finally {
+      db.close();
+    }
   });
 });

@@ -15,7 +15,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-import { Client, Connection, WorkflowFailedError } from '@temporalio/client';
+import { CancelledFailure, Client, Connection, WorkflowFailedError } from '@temporalio/client';
 import type { Worker } from '@temporalio/worker';
 
 import {
@@ -191,7 +191,16 @@ describe('temporal rust probe (cross-language feasibility gate)', () => {
 
     const logLengthBeforeCancel = rustWorkerLog.join('').length;
     await handle.cancel();
-    await assert.rejects(handle.result(), (err: unknown) => err instanceof WorkflowFailedError);
+    await assert.rejects(handle.result(), (err: unknown) => {
+      // `err instanceof WorkflowFailedError` alone also matches an activity timeout or any
+      // other workflow failure; require the cause to specifically be a cancellation.
+      assert.ok(err instanceof WorkflowFailedError, 'expected a WorkflowFailedError');
+      assert.ok(
+        err.cause instanceof CancelledFailure,
+        `expected the failure cause to be a CancelledFailure, got ${String(err.cause)}`,
+      );
+      return true;
+    });
 
     const history = await handle.fetchHistory();
     const eventTypes = (history.events ?? []).map((e) => e.eventType);
