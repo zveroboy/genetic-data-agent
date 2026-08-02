@@ -6,6 +6,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -97,7 +98,25 @@ fn rejections(path: &Path) -> Vec<RejectionReason> {
 }
 
 /// Builds the artifact under a fresh temp directory, returning the stats and the export root.
+///
+/// Unwraps the `Option` that says whether the sink interrupted the build: every sink used here
+/// but [`InterruptingProgressSink`] always continues, and the one test that does interrupt calls
+/// [`build_interruptibly_in`] instead.
 fn build_in(directory: &TempDir, source: &Path, sink: &dyn ProgressSink, batch_size: usize) -> Result<(ArtifactStats, PathBuf), ArtifactError> {
+    build_interruptibly_in(directory, source, sink, batch_size).map(|(stats, parquet_dir)| {
+        (
+            stats.expect("this sink never asks the build to stop"),
+            parquet_dir,
+        )
+    })
+}
+
+fn build_interruptibly_in(
+    directory: &TempDir,
+    source: &Path,
+    sink: &dyn ProgressSink,
+    batch_size: usize,
+) -> Result<(Option<ArtifactStats>, PathBuf), ArtifactError> {
     let parquet_dir = directory.path().join("parquet");
     let request = ArtifactBuildRequest {
         source_path: source.to_path_buf(),
@@ -124,8 +143,41 @@ impl RecordingProgressSink {
 }
 
 impl ProgressSink for RecordingProgressSink {
-    fn report(&self, event: &ProgressEvent) {
+    fn report(&self, event: &ProgressEvent) -> ControlFlow<()> {
         self.events.lock().expect("sink lock").push(event.clone());
+        ControlFlow::Continue(())
+    }
+}
+
+/// A `ProgressSink` that asks the build to stop at the n-th boundary, and records how many
+/// boundaries it was actually offered.
+struct InterruptingProgressSink {
+    stop_after: usize,
+    seen: Mutex<Vec<ProgressEvent>>,
+}
+
+impl InterruptingProgressSink {
+    fn new(stop_after: usize) -> Self {
+        Self {
+            stop_after,
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen(&self) -> Vec<ProgressEvent> {
+        self.seen.lock().expect("sink lock").clone()
+    }
+}
+
+impl ProgressSink for InterruptingProgressSink {
+    fn report(&self, event: &ProgressEvent) -> ControlFlow<()> {
+        let mut seen = self.seen.lock().expect("sink lock");
+        seen.push(event.clone());
+        if seen.len() >= self.stop_after {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
     }
 }
 
@@ -1069,6 +1121,50 @@ mod artifact_builder {
             assert_eq!(file.min_pos, 10_000);
             assert_eq!(file.max_pos, 10_000 + (PER_CHROM - 1) * 100);
         }
+    }
+
+    /// A sink that returns `ControlFlow::Break` must actually stop the build at that boundary —
+    /// not merely be noted while a whole-genome parse runs to completion — and the result must
+    /// be `Ok(None)`, because stopping on request is not a failure.
+    ///
+    /// This is the seam a cancelled Temporal Activity uses; the adapter's half is covered in
+    /// `temporal_activity_test.rs`.
+    #[test]
+    fn a_sink_that_breaks_stops_the_build_and_produces_no_statistics() {
+        const ROWS: u32 = 20_000;
+
+        let directory = TempDir::new().expect("temp dir");
+        let source = directory.path().join("interrupt.vcf");
+        {
+            let mut writer = BufWriter::new(File::create(&source).expect("create"));
+            writer.write_all(VCF_HEADER.as_bytes()).expect("header");
+            for index in 0..ROWS {
+                writer
+                    .write_all(data_line("1", 10_000 + index * 100, ".", "A", "C", "0/1").as_bytes())
+                    .expect("record");
+            }
+        }
+
+        // Boundaries are PARSING, then one WRITING_DUCKDB per 1 000-record batch. Stopping at the
+        // third means the build is abandoned early in the parse.
+        let sink = InterruptingProgressSink::new(3);
+        let (stats, parquet_dir) = build_interruptibly_in(&directory, &source, &sink, 1_000)
+            .expect("an interrupted build is not a failure");
+
+        assert!(stats.is_none(), "an interrupted build produces no statistics");
+        assert_eq!(
+            sink.seen().len(),
+            3,
+            "the build must stop at the boundary that asked it to, not keep reporting"
+        );
+        assert!(
+            !parquet_dir.exists(),
+            "an interrupted build must not have reached the Parquet export"
+        );
+
+        // The staging database was created and left where it is: removing the attempt's scratch
+        // space is the caller's job, and the caller owns the whole directory.
+        assert!(directory.path().join("staging.duckdb").exists());
     }
 }
 

@@ -23,9 +23,9 @@
 //! The Activity never writes `manifest.json`. Publication — and with it the only readiness
 //! signal a dataset has — belongs to the TypeScript `publishDataset` Activity.
 
-use std::panic::AssertUnwindSafe;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
@@ -34,6 +34,8 @@ use temporalio_common::error::ApplicationFailure;
 use temporalio_common::protos::coresdk::AsJsonPayloadExt;
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
+
+use sha2::{Digest, Sha256};
 
 use crate::artifact::{
     build_artifact, dataset_checksum_sha256, ArtifactBuildRequest, ArtifactError, ArtifactStats,
@@ -69,9 +71,39 @@ pub const STAGING_ROOT_VARIABLE: &str = "INGESTION_STAGING_ROOT";
 /// Keepalive period when the Workflow scheduled the Activity without a `heartbeatTimeout`.
 const DEFAULT_KEEPALIVE_PERIOD: Duration = Duration::from_secs(5);
 
-/// The keepalive re-reports this often relative to the negotiated `heartbeatTimeout`, leaving
-/// room for two missed ticks before the server would time the Activity out.
+/// The keepalive re-reports this often relative to the negotiated `heartbeatTimeout`.
+///
+/// Reporting more often than the timeout is all this buys: sdk-core aggregates recorded
+/// heartbeats and only sends one to the server every `heartbeatTimeout × 0.8`, so ticking faster
+/// than that does not put more heartbeats on the wire — it only makes sure there is always a
+/// fresh observation waiting when core's throttle window opens. (Measured against the production
+/// 15-second timeout, that window is 12 seconds, which leaves the *server-side* margin at 3
+/// seconds rather than the two spare ticks this constant might suggest. Widening it is a worker
+/// configuration change and is recorded in the task report rather than made here.)
 const KEEPALIVE_DIVISOR: u32 = 3;
+
+/// How long the keepalive will hold an Activity open on an observation that has not changed,
+/// as a multiple of the negotiated `heartbeatTimeout`.
+///
+/// The keepalive exists because two stages of the pipeline have no progress callback: streaming
+/// the pinned source object to disk, and DuckDB's per-partition `COPY`. Left unbounded it also
+/// disables the thing `heartbeatTimeout` is *for* — a worker wedged in a hung socket read or a
+/// DuckDB deadlock would keep reporting the last observation until `startToCloseTimeout`, which
+/// production sets to 30 minutes. So the re-emits are budgeted, and once the budget is spent the
+/// Activity falls silent and the server's own `heartbeatTimeout` retries it.
+///
+/// 40 × the 15-second production `heartbeatTimeout` is 10 minutes: one third of
+/// `startToCloseTimeout`, so a genuine hang is detected three times sooner than before, and
+/// comfortably more than the longest legitimate callback-free stretch. The longest is the
+/// download of the largest catalogued source (`na12878-full`, a gzipped whole-genome VCF of a
+/// couple of gigabytes); 10 minutes only becomes tight below a sustained few MB/s, an order of
+/// magnitude under what the deployment's MinIO delivers. A partition `COPY` is seconds.
+const KEEPALIVE_BUDGET_TIMEOUTS: u32 = 40;
+
+/// The budget expressed in keepalive ticks, which is what the keepalive counts. The period is
+/// `heartbeatTimeout / KEEPALIVE_DIVISOR`, so the two constants compose into a bound that does
+/// not depend on the negotiated timeout's actual value.
+pub const KEEPALIVE_BUDGET_TICKS: u32 = KEEPALIVE_BUDGET_TIMEOUTS * KEEPALIVE_DIVISOR;
 
 // -----------------------------------------------------------------------------------------
 // Failure mapping
@@ -165,6 +197,53 @@ pub trait HeartbeatChannel: Send + Sync + 'static {
     fn is_cancelled(&self) -> bool;
 }
 
+/// The frozen phase list of `contracts/ingestion-v1.md`, **in order**. A consumer polling
+/// heartbeats is entitled to read a phase as progress, so the published sequence must never
+/// regress through it.
+pub const PHASE_ORDER: [IngestionPhase; 6] = [
+    IngestionPhase::DownloadingSource,
+    IngestionPhase::Parsing,
+    IngestionPhase::WritingDuckdb,
+    IngestionPhase::ExportingParquet,
+    IngestionPhase::UploadingPartition,
+    IngestionPhase::Finalizing,
+];
+
+/// A phase's position in [`PHASE_ORDER`].
+pub fn phase_rank(phase: IngestionPhase) -> usize {
+    PHASE_ORDER
+        .iter()
+        .position(|candidate| *candidate == phase)
+        .expect("every IngestionPhase is in the contract's ordered phase list")
+}
+
+/// Projects a *processor* phase onto the phase the adapter may publish.
+///
+/// `FINALIZING` is the last entry of an ordered list, and in this pipeline it belongs to the
+/// adapter: it is published once, after every partition has been uploaded. The processor's own
+/// work finishes with the local Parquet export, which is `EXPORTING_PARQUET` — uploads are still
+/// to come. Letting a processor event through as `FINALIZING` would make the published sequence
+/// reach the terminal phase, regress to `UPLOADING_PARTITION`, and reach it again.
+///
+/// The processor no longer emits `FINALIZING`, so this is a guard rather than a correction: the
+/// ordering of the published sequence is the adapter's to guarantee, not something it inherits.
+fn projected_phase(phase: IngestionPhase) -> IngestionPhase {
+    match phase {
+        IngestionPhase::Finalizing => IngestionPhase::ExportingParquet,
+        other => other,
+    }
+}
+
+/// Whether a keepalive tick published anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepaliveTick {
+    /// The observation was re-sent (or had changed, which resets the budget).
+    Published,
+    /// The budget for an unchanged observation is spent. Nothing was sent, and nothing more will
+    /// be until real progress arrives.
+    BudgetSpent,
+}
+
 /// Projects the processor's progress onto the frozen [`IngestionHeartbeat`] payload.
 ///
 /// The projection is cumulative: an event updates the fields it knows about and leaves the rest
@@ -174,143 +253,139 @@ pub trait HeartbeatChannel: Send + Sync + 'static {
 /// while `uploadedBytes` is what tracks the upload's own progress.
 pub struct HeartbeatReporter {
     channel: Arc<dyn HeartbeatChannel>,
-    state: Mutex<IngestionHeartbeat>,
+    state: Mutex<ReporterState>,
+    /// How many times the keepalive may re-send an observation that has not changed.
+    keepalive_budget: u32,
+}
+
+struct ReporterState {
+    heartbeat: IngestionHeartbeat,
+    /// The payload published last, and how many consecutive keepalive ticks have re-sent it
+    /// unchanged. Real progress resets the count; see [`KEEPALIVE_BUDGET_TICKS`].
+    published: Option<IngestionHeartbeat>,
+    unchanged_reemits: u32,
 }
 
 impl HeartbeatReporter {
     pub fn new<C: HeartbeatChannel>(channel: Arc<C>) -> Self {
+        Self::with_keepalive_budget(channel, KEEPALIVE_BUDGET_TICKS)
+    }
+
+    pub fn with_keepalive_budget<C: HeartbeatChannel>(channel: Arc<C>, budget: u32) -> Self {
         Self {
             channel,
-            state: Mutex::new(IngestionHeartbeat {
-                phase: IngestionPhase::DownloadingSource,
-                processed_bytes: 0,
-                processed_variants: 0,
-                current_partition: None,
-                completed_files: 0,
-                uploaded_bytes: 0,
+            state: Mutex::new(ReporterState {
+                heartbeat: IngestionHeartbeat {
+                    phase: IngestionPhase::DownloadingSource,
+                    processed_bytes: 0,
+                    processed_variants: 0,
+                    current_partition: None,
+                    completed_files: 0,
+                    uploaded_bytes: 0,
+                },
+                published: None,
+                unchanged_reemits: 0,
             }),
+            keepalive_budget: budget,
         }
     }
 
     /// Folds a processor event into the running picture without publishing anything.
     pub fn absorb(&self, event: &ProgressEvent) {
         let mut state = self.locked();
-        state.phase = event.phase;
-        state.processed_bytes = event.processed_bytes;
-        state.processed_variants = event.processed_variants;
-        state.current_partition = event.current_partition.clone();
-        state.completed_files = event.completed_files;
+        state.heartbeat.phase = projected_phase(event.phase);
+        state.heartbeat.processed_bytes = event.processed_bytes;
+        state.heartbeat.processed_variants = event.processed_variants;
+        state.heartbeat.current_partition = event.current_partition.clone();
+        state.heartbeat.completed_files = event.completed_files;
     }
 
     /// Adds one uploaded object's bytes to the running total.
     pub fn note_uploaded_bytes(&self, bytes: u64) {
-        self.locked().uploaded_bytes += bytes;
+        self.locked().heartbeat.uploaded_bytes += bytes;
     }
 
     /// Publishes the current picture under `phase`, working on `current_partition`.
+    ///
+    /// This is the adapter's own progress, so `phase` is taken at face value: the adapter is the
+    /// layer that owns `UPLOADING_PARTITION` and `FINALIZING`.
     pub fn emit(&self, phase: IngestionPhase, current_partition: Option<&str>) {
         let heartbeat = {
             let mut state = self.locked();
-            state.phase = phase;
-            state.current_partition = current_partition.map(str::to_string);
-            state.clone()
+            state.heartbeat.phase = phase;
+            state.heartbeat.current_partition = current_partition.map(str::to_string);
+            state.heartbeat.clone()
         };
         self.publish(&heartbeat);
     }
 
-    /// Re-publishes the last observation unchanged.
+    /// Re-publishes the last observation, while the budget for doing so lasts.
     ///
     /// Two stages of the pipeline are a single uninterruptible call with no progress callback —
-    /// streaming a multi-gigabyte source onto disk, and DuckDB's one `COPY … TO` that exports
-    /// the whole dataset. Without this the Activity would look silent to the server and be
-    /// killed by the Workflow's 15-second `heartbeatTimeout` long before it was actually stuck.
-    pub fn reemit(&self) {
-        let heartbeat = self.locked().clone();
-        self.publish(&heartbeat);
+    /// streaming a multi-gigabyte source onto disk, and DuckDB's per-partition `COPY`. Without
+    /// this the Activity would look silent to the server and be killed by the Workflow's
+    /// 15-second `heartbeatTimeout` long before it was actually stuck.
+    ///
+    /// The budget is what keeps the cure from being worse than the disease: see
+    /// [`KEEPALIVE_BUDGET_TIMEOUTS`]. An observation that *has* changed since the last publish is
+    /// progress, is published, and resets the count.
+    pub fn reemit(&self) -> KeepaliveTick {
+        let heartbeat = {
+            let mut state = self.locked();
+            let unchanged = state.published.as_ref() == Some(&state.heartbeat);
+            if unchanged {
+                if state.unchanged_reemits >= self.keepalive_budget {
+                    return KeepaliveTick::BudgetSpent;
+                }
+                state.unchanged_reemits += 1;
+            } else {
+                state.unchanged_reemits = 0;
+            }
+            state.heartbeat.clone()
+        };
+        self.record(&heartbeat);
+        KeepaliveTick::Published
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.channel.is_cancelled()
     }
 
+    /// Publishes real progress: the keepalive budget is restored.
     fn publish(&self, heartbeat: &IngestionHeartbeat) {
+        self.locked().unchanged_reemits = 0;
+        self.record(heartbeat);
+    }
+
+    fn record(&self, heartbeat: &IngestionHeartbeat) {
+        self.locked().published = Some(heartbeat.clone());
         self.channel.record(heartbeat);
     }
 
     /// A poisoned heartbeat mutex means another thread panicked mid-update. The recorded numbers
     /// are only ever whole-field writes, so the worst case is one stale count in one heartbeat —
     /// not a reason to fail an ingestion that is otherwise healthy.
-    fn locked(&self) -> std::sync::MutexGuard<'_, IngestionHeartbeat> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, ReporterState> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
-/// The processor reports through this. Each report is a heartbeat *and* a cancellation
-/// checkpoint: see [`run_until_cancelled`].
+/// The processor reports through this. Each report is a heartbeat *and* the point at which a
+/// cancellation stops the run: [`ControlFlow::Break`] tells the processor to abandon the build
+/// at this boundary, and [`crate::artifact::build_artifact`] answers with `Ok(None)`.
 impl ProgressSink for HeartbeatReporter {
-    fn report(&self, event: &ProgressEvent) {
+    fn report(&self, event: &ProgressEvent) -> ControlFlow<()> {
         self.absorb(event);
-        self.reemit();
+        let heartbeat = self.locked().heartbeat.clone();
+        self.publish(&heartbeat);
         if self.is_cancelled() {
-            abort_processing();
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
     }
-}
-
-// -----------------------------------------------------------------------------------------
-// Cancellation
-// -----------------------------------------------------------------------------------------
-
-/// The panic payload used to unwind out of the blocking processor.
-struct CancellationRequested;
-
-/// Abandons the current processor run at a heartbeat boundary.
-///
-/// [`ProgressSink::report`] returns `()`: the processor is a synchronous, uninterruptible call
-/// that cannot be handed an error, and its signature is a frozen seam shared with the CLI and
-/// the acceptance tests. Unwinding from the callback is therefore the only way to *actually*
-/// stop reading the source and writing the staging database when a cancellation arrives, rather
-/// than merely noting it and letting a full-genome build run to completion first.
-///
-/// The unwind is contained: it is raised only from the sink, only in this module, and is caught
-/// by [`run_until_cancelled`] immediately around the processor call. Everything it passes
-/// through — the VCF reader, the DuckDB connection and appender — releases its resources in
-/// `Drop`.
-fn abort_processing() -> ! {
-    std::panic::panic_any(CancellationRequested)
-}
-
-/// Runs the blocking processor, returning `None` if a cancellation stopped it.
-///
-/// A panic that is *not* the cancellation sentinel is re-raised unchanged: a genuine bug must
-/// never be laundered into "the user cancelled".
-pub fn run_until_cancelled<T>(body: impl FnOnce() -> T) -> Option<T> {
-    match std::panic::catch_unwind(AssertUnwindSafe(body)) {
-        Ok(value) => Some(value),
-        Err(payload) if payload.is::<CancellationRequested>() => None,
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
-}
-
-/// Keeps the cancellation unwind out of the log.
-///
-/// The default panic hook prints before the unwind reaches [`run_until_cancelled`], which would
-/// make every ordinary cancellation look like a crash. This installs one hook, once, that stays
-/// silent for the sentinel and delegates every other panic to the hook that was already in
-/// place.
-pub fn install_quiet_cancellation_panic_hook() {
-    static INSTALLED: Once = Once::new();
-    INSTALLED.call_once(|| {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if info.payload().is::<CancellationRequested>() {
-                return;
-            }
-            previous(info);
-        }));
-    });
 }
 
 // -----------------------------------------------------------------------------------------
@@ -333,15 +408,21 @@ pub fn attempt_prefix_for(allowed_prefix: &str, attempt: u32) -> String {
 
 /// Derives and re-checks this attempt's writable prefix.
 ///
-/// Three refusals, all deterministic:
+/// Two refusals, both deterministic:
 ///
 /// 1. `datasetId` and `artifactVersion` must be single safe path segments — they flow verbatim
 ///    into the prefix, and `..` or a `/` would climb straight out of the dataset's namespace.
 /// 2. The declared `target.allowedPrefix` must be exactly the derived one
-///    (`ALLOWED_PREFIX_MISMATCH` on the TypeScript side).
-/// 3. The attempt prefix must be strictly below it. The object-store adapter validates only that
-///    a *key* sits below the prefix it is handed; this is the check that the prefix itself is
-///    contained, which TypeScript enforces as `ATTEMPT_PREFIX_OUTSIDE_ALLOWED_PREFIX`.
+///    (`ALLOWED_PREFIX_MISMATCH` on the TypeScript side). This is the check that gates: it is
+///    what refuses a widened `allowedPrefix` such as `datasets/`, which would otherwise satisfy
+///    every containment check downstream.
+///
+/// What TypeScript enforces as `ATTEMPT_PREFIX_OUTSIDE_ALLOWED_PREFIX` — the attempt prefix
+/// sitting strictly below the allowed prefix — holds here *by construction* rather than by
+/// check: [`attempt_prefix_for`] extends the value rule 2 just proved correct. A runtime
+/// re-check of `prefix.starts_with(&allowed)` on a string built as `format!("{allowed}…")` can
+/// never fail, so there is none; the containment is asserted in the tests against the two
+/// functions together.
 pub fn validated_attempt_prefix(
     input: &BuildDatasetArtifactInput,
     attempt: u32,
@@ -367,13 +448,7 @@ pub fn validated_attempt_prefix(
         )));
     }
 
-    let prefix = attempt_prefix_for(&allowed, attempt);
-    if !prefix.starts_with(&allowed) || prefix.len() == allowed.len() {
-        return Err(IngestionFailure::validation(format!(
-            "attempt prefix '{prefix}' is not strictly below '{allowed}'"
-        )));
-    }
-    Ok(prefix)
+    Ok(attempt_prefix_for(&allowed, attempt))
 }
 
 /// `^[A-Za-z0-9][A-Za-z0-9._-]*$`, matching `pathSegmentSchema` in `ingestion-contracts.ts`.
@@ -419,6 +494,21 @@ pub fn attempt_workspace_name(workflow_id: &str, activity_id: &str, attempt: u32
 /// push the path past the filesystem's limit.
 const MAX_IDENTIFIER_FRAGMENT: usize = 64;
 
+/// Hex digits of the disambiguating digest appended to every sanitized fragment.
+const IDENTIFIER_DIGEST_DIGITS: usize = 12;
+
+/// Reduces a caller-influenced identifier to something usable as a single directory name,
+/// without letting two different identifiers land on the same one.
+///
+/// The character mapping alone is lossy in two ways — it folds every unsafe character onto `_`,
+/// and it truncates — so `ingest-ds:1` and `ingest-ds/1` would both become `ingest-ds_1`. Two
+/// concurrent Activities whose Workflow IDs collided that way would race for one workspace, and
+/// the loser would fail `AttemptWorkspace::create`. That failure is safe (an attempt never
+/// reuses a path) but it is a retry nobody needed, so a short digest of the *untruncated raw*
+/// identifier is appended and the collision disappears.
+///
+/// The digest is a name-shortening device, not a security boundary: the sanitized fragment in
+/// front of it is what keeps the name from escaping the staging root, and it is still applied.
 fn sanitize_identifier(raw: &str) -> String {
     let sanitized: String = raw
         .chars()
@@ -431,11 +521,13 @@ fn sanitize_identifier(raw: &str) -> String {
             }
         })
         .collect();
-    if sanitized.is_empty() {
+    let sanitized = if sanitized.is_empty() {
         "unnamed".to_string()
     } else {
         sanitized
-    }
+    };
+    let digest = hex::encode(Sha256::digest(raw.as_bytes()));
+    format!("{sanitized}-{}", &digest[..IDENTIFIER_DIGEST_DIGITS])
 }
 
 /// One attempt's private scratch directory: the downloaded source, the staging database and the
@@ -666,8 +758,6 @@ impl IngestionActivities {
         ctx: ActivityContext,
         input: Value,
     ) -> Result<BuildDatasetArtifactResult, ActivityError> {
-        install_quiet_cancellation_panic_hook();
-
         let info = ctx.info();
         let attempt = info.attempt;
         let workspace_name = attempt_workspace_name(
@@ -815,22 +905,22 @@ impl IngestionActivities {
         };
         let sink = reporter.clone();
 
-        let outcome = tokio::task::spawn_blocking(move || {
-            run_until_cancelled(|| build_artifact(&request, sink.as_ref()))
-        })
-        .await
-        .map_err(|error| {
-            // The processor thread panicked or was aborted. It says nothing about the input, so
-            // it stays retryable; the local workspace is removed either way.
-            IngestionFailure::new(
-                FailureType::ArtifactWriteFailed,
-                format!("the ingestion processor thread did not finish: {error}"),
-            )
-        })?;
+        // `Ok(None)` is the processor answering the `ControlFlow::Break` the reporter returns
+        // once the Activity has been cancelled — not a failure, and never reported as one.
+        let outcome = tokio::task::spawn_blocking(move || build_artifact(&request, sink.as_ref()))
+            .await
+            .map_err(|error| {
+                // The processor thread panicked or was aborted. It says nothing about the input,
+                // so it stays retryable; the local workspace is removed either way.
+                IngestionFailure::new(
+                    FailureType::ArtifactWriteFailed,
+                    format!("the ingestion processor thread did not finish: {error}"),
+                )
+            })?;
 
-        match outcome {
+        match outcome.map_err(IngestionFailure::from)? {
             None => Err(Interrupted::Cancelled),
-            Some(result) => Ok(result.map_err(IngestionFailure::from)?),
+            Some(stats) => Ok(stats),
         }
     }
 
@@ -962,7 +1052,12 @@ impl HeartbeatChannel for ActivityHeartbeatChannel {
     }
 }
 
-/// Re-reports the last observation on a timer for as long as it lives.
+/// Re-reports the last observation on a timer, for a bounded stretch.
+///
+/// It keeps ticking for the Activity's whole life — a stage that resumes reporting restores the
+/// budget — but it will not carry an *unchanged* observation past
+/// [`KEEPALIVE_BUDGET_TICKS`] ticks. Past that the Activity goes quiet on purpose and the
+/// server's `heartbeatTimeout` does the job it exists for.
 struct Keepalive {
     handle: tokio::task::JoinHandle<()>,
 }
@@ -973,9 +1068,19 @@ impl Keepalive {
             let mut ticker = tokio::time::interval(period);
             // `interval` fires immediately; the first real heartbeat is the caller's job.
             ticker.tick().await;
+            let mut warned = false;
             loop {
                 ticker.tick().await;
-                reporter.reemit();
+                if reporter.reemit() == KeepaliveTick::BudgetSpent && !warned {
+                    warned = true;
+                    tracing::warn!(
+                        budget_ticks = KEEPALIVE_BUDGET_TICKS,
+                        period_ms = period.as_millis() as u64,
+                        "the ingestion activity has reported no new progress for the whole \
+                         keepalive budget; heartbeats stop here so the server's heartbeat \
+                         timeout can retry it"
+                    );
+                }
             }
         });
         Self { handle }
@@ -1000,6 +1105,8 @@ fn keepalive_period(ctx: &ActivityContext) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     /// The activity type registered with the worker must be the exact name the TypeScript
@@ -1021,5 +1128,94 @@ mod tests {
             "{}",
             root.display()
         );
+    }
+
+    /// Counts heartbeats. `Keepalive` is private, so the test that drives the real spawned task
+    /// has to live in the crate.
+    #[derive(Default)]
+    struct CountingChannel(AtomicUsize);
+
+    impl CountingChannel {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl HeartbeatChannel for CountingChannel {
+        fn record(&self, _heartbeat: &IngestionHeartbeat) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    /// The regression this bound exists for: an always-on keepalive turns the Workflow's
+    /// 15-second `heartbeatTimeout` into the 30-minute `startToCloseTimeout`, because a worker
+    /// wedged in a hung S3 read or a DuckDB deadlock keeps re-sending its last observation
+    /// forever. After the budget the spawned task must stop reaching the channel, so the server
+    /// stops seeing heartbeats and can time the Activity out.
+    #[tokio::test(start_paused = true)]
+    async fn the_keepalive_stops_re_emitting_an_unchanged_observation_after_its_budget() {
+        const BUDGET: u32 = 6;
+        let period = Duration::from_millis(100);
+
+        let channel = Arc::new(CountingChannel::default());
+        let reporter = Arc::new(HeartbeatReporter::with_keepalive_budget(
+            channel.clone(),
+            BUDGET,
+        ));
+        reporter.emit(IngestionPhase::DownloadingSource, None);
+        assert_eq!(channel.count(), 1, "the caller's own first heartbeat");
+
+        let keepalive = Keepalive::spawn(reporter.clone(), period);
+
+        /// Lets the spawned keepalive observe `ticks` periods of the paused clock. Stepping one
+        /// period at a time is what gives the task a chance to be polled per tick.
+        async fn tick(period: Duration, ticks: u32) {
+            for _ in 0..ticks {
+                tokio::time::advance(period).await;
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // Far more ticks than the budget: the count must stop at the budget, not track the clock.
+        tick(period, BUDGET * 10).await;
+        assert_eq!(
+            channel.count(),
+            1 + BUDGET as usize,
+            "the keepalive must re-send an unchanged observation at most {BUDGET} times"
+        );
+
+        // Real progress is a new observation, so the budget is restored and the keepalive
+        // resumes: the bound detects a *stall*, it does not cap a long healthy activity.
+        reporter.emit(IngestionPhase::Parsing, None);
+        tick(period, BUDGET * 10).await;
+        assert_eq!(
+            channel.count(),
+            2 + 2 * BUDGET as usize,
+            "progress must restore the keepalive budget"
+        );
+
+        drop(keepalive);
+    }
+
+    /// The processor's terminal observation must not be published as the contract's terminal
+    /// phase: `FINALIZING` is published once, by the adapter, after the uploads.
+    #[test]
+    fn the_processor_can_never_publish_the_terminal_phase() {
+        for phase in PHASE_ORDER {
+            let projected = projected_phase(phase);
+            assert_ne!(
+                projected,
+                IngestionPhase::Finalizing,
+                "{phase:?} must not reach the wire as FINALIZING"
+            );
+            assert!(
+                phase_rank(projected) <= phase_rank(phase),
+                "the projection must never advance a phase"
+            );
+        }
     }
 }

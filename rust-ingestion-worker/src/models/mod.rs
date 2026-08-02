@@ -4,6 +4,8 @@
 //! Nothing here knows about Temporal or S3. [`ProgressSink`] is the seam: the processor
 //! reports [`ProgressEvent`]s, and a later task adapts them into Temporal heartbeats.
 
+use std::ops::ControlFlow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::IngestionPhase;
@@ -58,17 +60,28 @@ impl ProgressEvent {
     }
 }
 
-/// Where the processor reports progress. Implemented by tests, the CLI and — in a later
-/// task — a Temporal activity heartbeat adapter.
+/// Where the processor reports progress. Implemented by tests, the CLI and the Temporal
+/// activity heartbeat adapter.
+///
+/// A progress report is also the processor's only *interruption point*. The processor is a
+/// synchronous call that streams a whole genome, so a caller that wants it to stop — a Temporal
+/// activity that has been cancelled — has to be able to say so at a boundary the processor
+/// already visits. That is what the return value is for: [`ControlFlow::Break`] asks the
+/// processor to abandon the run at this boundary and report no result.
+///
+/// This is deliberately *not* an error channel. Stopping on request is not a failure, and the
+/// sink has no vocabulary for the processor's failures.
 pub trait ProgressSink: Send + Sync {
-    fn report(&self, event: &ProgressEvent);
+    fn report(&self, event: &ProgressEvent) -> ControlFlow<()>;
 }
 
-/// Discards every event. The default for the debug CLI and for tests that do not inspect
-/// progress.
+/// Discards every event and never interrupts. The default for the debug CLI and for tests that
+/// do not inspect progress.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopProgressSink;
 
 impl ProgressSink for NoopProgressSink {
-    fn report(&self, _event: &ProgressEvent) {}
+    fn report(&self, _event: &ProgressEvent) -> ControlFlow<()> {
+        ControlFlow::Continue(())
+    }
 }

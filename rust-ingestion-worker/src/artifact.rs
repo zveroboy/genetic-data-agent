@@ -12,6 +12,7 @@
 
 use std::fs::File;
 use std::io::{self, Read};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use duckdb::{params, Connection};
@@ -130,16 +131,57 @@ impl ArtifactError {
     }
 }
 
+/// Why a build stopped before it produced statistics: a failure, or the sink asking it to stop.
+///
+/// Internal to this module. A caller sees the distinction as `Ok(None)` versus `Err(_)`, because
+/// stopping on request is not a failure and must never be reported as one.
+enum Stopped {
+    Interrupted,
+    Failed(ArtifactError),
+}
+
+impl From<ArtifactError> for Stopped {
+    fn from(error: ArtifactError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// Publishes one progress event and turns a [`ControlFlow::Break`] into [`Stopped::Interrupted`],
+/// so every reporting site in this module is one `?`.
+fn report(progress: &dyn ProgressSink, event: ProgressEvent) -> Result<(), Stopped> {
+    match progress.report(&event) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(()) => Err(Stopped::Interrupted),
+    }
+}
+
 /// Streams `request.source_path` into a partitioned Parquet dataset under
 /// `request.parquet_output_dir`, reporting progress to `progress`.
 ///
 /// Memory is bounded by `request.batch_size` records: the source is read one line at a time
 /// and flushed into DuckDB in batches, and the sort and partitioning happen inside DuckDB
 /// rather than in Rust memory.
+///
+/// Returns `Ok(None)` when `progress` asked the build to stop — see [`ProgressSink`]. That is
+/// not a failure: it is the caller's own request coming back, and the caller is the only one who
+/// knows what it means (for the Temporal adapter, a cancellation). Everything the abandoned run
+/// created is below `request.staging_db_path` and `request.parquet_output_dir`, which the caller
+/// owns and removes.
 pub fn build_artifact(
     request: &ArtifactBuildRequest,
     progress: &dyn ProgressSink,
-) -> Result<ArtifactStats, ArtifactError> {
+) -> Result<Option<ArtifactStats>, ArtifactError> {
+    match build_or_stop(request, progress) {
+        Ok(stats) => Ok(Some(stats)),
+        Err(Stopped::Interrupted) => Ok(None),
+        Err(Stopped::Failed(error)) => Err(error),
+    }
+}
+
+fn build_or_stop(
+    request: &ArtifactBuildRequest,
+    progress: &dyn ProgressSink,
+) -> Result<ArtifactStats, Stopped> {
     let batch_size = request.batch_size.max(1);
     refuse_existing_path(&request.staging_db_path, "staging database")?;
     refuse_existing_path(&request.parquet_output_dir, "Parquet export directory")?;
@@ -157,7 +199,8 @@ pub fn build_artifact(
             "{} yielded no parseable variant records ({} rejected)",
             request.source_path.display(),
             counts.rejected
-        )));
+        ))
+        .into());
     }
 
     staging
@@ -176,11 +219,14 @@ pub fn build_artifact(
         )
         .map_err(|error| ArtifactError::WriteFailed(format!("cannot record dataset metadata: {error}")))?;
 
-    progress.report(&ProgressEvent {
-        processed_bytes: counts.bytes,
-        processed_variants: counts.accepted,
-        ..ProgressEvent::phase(IngestionPhase::ExportingParquet)
-    });
+    report(
+        progress,
+        ProgressEvent {
+            processed_bytes: counts.bytes,
+            processed_variants: counts.accepted,
+            ..ProgressEvent::phase(IngestionPhase::ExportingParquet)
+        },
+    )?;
     export_parquet(&staging, &request.parquet_output_dir)?;
 
     // The staging database is closed before the export is inspected, so validation reads the
@@ -201,12 +247,19 @@ pub fn build_artifact(
         processor_version: PROCESSOR_VERSION.to_string(),
     };
 
-    progress.report(&ProgressEvent {
-        processed_bytes: counts.bytes,
-        processed_variants: stats.variant_count,
-        completed_files: stats.local_parquet_files.len() as u64,
-        ..ProgressEvent::phase(IngestionPhase::Finalizing)
-    });
+    // The processor's own last observation. It says "the local build is complete", which is the
+    // end of *this* layer's work and not the end of the ingestion: uploading is still to come.
+    // The phase is `EXPORTING_PARQUET` rather than `FINALIZING` for that reason — `FINALIZING`
+    // belongs to whoever publishes the dataset, and the contract's phase list is ordered.
+    report(
+        progress,
+        ProgressEvent {
+            processed_bytes: counts.bytes,
+            processed_variants: stats.variant_count,
+            completed_files: stats.local_parquet_files.len() as u64,
+            ..ProgressEvent::phase(IngestionPhase::ExportingParquet)
+        },
+    )?;
     Ok(stats)
 }
 
@@ -243,11 +296,11 @@ fn stage_variants(
     request: &ArtifactBuildRequest,
     batch_size: usize,
     progress: &dyn ProgressSink,
-) -> Result<StagingCounts, ArtifactError> {
+) -> Result<StagingCounts, Stopped> {
     let mut reader = open_vcf(&request.source_path)
         .map_err(|error| classify_source_error(&request.source_path, &error))?;
 
-    progress.report(&ProgressEvent::phase(IngestionPhase::Parsing));
+    report(progress, ProgressEvent::phase(IngestionPhase::Parsing))?;
 
     let mut counts = StagingCounts::default();
     let mut batch: Vec<UserVariant> = Vec::with_capacity(batch_size);
@@ -305,7 +358,7 @@ fn flush_batch(
     batch: &mut Vec<UserVariant>,
     counts: &mut StagingCounts,
     progress: &dyn ProgressSink,
-) -> Result<(), ArtifactError> {
+) -> Result<(), Stopped> {
     let batch_records = batch.len();
     {
         let mut appender = staging
@@ -330,13 +383,15 @@ fn flush_batch(
     batch.clear();
     counts.accepted += batch_records as u64;
 
-    progress.report(&ProgressEvent {
-        processed_bytes: counts.bytes,
-        processed_variants: counts.accepted,
-        batch_records,
-        ..ProgressEvent::phase(IngestionPhase::WritingDuckdb)
-    });
-    Ok(())
+    report(
+        progress,
+        ProgressEvent {
+            processed_bytes: counts.bytes,
+            processed_variants: counts.accepted,
+            batch_records,
+            ..ProgressEvent::phase(IngestionPhase::WritingDuckdb)
+        },
+    )
 }
 
 /// Exports the staging table as a sorted, chromosome-partitioned Zstandard Parquet dataset:
@@ -532,7 +587,7 @@ fn validate_export(
     output_dir: &Path,
     counts: &StagingCounts,
     progress: &dyn ProgressSink,
-) -> Result<Vec<LocalParquetFile>, ArtifactError> {
+) -> Result<Vec<LocalParquetFile>, Stopped> {
     let connection = Connection::open_in_memory().map_err(|error| {
         ArtifactError::ValidationFailed(format!("cannot open a validation connection: {error}"))
     })?;
@@ -552,7 +607,8 @@ fn validate_export(
         if normalize_chromosome(chrom).as_deref() != Some(chrom) {
             return Err(ArtifactError::ValidationFailed(format!(
                 "partition value '{chrom}' is not a canonical chromosome"
-            )));
+            ))
+            .into());
         }
 
         for file in read_sorted_dir(&partition)? {
@@ -564,20 +620,24 @@ fn validate_export(
             let relative_path = canonical_relative_path(directory_name, &name)?;
             files.push(describe_parquet_file(&connection, &file, chrom, relative_path)?);
 
-            progress.report(&ProgressEvent {
-                processed_bytes: counts.bytes,
-                processed_variants: counts.accepted,
-                current_partition: Some(chrom.to_string()),
-                completed_files: files.len() as u64,
-                ..ProgressEvent::phase(IngestionPhase::ExportingParquet)
-            });
+            report(
+                progress,
+                ProgressEvent {
+                    processed_bytes: counts.bytes,
+                    processed_variants: counts.accepted,
+                    current_partition: Some(chrom.to_string()),
+                    completed_files: files.len() as u64,
+                    ..ProgressEvent::phase(IngestionPhase::ExportingParquet)
+                },
+            )?;
         }
     }
 
     if files.is_empty() {
         return Err(ArtifactError::ValidationFailed(
             "the export produced no Parquet files".to_string(),
-        ));
+        )
+        .into());
     }
 
     let exported: u64 = files.iter().map(|file| file.row_count).sum();
@@ -585,7 +645,8 @@ fn validate_export(
         return Err(ArtifactError::ValidationFailed(format!(
             "exported {exported} rows but staged {}",
             counts.accepted
-        )));
+        ))
+        .into());
     }
 
     sort_canonically(&mut files);
@@ -595,6 +656,14 @@ fn validate_export(
 /// The sort key *inside* one partition file: the frozen `sortOrder` without `chrom`, which is
 /// the partition directory rather than a physical column.
 const PHYSICAL_SORT_KEY: [&str; 3] = ["pos", "ref", "alt"];
+
+/// The reader-side column that carries a Parquet file's *physical* row index.
+///
+/// `read_parquet(…, file_row_number = true)` projects it. Ordering the window by it is what makes
+/// the check below a statement about the bytes on disk rather than about whatever order the scan
+/// happened to emit — which is the only question worth asking, because [`export_parquet`]'s
+/// contract is physical order and the query path's row-group pruning depends on it.
+const PHYSICAL_ROW_ORDER: &str = "file_row_number";
 
 /// The sortedness check, as `(lag columns, comparison)`, built from [`PHYSICAL_SORT_KEY`] so it
 /// can never cover fewer columns than the contract's sort order.
@@ -607,7 +676,7 @@ fn sortedness_expressions() -> (String, String) {
         .iter()
         .map(|column| {
             format!(
-                "lag({column}, 1, {}) OVER () AS previous_{column}",
+                "lag({column}, 1, {}) OVER (ORDER BY {PHYSICAL_ROW_ORDER}) AS previous_{column}",
                 sort_key_minimum(column)
             )
         })
@@ -649,7 +718,8 @@ fn describe_parquet_file(
         .query_row(
             &format!(
                 "SELECT count(*), min(pos), max(pos), coalesce(bool_and({sorted_predicate}), true), {}
-                 FROM (SELECT *, {lag_columns} FROM read_parquet({quoted}))",
+                 FROM (SELECT *, {lag_columns}
+                       FROM read_parquet({quoted}, {PHYSICAL_ROW_ORDER} = true))",
                 not_null_violation_expression()
             ),
             [],
@@ -949,11 +1019,14 @@ mod tests {
         assert_eq!(PHYSICAL_SORT_KEY.to_vec(), expected);
 
         let (lag_columns, sorted_predicate) = sortedness_expressions();
+        // Every window is ordered by the reader's physical row index. `OVER ()` with no ordering
+        // clause describes scan order, not the order of the bytes on disk, and physical order is
+        // exactly what `export_parquet` promises.
         assert_eq!(
             lag_columns,
-            "lag(pos, 1, 0::UINTEGER) OVER () AS previous_pos, \
-             lag(ref, 1, '') OVER () AS previous_ref, \
-             lag(alt, 1, '') OVER () AS previous_alt"
+            "lag(pos, 1, 0::UINTEGER) OVER (ORDER BY file_row_number) AS previous_pos, \
+             lag(ref, 1, '') OVER (ORDER BY file_row_number) AS previous_ref, \
+             lag(alt, 1, '') OVER (ORDER BY file_row_number) AS previous_alt"
         );
         assert_eq!(
             sorted_predicate,

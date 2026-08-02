@@ -35,3 +35,14 @@ futures = "0.3"
 # Test-only: every test builds its VCF input, staging database and Parquet output inside a
 # `TempDir` that is removed when the test ends, so no test leaves state behind.
 tempfile = "=3.27.0"
+# `test-util` gives the keepalive tests a paused clock, so a bound measured in minutes of
+# heartbeat timeouts is asserted in milliseconds of wall clock. Test-only: `cargo build` does
+# not resolve dev-dependencies, so the shipped worker never has the mock clock compiled in.
+tokio = { version = "1.42", features = ["full", "test-util"] }
+
+# No profile sets `panic = "abort"`, and nothing here depends on unwinding: cancellation is
+# carried by `ProgressSink::report` returning `ControlFlow::Break`, not by a panic. The one
+# remaining unwind boundary is `spawn_blocking` around the processor, where a genuine bug is
+# turned into a retryable `ArtifactWriteFailed` for that attempt rather than taking the worker
+# down with it. `panic = "abort"` would forfeit that isolation, which is the reason to leave the
+# default alone.

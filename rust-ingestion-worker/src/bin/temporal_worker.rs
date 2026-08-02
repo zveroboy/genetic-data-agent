@@ -25,8 +25,7 @@ use temporalio_sdk::{Worker, WorkerOptions};
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
 use rust_ingestion_worker::temporal_activities::{
-    install_quiet_cancellation_panic_hook, staging_root_from_env, IngestionActivities,
-    ACTIVITY_TYPE, TASK_QUEUE, WORKER_IDENTITY_PREFIX,
+    staging_root_from_env, IngestionActivities, ACTIVITY_TYPE, TASK_QUEUE, WORKER_IDENTITY_PREFIX,
 };
 
 #[tokio::main]
@@ -40,8 +39,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // terminal; colour escapes only make structured fields harder to parse.
         .with_ansi(false)
         .init();
-    // Installed before any Activity runs, so an ordinary cancellation never prints a panic.
-    install_quiet_cancellation_panic_hook();
 
     let address =
         std::env::var("TEMPORAL_ADDRESS").unwrap_or_else(|_| "localhost:7233".to_string());

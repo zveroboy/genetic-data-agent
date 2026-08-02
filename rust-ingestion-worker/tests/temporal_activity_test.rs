@@ -13,6 +13,7 @@
 //! `tests/integration/temporal_rust_probe.test.ts`.
 
 mod temporal_activity {
+    use std::ops::ControlFlow;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -26,10 +27,10 @@ mod temporal_activity {
     use rust_ingestion_worker::object_store::{ObjectStoreError, UploadedObject};
     use rust_ingestion_worker::temporal_activities::{
         assert_inventory_checksum, attempt_prefix_for, attempt_workspace_name,
-        derived_allowed_prefix, install_quiet_cancellation_panic_hook, object_key_for,
-        published_inventory, run_until_cancelled, validated_attempt_prefix, AttemptWorkspace,
-        HeartbeatChannel, HeartbeatReporter, IngestionFailure, ACTIVITY_TYPE, TASK_QUEUE,
-        WORKER_IDENTITY_PREFIX,
+        derived_allowed_prefix, object_key_for, phase_rank, published_inventory,
+        validated_attempt_prefix, AttemptWorkspace, HeartbeatChannel, HeartbeatReporter,
+        IngestionFailure, KeepaliveTick, ACTIVITY_TYPE, KEEPALIVE_BUDGET_TICKS, PHASE_ORDER,
+        TASK_QUEUE, WORKER_IDENTITY_PREFIX,
     };
     use serde_json::{json, Value};
     use tempfile::TempDir;
@@ -74,6 +75,33 @@ mod temporal_activity {
                 .iter()
                 .map(|value| value["phase"].as_str().expect("a phase string").to_string())
                 .collect()
+        }
+    }
+
+    /// The contract's phase list is spelled "Phases, **in order**", so a consumer polling
+    /// heartbeats may read a phase as progress. Every published sequence has to be non-regressing
+    /// against that order — not merely drawn from the right *set*, which is what a `Set`
+    /// comparison would check and what let `FINALIZING`-before-`UPLOADING_PARTITION` through.
+    fn assert_phases_never_regress(phases: &[String]) {
+        let ranks: Vec<usize> = phases
+            .iter()
+            .map(|name| {
+                let phase = PHASE_ORDER
+                    .iter()
+                    .copied()
+                    .find(|candidate| {
+                        serde_json::to_value(candidate).expect("a phase serializes") == json!(name)
+                    })
+                    .unwrap_or_else(|| panic!("'{name}' is not a contract phase"));
+                phase_rank(phase)
+            })
+            .collect();
+
+        for window in ranks.windows(2) {
+            assert!(
+                window[1] >= window[0],
+                "the published phase sequence regresses: {phases:?}"
+            );
         }
     }
 
@@ -286,6 +314,11 @@ mod temporal_activity {
     /// All six phases are reported, in the contract's order, and `currentPartition` is present
     /// as an explicit `null` whenever no partition is being worked on — TypeScript spells the
     /// field `.nullable()`, not `.optional()`.
+    ///
+    /// The sequence below is the one the *Activity* drives, in the order it drives it: the
+    /// adapter emits `DOWNLOADING_SOURCE`, the processor reports through `ProgressSink` until its
+    /// local build is done, and only then does the adapter emit its own `UPLOADING_PARTITION` and
+    /// `FINALIZING`. Restating the contract's order by hand would prove nothing about that.
     #[test]
     fn reports_every_phase_and_a_null_partition_when_there_is_none() {
         let (channel, reporter) = reporter();
@@ -296,7 +329,7 @@ mod temporal_activity {
             IngestionPhase::WritingDuckdb,
             IngestionPhase::ExportingParquet,
         ] {
-            reporter.report(&ProgressEvent::phase(phase));
+            let _ = reporter.report(&ProgressEvent::phase(phase));
         }
         reporter.emit(IngestionPhase::UploadingPartition, Some("1"));
         reporter.emit(IngestionPhase::Finalizing, None);
@@ -312,6 +345,7 @@ mod temporal_activity {
                 "FINALIZING",
             ]
         );
+        assert_phases_never_regress(&channel.phases());
 
         // The wire text itself, not a re-serialization of it: the frozen payload has exactly
         // these six camelCase keys, in this order.
@@ -348,7 +382,7 @@ mod temporal_activity {
     fn projects_processor_progress_events_onto_the_wire_heartbeat() {
         let (channel, reporter) = reporter();
 
-        reporter.report(&ProgressEvent {
+        let _ = reporter.report(&ProgressEvent {
             processed_bytes: 8_192,
             processed_variants: 5_000,
             current_partition: Some("X".to_string()),
@@ -376,7 +410,7 @@ mod temporal_activity {
     fn accumulates_uploaded_bytes_across_partitions() {
         let (channel, reporter) = reporter();
 
-        reporter.report(&ProgressEvent {
+        let _ = reporter.report(&ProgressEvent {
             processed_bytes: 1_024,
             processed_variants: 1_500,
             completed_files: 2,
@@ -398,16 +432,61 @@ mod temporal_activity {
         assert_eq!(heartbeats[2]["processedVariants"], json!(1_500));
     }
 
+    /// The regression: the processor's last observation used to arrive with the phase
+    /// `FINALIZING`, and the reporter passed it straight to the wire. Uploads then ran and
+    /// emitted `UPLOADING_PARTITION`, and the adapter emitted `FINALIZING` again — so a consumer
+    /// polling heartbeats saw the run reach the terminal phase, regress, and reach it again.
+    ///
+    /// `FINALIZING` is the adapter's to publish, exactly once, after the uploads. Whatever the
+    /// processor reports, the projection must not let it through as the terminal phase.
+    #[test]
+    fn the_processor_can_never_drive_the_wire_to_the_terminal_phase() {
+        let (channel, reporter) = reporter();
+
+        reporter.emit(IngestionPhase::DownloadingSource, None);
+        let _ = reporter.report(&ProgressEvent::phase(IngestionPhase::Parsing));
+        // The processor signalling "my local build is complete".
+        let _ = reporter.report(&ProgressEvent {
+            processed_variants: 1_000,
+            completed_files: 6,
+            ..ProgressEvent::phase(IngestionPhase::Finalizing)
+        });
+        reporter.emit(IngestionPhase::UploadingPartition, Some("1"));
+        reporter.emit(IngestionPhase::Finalizing, None);
+
+        let phases = channel.phases();
+        assert_eq!(
+            phases,
+            [
+                "DOWNLOADING_SOURCE",
+                "PARSING",
+                "EXPORTING_PARQUET",
+                "UPLOADING_PARTITION",
+                "FINALIZING",
+            ],
+            "a processor event must never be published as FINALIZING"
+        );
+        assert_phases_never_regress(&phases);
+        assert_eq!(
+            phases.iter().filter(|phase| *phase == "FINALIZING").count(),
+            1,
+            "FINALIZING is published once, by the adapter, and is terminal"
+        );
+        // The counters the absorbed event carried are still projected — only the phase is.
+        assert_eq!(channel.heartbeats()[2]["completedFiles"], json!(6));
+        assert_eq!(channel.heartbeats()[2]["processedVariants"], json!(1_000));
+    }
+
     /// The keepalive re-sends the last observation unchanged, so a long uninterruptible stage —
-    /// a multi-gigabyte download, a single DuckDB `COPY` — cannot trip the 15-second
+    /// a multi-gigabyte download, a per-partition DuckDB `COPY` — cannot trip the 15-second
     /// `heartbeatTimeout` the workflow sets.
     #[test]
     fn the_keepalive_re_emits_the_last_observation_unchanged() {
         let (channel, reporter) = reporter();
 
         reporter.emit(IngestionPhase::DownloadingSource, None);
-        reporter.reemit();
-        reporter.reemit();
+        assert_eq!(reporter.reemit(), KeepaliveTick::Published);
+        assert_eq!(reporter.reemit(), KeepaliveTick::Published);
 
         let heartbeats = channel.heartbeats();
         assert_eq!(heartbeats.len(), 3);
@@ -415,37 +494,95 @@ mod temporal_activity {
         assert_eq!(heartbeats[1], heartbeats[2]);
     }
 
+    /// …but only for a bounded stretch. An unbounded keepalive re-reports a *stalled* worker
+    /// just as faithfully as a busy one, which converts the workflow's 15-second
+    /// `heartbeatTimeout` into its 30-minute `startToCloseTimeout`: a hung S3 read, a DuckDB
+    /// deadlock in the per-partition `COPY` or a wedged upload would all be invisible until then.
+    ///
+    /// Once the budget is spent the reporter publishes nothing, the server stops seeing
+    /// heartbeats, and its own timeout gets to do its job.
+    #[test]
+    fn the_keepalive_stops_re_emitting_a_stalled_observation() {
+        let (channel, reporter) = reporter();
+        reporter.emit(IngestionPhase::WritingDuckdb, None);
+
+        for tick in 0..KEEPALIVE_BUDGET_TICKS {
+            assert_eq!(
+                reporter.reemit(),
+                KeepaliveTick::Published,
+                "tick {tick} is still inside the budget"
+            );
+        }
+        for _ in 0..10 {
+            assert_eq!(
+                reporter.reemit(),
+                KeepaliveTick::BudgetSpent,
+                "a stalled observation must not be carried past the budget"
+            );
+        }
+        assert_eq!(
+            channel.heartbeats().len(),
+            1 + KEEPALIVE_BUDGET_TICKS as usize,
+            "nothing may reach the wire once the budget is spent"
+        );
+    }
+
+    /// The bound detects a *stall*, not a long healthy activity: any real progress is a new
+    /// observation, and restores the whole budget.
+    #[test]
+    fn progress_restores_the_keepalive_budget() {
+        let (channel, reporter) = reporter();
+        reporter.emit(IngestionPhase::DownloadingSource, None);
+
+        for _ in 0..KEEPALIVE_BUDGET_TICKS {
+            reporter.reemit();
+        }
+        assert_eq!(reporter.reemit(), KeepaliveTick::BudgetSpent);
+
+        // One partition finishes uploading: a genuinely new observation.
+        reporter.note_uploaded_bytes(4_096);
+        reporter.emit(IngestionPhase::UploadingPartition, Some("1"));
+        assert_eq!(reporter.reemit(), KeepaliveTick::Published);
+
+        let published = channel.heartbeats().len();
+        assert_eq!(published, 1 + KEEPALIVE_BUDGET_TICKS as usize + 2);
+        assert_phases_never_regress(&channel.phases());
+    }
+
     // -----------------------------------------------------------------------------------
     // Step 4 — cancellation
     // -----------------------------------------------------------------------------------
 
-    /// The processor is a blocking call with a `-> ()` progress callback, so the heartbeat
-    /// boundary is the only place it can be stopped. Once the activity is cancelled the very
-    /// next boundary must abandon the run rather than read or write anything further.
+    /// The processor is a blocking call, so a progress boundary is the only place it can be
+    /// stopped. Once the activity is cancelled the very next boundary must answer
+    /// `ControlFlow::Break`, which is how `build_artifact` learns to abandon the run rather than
+    /// read or write anything further.
+    ///
+    /// This replaces an earlier design in which the sink unwound out of the processor with a
+    /// private panic payload, because `ProgressSink::report` returned `()`. The seam is
+    /// crate-local and not part of the cross-language contract, so it now returns a
+    /// `ControlFlow` and there is no panic-as-control-flow left to contain.
     #[test]
-    fn cancellation_stops_the_processor_at_the_next_heartbeat_boundary() {
-        install_quiet_cancellation_panic_hook();
+    fn cancellation_stops_the_processor_at_the_next_progress_boundary() {
         let (channel, reporter) = reporter();
-        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut observed = Vec::new();
 
-        let recorded = observed.clone();
-        let outcome = run_until_cancelled(|| {
-            for step in 0..10u64 {
-                recorded.lock().expect("steps").push(step);
-                reporter.report(&ProgressEvent {
-                    processed_variants: step,
-                    ..ProgressEvent::phase(IngestionPhase::WritingDuckdb)
-                });
-                if step == 2 {
-                    channel.cancel();
-                }
+        for step in 0..10u64 {
+            observed.push(step);
+            let flow = reporter.report(&ProgressEvent {
+                processed_variants: step,
+                ..ProgressEvent::phase(IngestionPhase::WritingDuckdb)
+            });
+            if flow.is_break() {
+                break;
             }
-            "the processor finished"
-        });
+            if step == 2 {
+                channel.cancel();
+            }
+        }
 
-        assert_eq!(outcome, None, "a cancelled run must not produce a result");
         assert_eq!(
-            *observed.lock().expect("steps"),
+            observed,
             [0, 1, 2, 3],
             "work must stop at the first boundary after the cancellation, not before or later"
         );
@@ -456,26 +593,21 @@ mod temporal_activity {
         );
     }
 
-    /// A run that is never cancelled must be completely unaffected — the abort path must not
-    /// swallow the result, and a genuine panic must still propagate rather than be reported as
-    /// a cancellation.
+    /// A run that is never cancelled must be completely unaffected: every boundary continues.
     #[test]
-    fn an_uncancelled_run_returns_its_result() {
-        install_quiet_cancellation_panic_hook();
+    fn an_uncancelled_run_is_never_asked_to_stop() {
         let (_channel, reporter) = reporter();
 
-        let outcome = run_until_cancelled(|| {
-            reporter.report(&ProgressEvent::phase(IngestionPhase::Parsing));
-            41 + 1
-        });
-        assert_eq!(outcome, Some(42));
-    }
-
-    #[test]
-    #[should_panic(expected = "a genuine bug")]
-    fn a_real_panic_is_not_mistaken_for_a_cancellation() {
-        install_quiet_cancellation_panic_hook();
-        let _: Option<()> = run_until_cancelled(|| panic!("a genuine bug"));
+        for phase in [
+            IngestionPhase::Parsing,
+            IngestionPhase::WritingDuckdb,
+            IngestionPhase::ExportingParquet,
+        ] {
+            assert_eq!(
+                reporter.report(&ProgressEvent::phase(phase)),
+                ControlFlow::Continue(())
+            );
+        }
     }
 
     // -----------------------------------------------------------------------------------
@@ -513,7 +645,14 @@ mod temporal_activity {
     /// below the attempt prefix it is handed. Nothing checked that the *attempt prefix itself*
     /// sits below `datasets/{datasetId}/versions/{artifactVersion}/`, which is what TypeScript
     /// enforces as `ATTEMPT_PREFIX_OUTSIDE_ALLOWED_PREFIX`. A widened `allowedPrefix` such as
-    /// `datasets/` satisfies every containment check downstream, so it has to be refused here.
+    /// `datasets/` satisfies every containment check downstream.
+    ///
+    /// The check that gates is the equality against the *derived* prefix, which is what this
+    /// test exercises. Containment itself is structural — the attempt prefix is built by
+    /// extending the derived value, never by trusting the wire — so a runtime
+    /// `starts_with` re-check on a string built as `format!("{allowed}attempt-{n}/")` could not
+    /// fail and is not attempted; `derives_an_attempt_prefix_below_the_allowed_version_prefix`
+    /// asserts the two functions compose that way.
     #[test]
     fn refuses_an_allowed_prefix_that_is_not_the_derived_one() {
         for widened in [
@@ -727,6 +866,51 @@ mod temporal_activity {
             assert!(!name.contains('\\'), "'{name}' must stay a single segment");
             assert!(!name.contains(".."), "'{name}' must not climb out");
             assert!(!name.contains('\0'), "'{name}' must be a usable file name");
+        }
+    }
+
+    /// Sanitizing an identifier is lossy twice over — every unsafe character folds onto `_`, and
+    /// the fragment is truncated — so two different Workflow IDs could name one workspace. The
+    /// loser of that race fails `AttemptWorkspace::create`, which is *safe* (an attempt never
+    /// reuses a path) but costs a retry nobody needed. Distinct identifiers must produce
+    /// distinct names.
+    #[test]
+    fn workspace_names_do_not_collide_when_identifiers_sanitize_alike() {
+        let colliding = [
+            "ingest-ds:1",
+            "ingest-ds/1",
+            "ingest-ds 1",
+            "ingest-ds.1",
+            "ingest-ds_1",
+        ];
+        let names: Vec<String> = colliding
+            .iter()
+            .map(|workflow_id| attempt_workspace_name(workflow_id, "2", 1))
+            .collect();
+        let distinct: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            colliding.len(),
+            "identifiers that sanitize alike must still get their own workspace: {names:?}"
+        );
+
+        // Truncation is lossy in the same way, and must be disambiguated too.
+        let long = "w".repeat(200);
+        assert_ne!(
+            attempt_workspace_name(&long, "2", 1),
+            attempt_workspace_name(&format!("{long}-other"), "2", 1)
+        );
+
+        // The activity id half is sanitized the same way.
+        assert_ne!(
+            attempt_workspace_name("wf-1", "a:1", 1),
+            attempt_workspace_name("wf-1", "a/1", 1)
+        );
+
+        // Still a single, usable path segment, and still attempt-scoped.
+        for name in &names {
+            assert!(!name.contains('/') && !name.contains(".."), "{name}");
+            assert!(name.ends_with("-attempt-1"), "{name}");
         }
     }
 

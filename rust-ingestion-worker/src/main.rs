@@ -83,8 +83,11 @@ fn main() -> Result<()> {
         batch_size: DEFAULT_BATCH_SIZE,
     };
 
+    // `NoopProgressSink` never asks the build to stop, so `None` is unreachable here; the debug
+    // CLI has no cancellation to express.
     let stats = build_artifact(&request, &NoopProgressSink)
-        .with_context(|| format!("failed to build a dataset from {}", request.source_path.display()))?;
+        .with_context(|| format!("failed to build a dataset from {}", request.source_path.display()))?
+        .expect("the debug CLI's progress sink never interrupts a build");
 
     info!(
         "Ingested {} variants ({} rejected) into {} Parquet files under '{}'; dataset checksum {}",
