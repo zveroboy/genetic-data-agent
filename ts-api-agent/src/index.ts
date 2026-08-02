@@ -6,7 +6,13 @@ import { Hono } from 'hono';
 import { Connection, Client } from '@temporalio/client';
 import { askBioinformaticsAgent } from './infrastructure/ai/agent.ts';
 import { duckDbRepository } from './infrastructure/database/duckdb.ts';
-import { getProgressQuery, type IngestionProgress, GenomicIngestionWorkflow } from './application/workflows.ts';
+import { newDatasetId } from './application/dataset-catalog.ts';
+import {
+  CONTROL_PLANE_TASK_QUEUE,
+  GenomicIngestionWorkflow,
+  getProgressQuery,
+} from './application/workflows.ts';
+import { DATASET_KEYS, isDatasetKey } from './domain/datasets.ts';
 
 export const app = new Hono();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -41,104 +47,47 @@ app.get('/', (c) => c.html(getHtmlUi()));
 app.get('/ui', (c) => c.html(getHtmlUi()));
 app.get('/health', (c) => c.json({ status: 'ok', service: 'ts-api-agent' }));
 
-// Simulation Map for In-Memory Fallback if Temporal is offline
-const fallbackWorkflows = new Map<string, { progress: IngestionProgress; timer?: NodeJS.Timeout }>();
-
+/**
+ * Starts one real ingestion run.
+ *
+ * The request chooses a seeded catalog key and nothing else; the S3 identity comes from the
+ * allowlist inside the workflow's first activity. There is no simulation fallback: fabricating
+ * a progress stream would report a dataset as ingested when no manifest was ever published.
+ */
 app.post('/api/ingestion/start', async (c) => {
+  let body: { datasetKey?: string } = {};
   try {
-    let body: { fileKey?: string } = {};
-    try {
-      body = await c.req.json();
-    } catch {}
+    body = await c.req.json();
+  } catch {}
 
-    const fileKey = body.fileKey || 'tests/fixtures/demo_user.vcf';
-    const userId = fileKey.includes('na12878') ? 'user-na12878' : 'user-demo-01';
+  const datasetKey = body.datasetKey ?? 'demo-small';
+  if (!isDatasetKey(datasetKey)) {
+    return c.json({ error: `unknown dataset key '${datasetKey}'`, allowed: DATASET_KEYS }, 400);
+  }
 
-    // 1. Try connecting to Temporal
-    const temporalHost = process.env.TEMPORAL_HOST || 'localhost:7233';
-    try {
-      const connection = await Connection.connect({ address: temporalHost });
-      const client = new Client({ connection });
+  const datasetId = newDatasetId(datasetKey);
+  const temporalHost = process.env.TEMPORAL_HOST || 'localhost:7233';
 
-      const handle = await client.workflow.start(GenomicIngestionWorkflow, {
-        args: [userId, fileKey],
-        taskQueue: 'genomic-ingestion',
-        workflowId: `genomic-ingestion-${userId}-${Date.now()}`,
-      });
+  try {
+    const connection = await Connection.connect({ address: temporalHost });
+    const client = new Client({ connection });
 
-      console.log(`[Temporal] Started GenomicIngestionWorkflow ID: ${handle.workflowId}`);
-      return c.json({ workflowId: handle.workflowId, status: 'started', mode: 'temporal' });
-    } catch (temporalErr: any) {
-      console.warn(`[Temporal Connection Warning]: Could not connect to ${temporalHost}, switching to Simulation Mode.`, temporalErr.message);
+    const handle = await client.workflow.start(GenomicIngestionWorkflow, {
+      args: [{ datasetId, datasetKey }],
+      taskQueue: CONTROL_PLANE_TASK_QUEUE,
+      workflowId: `genomic-ingestion-${datasetId}`,
+    });
 
-      // 2. Fallback Simulation Mode
-      const simId = `sim-wf-${Date.now()}`;
-      const simProgress: IngestionProgress = {
-        step: 'DOWNLOADING_S3',
-        fileKey,
-        percentage: 10,
-        message: 'Checking and downloading genomic VCF file from S3 storage...',
-      };
-
-      fallbackWorkflows.set(simId, { progress: simProgress });
-
-      // Automatically advance simulation steps
-      setTimeout(async () => {
-        const wf = fallbackWorkflows.get(simId);
-        if (!wf) return;
-        wf.progress = {
-          step: 'PARSING_VCF',
-          fileKey,
-          percentage: 45,
-          message: 'Multi-threaded parsing & indexing via Rust Rayon engine into DuckDB...',
-        };
-      }, 1500);
-
-      setTimeout(async () => {
-        const wf = fallbackWorkflows.get(simId);
-        if (!wf) return;
-        wf.progress = {
-          step: 'VALIDATING',
-          fileKey,
-          percentage: 85,
-          message: 'Running ACMG validation and genetic variant integrity checks...',
-        };
-      }, 3000);
-
-      setTimeout(async () => {
-        const wf = fallbackWorkflows.get(simId);
-        if (!wf) return;
-        const realNa12878Path = ['data/na12878_hg001.vcf.gz', '/app/data/na12878_hg001.vcf.gz', '../data/na12878_hg001.vcf.gz'].find((p) => fs.existsSync(p));
-        await autoInitFixtures(fileKey.includes('na12878') ? realNa12878Path : undefined);
-        wf.progress = {
-          step: 'COMPLETED',
-          fileKey,
-          percentage: 100,
-          message: 'Genomic dataset successfully ingested, indexed, and validated in DuckDB!',
-        };
-      }, 4500);
-
-      return c.json({ workflowId: simId, status: 'started', mode: 'simulation' });
-    }
+    console.log(`[Temporal] Started GenomicIngestionWorkflow ID: ${handle.workflowId}`);
+    return c.json({ workflowId: handle.workflowId, datasetId, datasetKey, status: 'started' });
   } catch (err: any) {
     console.error('[API Server /api/ingestion/start Error]:', err);
-    return c.json({ error: err.message || String(err) }, 500);
+    return c.json({ error: `could not reach Temporal at ${temporalHost}: ${err.message}` }, 503);
   }
 });
 
 app.get('/api/ingestion/status/:workflowId', async (c) => {
   const workflowId = c.req.param('workflowId');
-
-  // Check Simulation Fallback Workflows
-  if (workflowId.startsWith('sim-wf-')) {
-    const sim = fallbackWorkflows.get(workflowId);
-    if (!sim) {
-      return c.json({ error: 'Simulation workflow not found' }, 404);
-    }
-    return c.json(sim.progress);
-  }
-
-  // Check Temporal Query
   const temporalHost = process.env.TEMPORAL_HOST || 'localhost:7233';
   try {
     const connection = await Connection.connect({ address: temporalHost });

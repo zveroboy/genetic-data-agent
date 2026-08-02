@@ -1,36 +1,42 @@
-import { Connection, Client } from '@temporalio/client';
-import { GenomicIngestionWorkflow } from './workflows.ts';
-import path from 'path';
-import fs from 'fs';
+/**
+ * Manual trigger for one ingestion run.
+ *
+ * The only thing a caller chooses is a seeded catalog key. There is no path, no URL and no
+ * bucket to pass: `inspectDatasetSource` resolves the key to its allowlisted S3 object, and the
+ * dataset id minted here names the immutable artifact prefix that run may write under.
+ *
+ *   node ts-api-agent/src/application/trigger_workflow.ts [demo-small|na12878-full]
+ */
+import { Client, Connection } from '@temporalio/client';
 
-async function run() {
-  console.log('[Temporal Client] Connecting to localhost:7233...');
-  const connection = await Connection.connect({ address: 'localhost:7233' });
-  const client = new Client({ connection });
+import { datasetCatalog, newDatasetId } from './dataset-catalog.ts';
+import { CONTROL_PLANE_TASK_QUEUE, GenomicIngestionWorkflow } from './workflows.ts';
 
-  const workflowId = `genomic-ingestion-${Date.now()}`;
-  const vcfArg = process.argv[2] || 'tests/fixtures/demo_user.vcf';
-  const vcfPath = path.resolve(process.cwd(), vcfArg);
+async function run(): Promise<void> {
+  const entry = datasetCatalog.get(process.argv[2] ?? 'demo-small');
+  const datasetId = newDatasetId(entry.key);
+  const address = process.env.TEMPORAL_HOST ?? 'localhost:7233';
 
-  if (!fs.existsSync(vcfPath)) {
-    throw new Error(`VCF file not found at path: ${vcfPath}`);
+  console.log(`[Temporal Client] Connecting to ${address}...`);
+  const connection = await Connection.connect({ address });
+
+  try {
+    const client = new Client({ connection });
+    const handle = await client.workflow.start(GenomicIngestionWorkflow, {
+      taskQueue: CONTROL_PLANE_TASK_QUEUE,
+      workflowId: `genomic-ingestion-${datasetId}`,
+      args: [{ datasetId, datasetKey: entry.key }],
+    });
+
+    console.log(`✔ Started ${handle.workflowId}`);
+    console.log(`  Dataset:  ${entry.key} (${entry.displayName})`);
+    console.log(`  Source:   s3://${entry.source.bucket}/${entry.source.key}`);
+    console.log(
+      `  Temporal: http://localhost:8233/namespaces/default/workflows/${handle.workflowId}`,
+    );
+  } finally {
+    await connection.close();
   }
-
-  const userId = vcfArg.includes('na12878') ? 'user-na12878' : 'user-demo-01';
-
-  console.log(`[Temporal Client] Starting GenomicIngestionWorkflow (ID: ${workflowId})...`);
-  console.log(`  User ID:  ${userId}`);
-  console.log(`  VCF File: ${vcfPath}`);
-
-  const handle = await client.workflow.start(GenomicIngestionWorkflow, {
-    taskQueue: 'genomic-ingestion',
-    workflowId,
-    args: [userId, vcfPath],
-  });
-
-  console.log(`\n✔ Workflow started successfully!`);
-  console.log(`  WorkflowID: ${handle.workflowId}`);
-  console.log(`  👉 View live in Temporal Web UI: http://localhost:8233/namespaces/default/workflows/${handle.workflowId}`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

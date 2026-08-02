@@ -5,6 +5,8 @@
  * catalog key and nothing else: arbitrary uploads, URLs, `s3://` URIs and filesystem paths
  * are rejected here rather than being sanitised downstream.
  */
+import { randomUUID } from 'node:crypto';
+
 import {
   DATASET_KEYS,
   REFERENCE_BUILD,
@@ -12,6 +14,20 @@ import {
   isDatasetKey,
 } from '../domain/datasets.ts';
 import type { DatasetCatalogEntry, DatasetKey } from '../domain/datasets.ts';
+
+/**
+ * Mints the identity of one ingestion run.
+ *
+ * A fresh id per run is what makes `datasets/{datasetId}/manifest.json` a conditional,
+ * never-overwritten write: two ingestions of the same catalog key never contend for one
+ * manifest key. The result is a single safe path segment, as the wire schema requires.
+ *
+ * This is a caller-side helper, not workflow code — the workflow receives the id in its input
+ * precisely because generating one is nondeterministic.
+ */
+export function newDatasetId(datasetKey: DatasetKey, uuid: string = randomUUID()): string {
+  return `${datasetKey}-${uuid}`;
+}
 
 export class UnknownDatasetKeyError extends Error {
   readonly requestedKey: string;
