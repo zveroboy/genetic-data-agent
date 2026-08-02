@@ -221,6 +221,46 @@ Bucket, key prefix, the `variants/` segment, ETag and version ID are deliberatel
 re-running the same source into a different attempt prefix must reproduce the same checksum,
 and the Rust processor must be able to compute it from local descriptors before any upload.
 
+## S3 storage conventions
+
+Two conventions bind the manifest's `etag`/`checksumSha256` fields to the underlying S3
+protocol. Neither is derivable from the wire schemas above, so both are frozen here,
+normatively, independent of any comment in either language's implementation. An uploader and a
+verifier that disagree on either will fail every publish with `CHECKSUM_METADATA_MISSING` or
+`ETAG_MISMATCH`.
+
+### Checksum metadata entry
+
+The content checksum recorded as `checksumSha256` MUST also be written as S3 **user metadata**
+on the object itself, under the metadata name `sha256` (the S3 wire header this produces is
+`x-amz-meta-sha256`). The value is the same lowercase hex-encoded SHA-256 digest of the
+object's raw body used for `checksumSha256` — not the ETag, not a digest of anything else, and
+not upper-case or mixed-case hex.
+
+- Uploaders MUST set this exact metadata entry on every object whose `checksumSha256` a
+  verifier will check.
+- Verifiers read it back with a `HEAD`, lower-case the value before comparison (some
+  intermediaries case-normalize header values), and reject the object as
+  `CHECKSUM_METADATA_MISSING` when the entry is absent or `CHECKSUM_METADATA_MISMATCH` when the
+  value disagrees with the declared `checksumSha256`.
+
+### ETag canonical form
+
+Every `etag` field (`source.etag`, `parquetObjects[].etag`) and every ETag compared during
+verification is recorded and compared in **canonical, unquoted** form:
+
+- The raw `ETag` HTTP header S3 returns is wrapped in double quotes, e.g.
+  `"d41d8cd98f00b204e9800998ecf8427e"`. The canonical form is that value with the surrounding
+  quotes removed and nothing else altered.
+- A multipart upload's ETag carries a `-N` suffix denoting the number of parts, e.g.
+  `"d41d8cd98f00b204e9800998ecf8427e-3"`. Canonicalization strips only the surrounding quotes;
+  the `-N` suffix is left intact. Implementations MUST NOT interpret, strip, recompute, or
+  otherwise treat the pre-`-N` portion as an MD5 of the whole object once a `-N` suffix is
+  present — it is not one.
+- Producers and verifiers on both sides of the language boundary MUST store and compare ETags
+  in this unquoted form. A raw quoted header value stored verbatim will fail every
+  `ETAG_MISMATCH` comparison against a canonicalized peer, and vice versa.
+
 ## Canonical inventory invariants
 
 Enforced by `assertCanonicalArtifactInventory` before anything is published or queried:

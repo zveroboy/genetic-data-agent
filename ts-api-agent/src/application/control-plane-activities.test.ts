@@ -449,7 +449,7 @@ describe('publishDataset writes no manifest when verification fails', () => {
       readonly input: typeof goldenInput;
       readonly result: BuildDatasetArtifactResult;
     },
-    expected: new (...args: never[]) => Error,
+    expected: NonNullable<Parameters<typeof assert.rejects>[1]>,
   ): Promise<FakeObjectStore> {
     const store = new FakeObjectStore();
     const { input, result } = prepare(store);
@@ -493,7 +493,30 @@ describe('publishDataset writes no manifest when verification fails', () => {
         }),
       );
       return pair;
-    }, Error);
+    }, /object store unavailable for/);
+  });
+
+  it('when the stored object carries no ETag (reaches ETAG_MISSING, not ETAG_MISMATCH)', async () => {
+    const store = new FakeObjectStore();
+    const pair = goldenPair(store);
+    const object = pair.result.parquetObjects[0]!;
+    store.seed({ bucket: object.bucket, key: object.key }, 'p'.repeat(object.byteSize), {
+      etag: null,
+      versionId: object.versionId,
+      checksumSha256: object.checksumSha256,
+    });
+    const { publishDataset } = activitiesFor(store);
+
+    await assert.rejects(
+      () => publishDataset(pair.input, pair.result),
+      (error: unknown) => {
+        assert.ok(error instanceof DatasetObjectVerificationError);
+        assert.equal(error.code, 'ETAG_MISSING');
+        return true;
+      },
+    );
+    assert.deepEqual(store.operationsMatching('PUT'), [], 'no manifest may be written');
+    assert.equal(await store.getJson(goldenManifestLocation), null);
   });
 
   it('when a declared ETag does not match the stored object', async () => {
@@ -607,6 +630,19 @@ describe('publishDataset writes no manifest when verification fails', () => {
       objectStore: store,
       artifactBucket: 'some-other-artifact-bucket',
       artifactVersion: goldenInput.target.artifactVersion,
+    });
+
+    await assert.rejects(() => publishDataset(goldenInput, goldenResult), ContractValidationError);
+    assert.deepEqual(store.operations, [], 'nothing may reach the store');
+  });
+
+  it('when the input targets an artifact version this worker does not publish', async () => {
+    const store = new FakeObjectStore();
+    seedGoldenInventory(store);
+    const { publishDataset } = createControlPlaneActivities({
+      objectStore: store,
+      artifactBucket: ARTIFACT_BUCKET,
+      artifactVersion: `${goldenInput.target.artifactVersion}-other`,
     });
 
     await assert.rejects(() => publishDataset(goldenInput, goldenResult), ContractValidationError);

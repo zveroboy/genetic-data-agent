@@ -5,12 +5,15 @@
  * exercised against an in-memory fake and the adapter stays replaceable.
  *
  * Two conventions cross the TypeScript/Rust boundary and must be mirrored by
- * `rust-ingestion-worker/src/object_store.rs`:
+ * `rust-ingestion-worker/src/object_store.rs`. Both are frozen, normatively, in
+ * `contracts/ingestion-v1.md` ("S3 storage conventions") — that document, not this comment, is
+ * the source of truth an implementer on either side should read:
  *
  * - Content checksums travel as the S3 user metadata entry named `CHECKSUM_METADATA_KEY`
  *   (`x-amz-meta-sha256` on the wire), holding a lowercase hex SHA-256 of the object body.
  * - The canonical ETag form is the S3 header value with its surrounding double quotes
  *   removed, so an ETag recorded by an uploader equals the ETag a later `head` reads back.
+ *   A multipart ETag's `-N` suffix is left untouched by canonicalization.
  *
  * A location is always a `{ bucket, key }` pair. `s3://` URIs and HTTP URLs are never
  * accepted, parsed or constructed here: an object's bucket comes from the seeded catalog or

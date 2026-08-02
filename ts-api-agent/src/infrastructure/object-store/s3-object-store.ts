@@ -84,8 +84,13 @@ export function s3ObjectStoreConfigFromEnv(
   };
 }
 
-/** S3 returns ETags quoted; the canonical cross-language form drops the quotes. */
-function canonicalEtag(raw: string | undefined): string | null {
+/**
+ * S3 returns ETags quoted; the canonical cross-language form drops the quotes and nothing
+ * else, so a multipart ETag's `-N` suffix survives untouched. See
+ * `contracts/ingestion-v1.md` ("S3 storage conventions") for the normative statement this
+ * implements.
+ */
+export function canonicalEtag(raw: string | undefined): string | null {
   if (raw === undefined || raw.length === 0) return null;
   return raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
 }
@@ -102,6 +107,21 @@ function isNotFound(error: unknown): boolean {
 function isPreconditionFailed(error: unknown): boolean {
   return (
     statusOf(error) === 412 || (error as { name?: string } | null)?.name === 'PreconditionFailed'
+  );
+}
+
+/**
+ * S3 documents two distinct HTTP statuses for a lost `If-None-Match: *` race: 412
+ * `PreconditionFailed` (the common case) and 409 `ConditionalRequestConflict`, returned when a
+ * concurrent conditional write to the same key is in flight. Both mean the same thing for
+ * manifest publication — someone else's write is (or will be) present — so both are treated as
+ * `{ outcome: 'exists' }` rather than letting 409 escape as a raw SDK error.
+ */
+function isConditionalWriteConflict(error: unknown): boolean {
+  return (
+    isPreconditionFailed(error) ||
+    statusOf(error) === 409 ||
+    (error as { name?: string } | null)?.name === 'ConditionalRequestConflict'
   );
 }
 
@@ -172,7 +192,14 @@ export class S3ObjectStore implements ObjectStore {
       throw error;
     }
 
-    if ((response.ContentLength ?? 0) > MAX_JSON_BYTES) {
+    // A response with no Content-Length must fail rather than silently skip the size guard:
+    // `transformToString` below would otherwise buffer an unbounded body.
+    if (response.ContentLength === undefined) {
+      throw new Error(
+        `'${location.bucket}/${location.key}' returned no Content-Length; refusing to buffer a body of unknown size`,
+      );
+    }
+    if (response.ContentLength > MAX_JSON_BYTES) {
       throw new Error(
         `'${location.bucket}/${location.key}' is ${response.ContentLength} bytes, above the ${MAX_JSON_BYTES} byte JSON limit`,
       );
@@ -207,7 +234,7 @@ export class S3ObjectStore implements ObjectStore {
         versionId: response.VersionId ?? null,
       };
     } catch (error) {
-      if (isPreconditionFailed(error)) return { outcome: 'exists' };
+      if (isConditionalWriteConflict(error)) return { outcome: 'exists' };
       throw error;
     }
   }

@@ -271,6 +271,17 @@ export function createControlPlaneActivities(
         );
       }
 
+      // Same reasoning as the bucket guard above: `target.artifactVersion` flows verbatim into
+      // `allowedPrefixFor` on both sides of `assertValidArtifactResult`/
+      // `assertValidDatasetManifest`, so a self-consistent but wrong version agrees with
+      // itself and would otherwise publish under a version this Worker never validated.
+      if (parsedInput.target.artifactVersion !== artifactVersion) {
+        throw new ContractValidationError(
+          'ARTIFACT_VERSION_MISMATCH',
+          `input targets artifact version '${parsedInput.target.artifactVersion}', this worker publishes version '${artifactVersion}'`,
+        );
+      }
+
       assertValidArtifactResult(parsedInput, parsedResult);
 
       const manifest = buildManifest(parsedInput, parsedResult);
