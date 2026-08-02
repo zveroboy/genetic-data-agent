@@ -23,19 +23,28 @@ cargo test --manifest-path rust-ingestion-worker/Cargo.toml contracts
   BigInt, buffers, class instances and serialized language-native errors are prohibited.
 - Every wire object is closed: `.strict()` in Zod, `deny_unknown_fields` in serde. An
   unexpected field is an error, never a silently ignored one.
+- A field documented as `T | null` is **nullable, not optional**: the key must be present and
+  may carry `null`. TypeScript spells this `.nullable()`; Rust must spell it
+  `#[serde(deserialize_with = "required_nullable")]` on the `Option<T>`, because a bare
+  `Option<T>` silently accepts an omitted key even under `deny_unknown_fields`.
+- Integers are plain JSON numbers. Rust narrows some of them (see the type column); a value
+  outside the Rust range is a contract violation, not a truncation.
 - Only the seeded catalog keys `demo-small` and `na12878-full` are accepted. Arbitrary
   uploads, URLs, `s3://` URIs and filesystem paths are rejected by
   `ts-api-agent/src/application/dataset-catalog.ts`; nothing downstream sanitises them.
 - Published Parquet objects are immutable and become queryable only once a matching
   `manifest.json` exists.
-- Workflow code must import the TypeScript module with `import type` only. The checksum
-  helper uses `node:crypto`, which is unavailable inside the Temporal workflow sandbox.
+- `ts-api-agent/src/application/ingestion-contracts.ts` is free of Node built-ins at import
+  and evaluation time, so Temporal **workflow** code may import its constants, schemas and
+  types by value. Everything needing `node:crypto` lives in
+  `ts-api-agent/src/application/dataset-checksum.ts`, which workflow code must not import; a
+  test enforces the boundary.
 
 ## Versioning
 
 | Constant           | Value | Meaning                                                        |
 | ------------------ | ----- | -------------------------------------------------------------- |
-| `contractVersion`  | `1`   | Activity input envelope. Rejected by the input schema if not 1. |
+| `contractVersion`  | `1`   | Activity input envelope. Rejected during deserialization if not 1, on both sides: `z.literal(1)` in TypeScript, the validating `ContractVersion` newtype in Rust. |
 | `layoutVersion`    | `1`   | Physical prefix shape and partition directories.                |
 | `schemaVersion`    | `1`   | Logical Parquet column set.                                     |
 | `artifactFormat`   | `"parquet-dataset"` | The only supported artifact format at layout 1.    |
@@ -43,15 +52,40 @@ cargo test --manifest-path rust-ingestion-worker/Cargo.toml contracts
 ## Object layout
 
 ```text
-s3://<target.bucket>/datasets/{datasetId}/versions/{artifactVersion}/attempt-{attempt}/chrom=<value>/<file>.parquet
+s3://<target.bucket>/datasets/{datasetId}/versions/{artifactVersion}/attempt-{attempt}/variants/chrom=<value>/part-NNN.parquet
 s3://<target.bucket>/datasets/{datasetId}/manifest.json
 ```
 
-- `target.allowedPrefix` is `datasets/{datasetId}/versions/{artifactVersion}/`.
+### Key composition
+
+An object key is composed of exactly three parts:
+
+```text
+key          = attemptPrefix + "variants/" + relativePath
+attemptPrefix = allowedPrefix + "attempt-{attempt}/"
+allowedPrefix = "datasets/{datasetId}/versions/{artifactVersion}/"
+relativePath  = "chrom=<value>/part-NNN.parquet"
+```
+
+**`relativePath` does not contain the `variants/` segment.** That is deliberate and load
+bearing: `relativePath` is the unit the dataset checksum is computed from, and the Rust
+processor emits it relative to its *local* Parquet export directory, with no S3 knowledge.
+The `variants/` segment is contributed only by the S3 mapping layer. Consequently the same
+dataset content yields the same `datasetChecksumSha256` whatever prefix it is uploaded under.
+
+Validation strips `{attemptPrefix}variants/` — not merely `{attemptPrefix}` — to recover
+`relativePath`, and rejects with `KEY_OUTSIDE_ALLOWED_PREFIX` any key that does not sit under
+that exact prefix, including one that omits `variants/`. The segment is named
+`VARIANTS_SEGMENT` in both languages.
+
+- `target.allowedPrefix` is `datasets/{datasetId}/versions/{artifactVersion}/`. It is
+  **derived and re-checked**, never trusted as sent: a widened value such as `datasets/`
+  would otherwise satisfy every containment check. See `ALLOWED_PREFIX_MISMATCH`.
 - `attemptPrefix` is strictly below `allowedPrefix` and unique per activity attempt, so a
   retry can never append to or overwrite a previous attempt's objects.
 - Dataset, version and attempt segments must not contain `=`; `=` appears only in the
-  `chrom=<value>` partition directory.
+  `chrom=<value>` partition directory. `variants` is a plain segment for the same reason the
+  attempt segment is `attempt-{attempt}`: it must not become an accidental Hive column.
 - `partitionSpec` is `["chrom"]`; `sortOrder` is `["chrom", "pos", "ref", "alt"]`.
 - The physical Parquet schema is `pos`, `rsid`, `ref`, `alt`, `gt_raw`. `chrom` is not a
   physical column: it is restored from the partition directory via
@@ -107,15 +141,21 @@ Each `parquetObjects` entry:
 | Field            | JSON type      | Notes                                          |
 | ---------------- | -------------- | ---------------------------------------------- |
 | `bucket`         | string         | Same bucket for every entry.                    |
-| `key`            | string         | Below `attemptPrefix`.                          |
+| `key`            | string         | `{attemptPrefix}variants/chrom=<value>/part-NNN.parquet`. |
 | `etag`           | string         | Returned by the upload.                         |
 | `versionId`      | string \| null | `null` when the bucket is unversioned.          |
 | `chrom`          | string         | Must equal the `chrom=<value>` directory.       |
 | `checksumSha256` | string         | SHA-256 of the file content, lowercase hex.     |
 | `byteSize`       | number         | Object size in bytes.                           |
 | `rowCount`       | number         | Rows in the file.                               |
-| `minPos`         | number         | Minimum `pos`, used for row-group pruning.      |
-| `maxPos`         | number         | Maximum `pos`, used for row-group pruning.      |
+| `minPos`         | number         | Minimum `pos`, used for row-group pruning. Bounded by `u32` — see below. |
+| `maxPos`         | number         | Maximum `pos`, used for row-group pruning. Bounded by `u32` — see below. |
+
+`minPos`/`maxPos` are `u32` in Rust, matching the DuckDB `UINTEGER` `pos` column and
+`models::UserVariant::pos`. TypeScript validates them only as non-negative safe integers, so
+TypeScript is the wider of the two: a value above `4294967295` parses in TypeScript and fails
+to deserialize in Rust. That bound is a deliberate part of the contract, not an oversight —
+no human chromosome exceeds it. Producers must stay within `u32`.
 
 ### `DatasetManifest`
 
@@ -158,19 +198,28 @@ Activity heartbeat detail. Phases, in order: `DOWNLOADING_SOURCE`, `PARSING`,
 `datasetChecksumSha256` identifies dataset *content*, independent of which activity attempt
 produced it. It is computed from **relative** descriptors:
 
-1. For each Parquet object, take `relativePath = key` with `attemptPrefix` removed.
+1. For each Parquet object, take `relativePath = key` with the `{attemptPrefix}variants/`
+   prefix removed — so `relativePath` is `chrom=<value>/part-NNN.parquet`, never carrying the
+   `variants/` segment. A key not under that prefix is a validation failure, not input to the
+   hash.
 2. Emit one line per object, tab separated, terminated by `\n`:
 
    ```text
    {chrom}\t{relativePath}\t{checksumSha256}\t{byteSize}\t{rowCount}\t{minPos}\t{maxPos}\n
    ```
 
+   The four integer fields are rendered as **unpadded base-10 ASCII digits**: no leading
+   zeros, no `+`/`-` sign, no thousands separators, no exponent, no decimal point. `0`
+   renders as the single character `0`. This is what JavaScript's
+   `Number.prototype.toString()` and Rust's `Display for u32`/`u64` both produce for the
+   non-negative integers these fields hold, so neither implementation needs a format string.
 3. Sort the lines byte-wise ascending by `(chrom, relativePath)` — a UTF-8 byte comparison,
    not a numeric chromosome order, so `"1" < "10" < "12" < "2"`.
 4. The checksum is the lowercase hex SHA-256 of the concatenated lines.
 
-Bucket, key prefix, ETag and version ID are deliberately excluded: re-running the same
-source into a different attempt prefix must reproduce the same checksum.
+Bucket, key prefix, the `variants/` segment, ETag and version ID are deliberately excluded:
+re-running the same source into a different attempt prefix must reproduce the same checksum,
+and the Rust processor must be able to compute it from local descriptors before any upload.
 
 ## Canonical inventory invariants
 
@@ -179,8 +228,9 @@ Enforced by `assertCanonicalArtifactInventory` before anything is published or q
 | Code                                    | Rejects                                                     |
 | --------------------------------------- | ----------------------------------------------------------- |
 | `EMPTY_INVENTORY`                       | A dataset declaring no Parquet object.                       |
+| `ALLOWED_PREFIX_MISMATCH`               | An input `allowedPrefix` that is not the prefix derived from its own `datasetId`/`artifactVersion`. |
 | `ATTEMPT_PREFIX_OUTSIDE_ALLOWED_PREFIX` | An attempt prefix not strictly below the allowed prefix.     |
-| `KEY_OUTSIDE_ALLOWED_PREFIX`            | An object key outside the attempt prefix.                    |
+| `KEY_OUTSIDE_ALLOWED_PREFIX`            | An object key outside `{attemptPrefix}variants/`, including one omitting `variants/`. |
 | `BUCKET_MISMATCH`                       | A descriptor in an unexpected bucket.                        |
 | `DUPLICATE_KEY`                         | The same key declared more than once.                        |
 | `NONCANONICAL_ORDER`                    | Descriptors not ordered by `(chrom, relativePath)`.          |
@@ -189,8 +239,9 @@ Enforced by `assertCanonicalArtifactInventory` before anything is published or q
 | `SCHEMA_FINGERPRINT_MISMATCH`           | A manifest not describing the frozen Parquet schema.         |
 | `REFERENCE_BUILD_MISMATCH`              | A result whose build contradicts the requested reference.    |
 
-A manifest derives its allowed prefix from its own `datasetId` and `artifactVersion`, so a
-manifest cannot claim objects belonging to another dataset or artifact version.
+Both an activity result and a published manifest derive their allowed prefix from a
+`datasetId`/`artifactVersion` pair rather than reading `target.allowedPrefix` off the wire, so
+neither can claim objects belonging to another dataset or artifact version.
 
 ## Failure taxonomy
 

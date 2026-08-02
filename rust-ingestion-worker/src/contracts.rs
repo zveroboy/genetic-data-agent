@@ -12,14 +12,75 @@
 //! The golden fixtures under `contracts/fixtures/` are the shared source of truth and are
 //! parsed by the tests in both languages. See `contracts/ingestion-v1.md`.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
 /// Wire contract version carried by every activity input.
 pub const CONTRACT_VERSION: u32 = 1;
 
+/// Deserializes a nullable-but-**required** wire field.
+///
+/// A bare `Option<T>` field is not enough: serde applies an implicit `Default` to a missing
+/// `Option`, so an absent key silently becomes `None` even under `deny_unknown_fields`.
+/// TypeScript spells these fields `.nullable()` and not `.optional()`, so the key must be
+/// present and may only be `null`. Attaching `deserialize_with` suppresses serde's implicit
+/// default, which makes an omitted key a `missing field` error.
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// The `contractVersion` envelope field, which only ever holds [`CONTRACT_VERSION`].
+///
+/// TypeScript declares it `z.literal(1)`. Deserializing a bare `u32` here would accept `2`
+/// and leave the version check to a caller that may forget it, so the rejection lives in the
+/// deserializer where it cannot be bypassed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ContractVersion(u32);
+
+impl ContractVersion {
+    /// The only value that can exist: [`CONTRACT_VERSION`].
+    pub const CURRENT: Self = Self(CONTRACT_VERSION);
+
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ContractVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        if value != CONTRACT_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported contractVersion {value}; this worker implements {CONTRACT_VERSION}"
+            )));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl fmt::Display for ContractVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
 /// Physical artifact layout version (prefix shape, partition directories).
 pub const LAYOUT_VERSION: u32 = 1;
+
+/// Key segment separating an attempt prefix from its partition directories:
+/// `{attemptPrefix}variants/{relativePath}`.
+///
+/// It is part of the S3 key only. `relativePath` — the unit the dataset checksum is computed
+/// from — is `chrom=<value>/part-NNN.parquet` and never carries this segment, so the
+/// checksum stays computable from the processor's local Parquet descriptors alone.
+pub const VARIANTS_SEGMENT: &str = "variants/";
 
 /// Logical Parquet column set version.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -79,6 +140,7 @@ pub struct S3ObjectRef {
     pub bucket: String,
     pub key: String,
     pub etag: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub version_id: Option<String>,
 }
 
@@ -89,6 +151,7 @@ pub struct SourceObject {
     pub bucket: String,
     pub key: String,
     pub etag: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub version_id: Option<String>,
     pub content_length: u64,
 }
@@ -114,7 +177,7 @@ pub struct ArtifactTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BuildDatasetArtifactInput {
-    pub contract_version: u32,
+    pub contract_version: ContractVersion,
     pub dataset_id: String,
     pub dataset_key: DatasetKey,
     pub source: SourceObject,
@@ -129,6 +192,7 @@ pub struct ParquetObject {
     pub bucket: String,
     pub key: String,
     pub etag: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub version_id: Option<String>,
     pub chrom: String,
     pub checksum_sha256: String,
@@ -198,6 +262,7 @@ pub struct IngestionHeartbeat {
     pub phase: IngestionPhase,
     pub processed_bytes: u64,
     pub processed_variants: u64,
+    #[serde(deserialize_with = "required_nullable")]
     pub current_partition: Option<String>,
     pub completed_files: u64,
     pub uploaded_bytes: u64,
@@ -278,7 +343,8 @@ mod tests {
         let input: BuildDatasetArtifactInput =
             serde_json::from_str(&fixture(INPUT)).expect("golden input deserializes");
 
-        assert_eq!(input.contract_version, CONTRACT_VERSION);
+        assert_eq!(input.contract_version, ContractVersion::CURRENT);
+        assert_eq!(input.contract_version.get(), CONTRACT_VERSION);
         assert_eq!(input.dataset_id, "ds-test-001");
         assert_eq!(input.dataset_key, DatasetKey::DemoSmall);
         assert_eq!(input.source.bucket, "genomic-data");
@@ -310,6 +376,20 @@ mod tests {
         assert_eq!(result.reference_build, "GRCh38");
         assert_eq!(result.processor_version, "rust-ingestion-worker/0.1.0");
         assert_eq!(result.parquet_objects.len(), 2);
+
+        // The frozen layout: {attemptPrefix}variants/chrom=<value>/part-NNN.parquet.
+        for object in &result.parquet_objects {
+            let variants_prefix = format!("{}{VARIANTS_SEGMENT}", result.attempt_prefix);
+            let relative_path = object
+                .key
+                .strip_prefix(&variants_prefix)
+                .unwrap_or_else(|| panic!("key '{}' must sit under '{variants_prefix}'", object.key));
+            assert_eq!(
+                relative_path,
+                format!("chrom={}/part-000.parquet", object.chrom),
+                "relativePath must not carry the variants/ segment"
+            );
+        }
 
         let first = &result.parquet_objects[0];
         assert_eq!(first.chrom, "1");
@@ -411,6 +491,71 @@ mod tests {
         let mut extra = payload;
         extra["contentLength"] = json!(1024);
         assert!(serde_json::from_value::<S3ObjectRef>(extra).is_err());
+    }
+
+    /// A nullable wire field must be *present*. TypeScript uses `.nullable()`, not
+    /// `.optional()`; serde's implicit missing-`Option` shortcut would silently accept a
+    /// producer that drops the key, so every nullable field opts out of it.
+    #[test]
+    fn requires_nullable_fields_to_be_present() {
+        // S3ObjectRef
+        let mut without = json!({"bucket": "b", "key": "k", "etag": "e"});
+        assert!(
+            serde_json::from_value::<S3ObjectRef>(without.clone()).is_err(),
+            "S3ObjectRef must reject an omitted versionId"
+        );
+        without["versionId"] = Value::Null;
+        assert_eq!(
+            serde_json::from_value::<S3ObjectRef>(without).unwrap().version_id,
+            None
+        );
+
+        // SourceObject
+        let mut source = fixture_value(INPUT)["source"].clone();
+        source.as_object_mut().unwrap().remove("versionId");
+        assert!(
+            serde_json::from_value::<SourceObject>(source).is_err(),
+            "SourceObject must reject an omitted versionId"
+        );
+        let mut input = fixture_value(INPUT);
+        input["source"].as_object_mut().unwrap().remove("versionId");
+        assert!(
+            serde_json::from_value::<BuildDatasetArtifactInput>(input).is_err(),
+            "BuildDatasetArtifactInput must reject a source with an omitted versionId"
+        );
+
+        // ParquetObject
+        let mut object = fixture_value(RESULT)["parquetObjects"][0].clone();
+        object.as_object_mut().unwrap().remove("versionId");
+        assert!(
+            serde_json::from_value::<ParquetObject>(object).is_err(),
+            "ParquetObject must reject an omitted versionId"
+        );
+
+        // IngestionHeartbeat
+        let heartbeat = json!({
+            "phase": "PARSING",
+            "processedBytes": 4096,
+            "processedVariants": 2500,
+            "completedFiles": 3,
+            "uploadedBytes": 1048576
+        });
+        assert!(
+            serde_json::from_value::<IngestionHeartbeat>(heartbeat).is_err(),
+            "IngestionHeartbeat must reject an omitted currentPartition"
+        );
+    }
+
+    #[test]
+    fn rejects_an_unsupported_contract_version() {
+        for version in [0u64, 2, 4_294_967_295] {
+            let mut input = fixture_value(INPUT);
+            input["contractVersion"] = json!(version);
+            assert!(
+                serde_json::from_value::<BuildDatasetArtifactInput>(input).is_err(),
+                "contractVersion {version} must be rejected"
+            );
+        }
     }
 
     #[test]

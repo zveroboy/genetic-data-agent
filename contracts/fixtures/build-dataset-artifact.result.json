@@ -8,7 +8,7 @@
   "parquetObjects": [
     {
       "bucket": "genomic-artifacts",
-      "key": "datasets/ds-test-001/versions/iv-test-001/attempt-1/chrom=1/part-000.parquet",
+      "key": "datasets/ds-test-001/versions/iv-test-001/attempt-1/variants/chrom=1/part-000.parquet",
       "etag": "fixture-parquet-etag-chrom-1",
       "versionId": null,
       "chrom": "1",
@@ -20,7 +20,7 @@
     },
     {
       "bucket": "genomic-artifacts",
-      "key": "datasets/ds-test-001/versions/iv-test-001/attempt-1/chrom=12/part-000.parquet",
+      "key": "datasets/ds-test-001/versions/iv-test-001/attempt-1/variants/chrom=12/part-000.parquet",
       "etag": "fixture-parquet-etag-chrom-12",
       "versionId": "fixture-version-chrom-12",
       "chrom": "12",

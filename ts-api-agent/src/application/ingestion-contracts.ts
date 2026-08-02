@@ -10,11 +10,11 @@
  * - The dataset content checksum is derived from *relative* descriptors, so it is stable
  *   across activity attempts and S3 prefixes.
  *
- * Workflow code must import from this module with `import type` only: the checksum helper
- * uses `node:crypto`, which is unavailable inside the Temporal workflow sandbox.
+ * This module is deliberately free of Node built-ins at both import and evaluation time, so
+ * Temporal workflow code may import its constants, schemas and types by value. Everything
+ * that needs `node:crypto` lives in `./dataset-checksum.ts`, which workflow code must not
+ * import. `ingestion-contracts.test.ts` enforces that boundary.
  */
-import { createHash } from 'node:crypto';
-
 import { z } from 'zod';
 
 import { DATASET_KEYS } from '../domain/datasets.ts';
@@ -24,6 +24,17 @@ export const CONTRACT_VERSION = 1;
 
 /** Physical artifact layout version (prefix shape, partition directories). */
 export const LAYOUT_VERSION = 1;
+
+/**
+ * Key segment separating an attempt prefix from its partition directories:
+ * `{attemptPrefix}variants/{relativePath}`.
+ *
+ * It is part of the S3 key only. `relativePath` — the unit the dataset checksum is computed
+ * from — is `chrom=<value>/part-NNN.parquet` and never carries this segment, so the checksum
+ * stays computable from the Rust processor's local Parquet descriptors, which have no S3
+ * knowledge. The segment is added by the S3 mapping layer.
+ */
+export const VARIANTS_SEGMENT = 'variants/';
 
 /** Logical Parquet column set version. */
 export const SCHEMA_VERSION = 1;
@@ -43,8 +54,16 @@ export const SORT_ORDER = ['chrom', 'pos', 'ref', 'alt'] as const;
 export const PARQUET_SCHEMA_COLUMNS =
   'pos:UINTEGER:NOT NULL;rsid:VARCHAR:NULL;ref:VARCHAR:NOT NULL;alt:VARCHAR:NOT NULL;gt_raw:VARCHAR:NOT NULL';
 
-/** SHA-256 of `PARQUET_SCHEMA_COLUMNS`; recorded in every published manifest. */
-export const PARQUET_SCHEMA_FINGERPRINT = sha256Hex(PARQUET_SCHEMA_COLUMNS);
+/**
+ * SHA-256 of `PARQUET_SCHEMA_COLUMNS`; recorded in every published manifest.
+ *
+ * Pinned as a literal rather than derived, exactly as Rust pins it in
+ * `contracts.rs::PARQUET_SCHEMA_FINGERPRINT`, so this module never needs `node:crypto`.
+ * `ingestion-contracts.test.ts` asserts the literal against a freshly computed digest and
+ * against the golden manifest fixture, so the three cannot drift apart.
+ */
+export const PARQUET_SCHEMA_FINGERPRINT =
+  '89e4e0a61728e9776376f7550d09426acba14bd486c68a918e66fb11d437d7de';
 
 /** Activity progress phases, in the order the Rust worker reports them. */
 export const INGESTION_PHASES = [
@@ -55,10 +74,6 @@ export const INGESTION_PHASES = [
   'UPLOADING_PARTITION',
   'FINALIZING',
 ] as const;
-
-function sha256Hex(value: string): string {
-  return createHash('sha256').update(value, 'utf8').digest('hex');
-}
 
 const sha256HexSchema = z.string().regex(/^[0-9a-f]{64}$/, 'expected a lowercase SHA-256 hex digest');
 
@@ -188,6 +203,7 @@ export type IngestionPhase = z.infer<typeof IngestionHeartbeatSchema>['phase'];
 
 export type ContractValidationCode =
   | 'EMPTY_INVENTORY'
+  | 'ALLOWED_PREFIX_MISMATCH'
   | 'ATTEMPT_PREFIX_OUTSIDE_ALLOWED_PREFIX'
   | 'KEY_OUTSIDE_ALLOWED_PREFIX'
   | 'BUCKET_MISMATCH'
@@ -209,190 +225,16 @@ export class ContractValidationError extends Error {
   }
 }
 
-function fail(code: ContractValidationCode, message: string): never {
-  throw new ContractValidationError(code, message);
-}
-
-/** Byte-wise ascending comparison, matching Rust's `Ord for str`. */
-function compareUtf8(left: string, right: string): number {
-  return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
-}
-
-function relativePathOf(attemptPrefix: string, key: string): string {
-  if (!key.startsWith(attemptPrefix)) {
-    fail('KEY_OUTSIDE_ALLOWED_PREFIX', `object key '${key}' is not below '${attemptPrefix}'`);
-  }
-  return key.slice(attemptPrefix.length);
-}
-
 /**
- * Canonical descriptor list: relative path, content checksum and statistics, sorted
- * byte-wise by `(chrom, relativePath)`. Deliberately excludes bucket, key prefix, ETag and
- * version ID so the same dataset content yields the same checksum on every attempt.
+ * The single immutable prefix a dataset's artifact version may write under. Derived, never
+ * taken from the wire: a caller-supplied `allowedPrefix` such as `datasets/` would otherwise
+ * satisfy every containment check.
  */
-function canonicalDescriptorBlock(attemptPrefix: string, objects: readonly ParquetObject[]): string {
-  return objects
-    .map((object) => ({ object, relativePath: relativePathOf(attemptPrefix, object.key) }))
-    .sort(
-      (left, right) =>
-        compareUtf8(left.object.chrom, right.object.chrom) ||
-        compareUtf8(left.relativePath, right.relativePath),
-    )
-    .map(
-      ({ object, relativePath }) =>
-        [
-          object.chrom,
-          relativePath,
-          object.checksumSha256,
-          object.byteSize,
-          object.rowCount,
-          object.minPos,
-          object.maxPos,
-        ].join('\t') + '\n',
-    )
-    .join('');
+export function allowedPrefixFor(datasetId: string, artifactVersion: string): string {
+  return `datasets/${datasetId}/versions/${artifactVersion}/`;
 }
 
-/** Deterministic content checksum of a Parquet dataset. Independent of the attempt prefix. */
-export function computeDatasetChecksumSha256(
-  attemptPrefix: string,
-  objects: readonly ParquetObject[],
-): string {
-  return sha256Hex(canonicalDescriptorBlock(attemptPrefix, objects));
-}
-
-interface InventoryExpectations {
-  readonly allowedPrefix: string;
-  readonly attemptPrefix: string;
-  readonly datasetChecksumSha256: string;
-  readonly objects: readonly ParquetObject[];
-  readonly expectedBucket?: string;
-}
-
-/**
- * Enforces the invariants a Parquet inventory must satisfy before anything is published or
- * queried: single bucket, every key below the attempt prefix below the allowed immutable
- * version prefix, `chrom=<value>` partition agreement, no duplicates, canonical ordering
- * and a reproducible dataset checksum.
- */
-export function assertCanonicalArtifactInventory(expectations: InventoryExpectations): void {
-  const { allowedPrefix, attemptPrefix, datasetChecksumSha256, objects } = expectations;
-
-  if (objects.length === 0) {
-    fail('EMPTY_INVENTORY', 'a published dataset must declare at least one Parquet object');
-  }
-
-  if (!attemptPrefix.startsWith(allowedPrefix) || attemptPrefix.length === allowedPrefix.length) {
-    fail(
-      'ATTEMPT_PREFIX_OUTSIDE_ALLOWED_PREFIX',
-      `attempt prefix '${attemptPrefix}' is not below '${allowedPrefix}'`,
-    );
-  }
-
-  const expectedBucket = expectations.expectedBucket ?? objects[0]!.bucket;
-  const relativePaths: string[] = [];
-
-  for (const object of objects) {
-    if (object.bucket !== expectedBucket) {
-      fail(
-        'BUCKET_MISMATCH',
-        `object '${object.key}' is in bucket '${object.bucket}', expected '${expectedBucket}'`,
-      );
-    }
-
-    const relativePath = relativePathOf(attemptPrefix, object.key);
-    const partition = /^chrom=([^/]+)\/[^/]+$/.exec(relativePath);
-    if (partition === null) {
-      fail(
-        'PARTITION_MISMATCH',
-        `'${relativePath}' is not a 'chrom=<value>/<file>' partition path`,
-      );
-    }
-    if (partition[1] !== object.chrom) {
-      fail(
-        'PARTITION_MISMATCH',
-        `descriptor chrom '${object.chrom}' contradicts partition '${partition[1]}'`,
-      );
-    }
-    relativePaths.push(relativePath);
-  }
-
-  const seen = new Set<string>();
-  for (const object of objects) {
-    if (seen.has(object.key)) {
-      fail('DUPLICATE_KEY', `object key '${object.key}' is declared more than once`);
-    }
-    seen.add(object.key);
-  }
-
-  const canonical = objects
-    .map((object, index) => ({ key: object.key, chrom: object.chrom, path: relativePaths[index]! }))
-    .sort(
-      (left, right) =>
-        compareUtf8(left.chrom, right.chrom) || compareUtf8(left.path, right.path),
-    )
-    .map((entry) => entry.key);
-
-  for (const [index, key] of canonical.entries()) {
-    if (objects[index]!.key !== key) {
-      fail(
-        'NONCANONICAL_ORDER',
-        `objects must be ordered by (chrom, relativePath); position ${index} should be '${key}'`,
-      );
-    }
-  }
-
-  const computed = computeDatasetChecksumSha256(attemptPrefix, objects);
-  if (computed !== datasetChecksumSha256) {
-    fail(
-      'DATASET_CHECKSUM_MISMATCH',
-      `declared '${datasetChecksumSha256}' but the descriptor list hashes to '${computed}'`,
-    );
-  }
-}
-
-/** Validates an activity result against the input that requested it. */
-export function assertValidArtifactResult(
-  input: BuildDatasetArtifactInput,
-  result: BuildDatasetArtifactResult,
-): void {
-  if (result.referenceBuild !== input.reference.build) {
-    fail(
-      'REFERENCE_BUILD_MISMATCH',
-      `result declares '${result.referenceBuild}' but '${input.reference.build}' was requested`,
-    );
-  }
-
-  assertCanonicalArtifactInventory({
-    allowedPrefix: input.target.allowedPrefix,
-    attemptPrefix: result.attemptPrefix,
-    datasetChecksumSha256: result.datasetChecksumSha256,
-    objects: result.parquetObjects,
-    expectedBucket: input.target.bucket,
-  });
-}
-
-/**
- * Validates a published manifest in isolation. The allowed prefix is derived from the
- * manifest's own `datasetId`/`artifactVersion`, so a manifest cannot claim objects that
- * belong to another dataset or artifact version.
- */
-export function assertValidDatasetManifest(
-  manifest: DatasetManifest,
-  options: { readonly expectedBucket?: string } = {},
-): void {
-  if (manifest.schemaFingerprint !== PARQUET_SCHEMA_FINGERPRINT) {
-    fail(
-      'SCHEMA_FINGERPRINT_MISMATCH',
-      `manifest declares '${manifest.schemaFingerprint}', expected '${PARQUET_SCHEMA_FINGERPRINT}'`,
-    );
-  }
-
-  assertCanonicalArtifactInventory({
-    allowedPrefix: `datasets/${manifest.datasetId}/versions/${manifest.artifactVersion}/`,
-    attemptPrefix: manifest.attemptPrefix,
-    datasetChecksumSha256: manifest.datasetChecksumSha256,
-    objects: manifest.parquetObjects,
-    ...(options.expectedBucket === undefined ? {} : { expectedBucket: options.expectedBucket }),
-  });
+/** The prefix every Parquet object of one attempt sits under. */
+export function variantsPrefixFor(attemptPrefix: string): string {
+  return `${attemptPrefix}${VARIANTS_SEGMENT}`;
 }

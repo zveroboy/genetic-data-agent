@@ -8,6 +8,7 @@
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -20,14 +21,19 @@ import {
   DatasetManifestSchema,
   IngestionHeartbeatSchema,
   LAYOUT_VERSION,
+  PARQUET_SCHEMA_COLUMNS,
   PARQUET_SCHEMA_FINGERPRINT,
   PARTITION_SPEC,
   SCHEMA_VERSION,
   SORT_ORDER,
+  VARIANTS_SEGMENT,
+} from './ingestion-contracts.ts';
+import {
   assertValidArtifactResult,
   assertValidDatasetManifest,
   computeDatasetChecksumSha256,
-} from './ingestion-contracts.ts';
+  sha256Hex,
+} from './dataset-checksum.ts';
 import { UnknownDatasetKeyError, datasetCatalog } from './dataset-catalog.ts';
 
 function readFixture(name: string): unknown {
@@ -215,6 +221,24 @@ describe('artifact result inventory validation', () => {
     assert.doesNotThrow(() => assertValidArtifactResult(input, result));
   });
 
+  it('accepts the mandated attempt-{n}/variants/chrom=<value>/ layout', () => {
+    for (const object of result.parquetObjects) {
+      assert.match(
+        object.key,
+        /^datasets\/[^/]+\/versions\/[^/]+\/attempt-\d+\/variants\/chrom=[^/]+\/part-\d{3}\.parquet$/,
+      );
+    }
+    assert.doesNotThrow(() => assertValidArtifactResult(input, result));
+  });
+
+  it('rejects a key that omits the variants/ segment', () => {
+    expectRejection((draft) => {
+      for (const object of draft.parquetObjects) {
+        object.key = `${draft.attemptPrefix}chrom=${object.chrom}/part-000.parquet`;
+      }
+    }, 'KEY_OUTSIDE_ALLOWED_PREFIX');
+  });
+
   it('rejects an empty inventory', () => {
     expectRejection((draft) => {
       draft.parquetObjects = [];
@@ -259,8 +283,23 @@ describe('artifact result inventory validation', () => {
 
   it('rejects a relative path that is not chromosome partitioned', () => {
     expectRejection((draft) => {
-      draft.parquetObjects[0]!.key = `${draft.attemptPrefix}part-000.parquet`;
+      draft.parquetObjects[0]!.key = `${draft.attemptPrefix}${VARIANTS_SEGMENT}part-000.parquet`;
     }, 'PARTITION_MISMATCH');
+  });
+
+  it('rejects an allowedPrefix that is not derived from the dataset and artifact version', () => {
+    for (const allowedPrefix of ['datasets/', 'datasets/ds-test-001/', 'datasets/ds-other/versions/iv-test-001/']) {
+      const widened = clone(input);
+      (widened.target as { allowedPrefix: string }).allowedPrefix = allowedPrefix;
+      assert.throws(
+        () => assertValidArtifactResult(widened, result),
+        (error: unknown) => {
+          assert.ok(error instanceof ContractValidationError);
+          assert.equal(error.code, 'ALLOWED_PREFIX_MISMATCH');
+          return true;
+        },
+      );
+    }
   });
 
   it('rejects a dataset checksum that does not match the descriptor list', () => {
@@ -323,6 +362,56 @@ describe('published manifest validation', () => {
         return true;
       },
     );
+  });
+});
+
+describe('the schema module is importable from Temporal workflow code', () => {
+  const moduleDir = fileURLToPath(new URL('.', import.meta.url));
+
+  /**
+   * Every module `ingestion-contracts.ts` reaches transitively through relative imports.
+   * A Node built-in anywhere in that graph would be pulled into the workflow bundle, where
+   * it cannot be resolved.
+   */
+  function localImportGraph(entry: string): Map<string, string> {
+    const sources = new Map<string, string>();
+    const pending = [entry];
+    while (pending.length > 0) {
+      const specifier = pending.pop()!;
+      if (sources.has(specifier)) continue;
+      const source = readFileSync(join(moduleDir, specifier), 'utf8');
+      sources.set(specifier, source);
+      for (const match of source.matchAll(/from\s+'(\.[^']+)'/g)) {
+        pending.push(match[1]!);
+      }
+    }
+    return sources;
+  }
+
+  it('pulls in no node: built-in, directly or transitively', () => {
+    const graph = localImportGraph('./ingestion-contracts.ts');
+    assert.ok(graph.size >= 2, 'expected the domain module to be part of the graph');
+    for (const [specifier, source] of graph) {
+      assert.equal(
+        /from\s+'node:[^']+'|require\(\s*'node:/.test(source),
+        false,
+        `${specifier} imports a node: built-in; workflow code cannot bundle it`,
+      );
+    }
+  });
+
+  it('keeps the checksum helpers in a module workflow code does not import', () => {
+    const checksumModule = readFileSync(join(moduleDir, 'dataset-checksum.ts'), 'utf8');
+    assert.match(checksumModule, /from 'node:crypto'/);
+    // Prose in the module header may name `node:crypto`; an import or a call may not.
+    assert.doesNotMatch(
+      readFileSync(join(moduleDir, 'ingestion-contracts.ts'), 'utf8'),
+      /from 'node:crypto'|createHash\(/,
+    );
+  });
+
+  it('pins the schema fingerprint to the digest it claims to be', () => {
+    assert.equal(sha256Hex(PARQUET_SCHEMA_COLUMNS), PARQUET_SCHEMA_FINGERPRINT);
   });
 });
 
