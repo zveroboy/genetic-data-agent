@@ -18,6 +18,8 @@
 //!   cargo run --bin temporal_worker
 //! ```
 
+use std::time::Duration;
+
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_common::worker::WorkerTaskTypes;
@@ -68,6 +70,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .task_types(WorkerTaskTypes::activity_only())
         .client_identity_override(identity.clone())
         .register_activities(activities)
+        // sdk-core throttles recorded heartbeats to `min(heartbeatTimeout × 0.8,
+        // max_heartbeat_throttle_interval)` before one reaches the server (see
+        // `temporalio-sdk-core-0.5.0/src/worker/activities.rs`). Against production's 15-second
+        // `heartbeatTimeout`, the SDK default of 60s for the former and 30s for the latter would
+        // let `heartbeatTimeout × 0.8` = 12s govern, leaving only 3s of server-side margin: one
+        // delayed heartbeat RPC, a GC stall, or ordinary frontend jitter times out a healthy
+        // activity and it is retried from scratch. 5 seconds matches this worker's own keepalive
+        // period (`heartbeatTimeout / KEEPALIVE_DIVISOR`, see `temporal_activities.rs`) exactly,
+        // so it — not `heartbeatTimeout × 0.8` — is what governs, giving 10s of margin (two spare
+        // ticks) instead of 3s, and bounding worst-case cancellation observation at ~5s instead
+        // of ~12s. This is a worker-local knob, not the negotiated `heartbeatTimeout`: raising the
+        // timeout itself would also slow dead-worker detection and lengthen the Workflow's
+        // `WAIT_CANCELLATION_COMPLETED` blocking.
+        .max_heartbeat_throttle_interval(Duration::from_secs(5))
+        // Applies only when an activity is scheduled without a `heartbeatTimeout` (SDK default
+        // 30s); matched to `DEFAULT_KEEPALIVE_PERIOD` in `temporal_activities.rs` for the same
+        // reason as above.
+        .default_heartbeat_throttle_interval(Duration::from_secs(5))
         .build();
     let mut worker = Worker::new(&runtime, client, worker_options)?;
 

@@ -73,6 +73,7 @@ import {
   CONTRACT_VERSION,
   type DatasetManifest,
   DatasetManifestSchema,
+  INGESTION_PHASES,
   IngestionHeartbeatSchema,
   LAYOUT_VERSION,
   PARQUET_SCHEMA_FINGERPRINT,
@@ -98,15 +99,12 @@ const WORKER_IDENTITY_PREFIX = 'rust-ingestion-worker@';
 /**
  * `contracts/ingestion-v1.md`: "Phases, **in order**". A consumer polling heartbeats may read a
  * phase as progress, so the published sequence must never regress through this list.
+ *
+ * Sourced from `ingestion-contracts.ts::INGESTION_PHASES` — the same shared contract module this
+ * file already imports schemas and constants from — rather than duplicated as a literal, so this
+ * test cannot drift from the one the TypeScript application code and its own tests use.
  */
-const PHASE_ORDER = [
-  'DOWNLOADING_SOURCE',
-  'PARSING',
-  'WRITING_DUCKDB',
-  'EXPORTING_PARQUET',
-  'UPLOADING_PARTITION',
-  'FINALIZING',
-] as const;
+const PHASE_ORDER = INGESTION_PHASES;
 
 const S3_ENDPOINT = process.env.S3_ENDPOINT ?? 'http://localhost:9000';
 const S3_ACCESS_KEY = process.env.S3_ACCESS_KEY ?? 'admin';
@@ -179,22 +177,37 @@ const RETRY_EXPECTED_VARIANTS = CHROMOSOMES.length * RETRY_VARIANTS_PER_CHROMOSO
  *
  * A Temporal Activity learns that it has been cancelled from the *response* to one of its own
  * heartbeats (`RecordActivityTaskHeartbeatResponse.cancel_requested`). sdk-core throttles those
- * requests to `heartbeatTimeout × 0.8`, which is 12 seconds under the Workflow's frozen
- * `heartbeatTimeout: '15 seconds'`. So however promptly the Workflow asks, the Rust side cannot
- * observe the cancellation for up to ~12 seconds — and an Activity that finishes first is simply
- * never cancelled.
+ * requests to `min(heartbeatTimeout × 0.8, max_heartbeat_throttle_interval)`. The worker sets
+ * `max_heartbeat_throttle_interval` to 5 seconds (`temporal_worker.rs`), well under
+ * `heartbeatTimeout × 0.8` = 12 seconds under the Workflow's frozen `heartbeatTimeout: '15
+ * seconds'`, so the 5-second cap is what governs: however promptly the Workflow asks, the Rust
+ * side cannot observe the cancellation for up to ~5 seconds — and an Activity that finishes first
+ * is simply never cancelled.
  *
- * Measured on this fixture shape and this machine, the Activity gets through ~220 000
- * variants/second, and 2.7 M variants was observed to finish in 12.3 s — close enough to the
- * throttle window that the cancellation arrived too late. 5.4 M keeps it working for ~25 s, so
- * the cancellation lands mid-parse with ~10 s of margin. Making this cheaper would mean lowering
- * the worker's `max_heartbeat_throttle_interval`, which is production behaviour and out of scope
- * for this fix pass; it is called out in the task report instead.
+ * This is a *smaller* fixture than a previous version of this test used, and the 5-second figure
+ * above is why it could shrink: before the worker set `max_heartbeat_throttle_interval`, the
+ * governing window was the full `heartbeatTimeout × 0.8` = 12 seconds, so the fixture had to keep
+ * the Activity in flight that long (5.4 M variants, ~25 s of runtime).
+ *
+ * Measured on this fixture shape and this machine: the Activity gets through roughly
+ * 165 000-190 000 variants/second once it reaches `WRITING_DUCKDB`, so 1.5 M variants
+ * (`CANCEL_VARIANTS_PER_CHROMOSOME * CHROMOSOMES.length`) takes ~9 s to finish if left uncancelled.
+ * Across repeated runs, the cancellation was consistently observed ~5.3 s after the Activity
+ * started (matching the 5-second throttle cap plus the RPC round trip), leaving ~3.5-4 s of margin
+ * before the Activity would have finished on its own — comfortably mid-parse, in the
+ * `WRITING_DUCKDB` phase, with roughly 40% of the variants still unprocessed.
+ *
+ * Do not shrink this further without re-measuring: the margin above is the whole safety factor.
+ * A fixture sized so total runtime is only slightly more than the 5-second worst-case observation
+ * window has no slack for a slower CI machine or a slow tick of the JS watcher's 250 ms poll
+ * before `handle.cancel()` fires, and the Activity would sometimes complete before the
+ * cancellation could ever reach it — turning this into a flaky "activity finished, was never
+ * cancelled" failure instead of a reliable proof of the cross-language cancellation contract.
  *
  * The fixture is gzipped so that "large" costs disk and network almost nothing — and, as a
  * bonus, this is the one end-to-end exercise of the gzip source path.
  */
-const CANCEL_VARIANTS_PER_CHROMOSOME = 900_000;
+const CANCEL_VARIANTS_PER_CHROMOSOME = 250_000;
 
 interface HeadFacts {
   contentLength: number;
@@ -382,6 +395,30 @@ async function waitFor(
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`timed out waiting for ${label}: ${String(lastError)}`);
+}
+
+/**
+ * Races `promise` against a bound, well under the Workflow's 45-minute `scheduleToCloseTimeout`.
+ *
+ * `handle.result()` has no timeout of its own, and this suite configures no `--test-timeout`
+ * either. So the exact regression the retry and cancellation scenarios exist to catch — the Rust
+ * side never producing the event the Workflow is waiting on (a repaired attempt 2 that never
+ * starts, an `ActivityTaskCanceled` that never arrives) — would hang the whole suite for up to 45
+ * minutes instead of failing it in seconds.
+ */
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`timed out after ${timeoutMs}ms waiting for ${label}`)),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([promise, bound]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function decodeJsonPayload(payload: { data?: Uint8Array | null } | null | undefined): unknown {
@@ -895,17 +932,27 @@ describe('rust buildDatasetArtifact activity (cross-language ingestion gate)', (
             const failureType = pending?.lastFailure?.applicationFailureInfo?.type;
             if (failureType) observedFailureType = failureType;
             if (!repaired && attempt >= 2) {
-              repaired = true;
+              // Flip the flag only once the bucket genuinely exists. Setting it first and
+              // letting `createOwnBucket` fail underneath the surrounding `catch` would leave
+              // `repaired` permanently `true` with no bucket ever created — the watcher would
+              // never retry, and the workflow would keep failing until the 45-minute
+              // `scheduleToCloseTimeout` instead of the few seconds this test expects.
               await createOwnBucket(RETRY_ARTIFACT_BUCKET);
+              repaired = true;
             }
           } catch {
-            // The execution may close between the describe and the read.
+            // The execution may close between the describe and the read — or `createOwnBucket`
+            // above may fail (e.g. a transient MinIO hiccup); either way `repaired` is left
+            // `false` and the next tick tries again.
           }
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
       })();
 
-      await handle.result();
+      // Bounded well under the 45-minute `scheduleToCloseTimeout`: if the repair above never
+      // lands, or attempt 2 never completes, this scenario must fail fast rather than hang the
+      // suite.
+      await withTimeout(handle.result(), 120_000, 'the retried workflow to complete');
       watching = false;
       await watcher;
       history = await handle.fetchHistory();
@@ -1056,9 +1103,16 @@ describe('rust buildDatasetArtifact activity (cross-language ingestion gate)', (
       );
       await handle.cancel();
 
-      resultError = await handle.result().then(
-        (value) => new Error(`the cancelled workflow returned ${JSON.stringify(value)}`),
-        (error: unknown) => error,
+      // Bounded well under the 45-minute `scheduleToCloseTimeout`: this is exactly finding 4's
+      // regression guard — a Rust side that never produces `ActivityTaskCanceled` must fail this
+      // scenario in seconds, not hang the suite.
+      resultError = await withTimeout(
+        handle.result().then(
+          (value) => new Error(`the cancelled workflow returned ${JSON.stringify(value)}`),
+          (error: unknown) => error,
+        ),
+        120_000,
+        'the cancelled workflow to close',
       );
       workflowStatus = (await handle.describe()).status.name;
       history = await handle.fetchHistory();

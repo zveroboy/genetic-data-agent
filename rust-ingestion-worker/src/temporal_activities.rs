@@ -74,12 +74,15 @@ const DEFAULT_KEEPALIVE_PERIOD: Duration = Duration::from_secs(5);
 /// The keepalive re-reports this often relative to the negotiated `heartbeatTimeout`.
 ///
 /// Reporting more often than the timeout is all this buys: sdk-core aggregates recorded
-/// heartbeats and only sends one to the server every `heartbeatTimeout × 0.8`, so ticking faster
-/// than that does not put more heartbeats on the wire — it only makes sure there is always a
-/// fresh observation waiting when core's throttle window opens. (Measured against the production
-/// 15-second timeout, that window is 12 seconds, which leaves the *server-side* margin at 3
-/// seconds rather than the two spare ticks this constant might suggest. Widening it is a worker
-/// configuration change and is recorded in the task report rather than made here.)
+/// heartbeats and only sends one to the server every `min(heartbeatTimeout × 0.8,
+/// max_heartbeat_throttle_interval)`, so ticking faster than that does not put more heartbeats on
+/// the wire — it only makes sure there is always a fresh observation waiting when core's throttle
+/// window opens. `temporal_worker.rs` sets `max_heartbeat_throttle_interval` (and
+/// `default_heartbeat_throttle_interval`) to 5 seconds, matching this period exactly: against the
+/// production 15-second `heartbeatTimeout`, `heartbeatTimeout × 0.8` is 12 seconds, so the
+/// 5-second worker-local cap is what actually governs. That makes the two spare ticks this
+/// constant implies real — the server-side margin is 10 seconds, not 3, and worst-case
+/// cancellation observation is bounded at ~5 seconds rather than ~12.
 const KEEPALIVE_DIVISOR: u32 = 3;
 
 /// How long the keepalive will hold an Activity open on an observation that has not changed,
@@ -101,8 +104,12 @@ const KEEPALIVE_DIVISOR: u32 = 3;
 const KEEPALIVE_BUDGET_TIMEOUTS: u32 = 40;
 
 /// The budget expressed in keepalive ticks, which is what the keepalive counts. The period is
-/// `heartbeatTimeout / KEEPALIVE_DIVISOR`, so the two constants compose into a bound that does
-/// not depend on the negotiated timeout's actual value.
+/// `heartbeatTimeout / KEEPALIVE_DIVISOR`, so above a 3-second `heartbeatTimeout` the two
+/// constants compose into a wall-clock bound that scales with the negotiated timeout and needs no
+/// separate justification. Below 3 seconds, `keepalive_period` clamps the period to a 1-second
+/// floor, so the wall-clock bound stops scaling with `heartbeatTimeout` and starts depending on
+/// its actual value — this is only reachable with a pathologically short `heartbeatTimeout`, well
+/// below anything this deployment negotiates.
 pub const KEEPALIVE_BUDGET_TICKS: u32 = KEEPALIVE_BUDGET_TIMEOUTS * KEEPALIVE_DIVISOR;
 
 // -----------------------------------------------------------------------------------------
@@ -210,11 +217,22 @@ pub const PHASE_ORDER: [IngestionPhase; 6] = [
 ];
 
 /// A phase's position in [`PHASE_ORDER`].
+///
+/// A `match` rather than a lookup into [`PHASE_ORDER`]: the array is a plain literal with no
+/// compile-time link to the enum, so a seventh `IngestionPhase` variant added without updating it
+/// would have silently fallen through to the `.expect()` this used to end in — a *runtime* panic,
+/// on the very phase the omission was about, discovered only by whichever attempt happened to
+/// reach it. `match` is exhaustive by construction: the compiler refuses to build until every
+/// variant — old and new — has an arm, so an added variant is a compile error here instead.
 pub fn phase_rank(phase: IngestionPhase) -> usize {
-    PHASE_ORDER
-        .iter()
-        .position(|candidate| *candidate == phase)
-        .expect("every IngestionPhase is in the contract's ordered phase list")
+    match phase {
+        IngestionPhase::DownloadingSource => 0,
+        IngestionPhase::Parsing => 1,
+        IngestionPhase::WritingDuckdb => 2,
+        IngestionPhase::ExportingParquet => 3,
+        IngestionPhase::UploadingPartition => 4,
+        IngestionPhase::Finalizing => 5,
+    }
 }
 
 /// Projects a *processor* phase onto the phase the adapter may publish.
@@ -310,13 +328,11 @@ impl HeartbeatReporter {
     /// This is the adapter's own progress, so `phase` is taken at face value: the adapter is the
     /// layer that owns `UPLOADING_PARTITION` and `FINALIZING`.
     pub fn emit(&self, phase: IngestionPhase, current_partition: Option<&str>) {
-        let heartbeat = {
-            let mut state = self.locked();
-            state.heartbeat.phase = phase;
-            state.heartbeat.current_partition = current_partition.map(str::to_string);
-            state.heartbeat.clone()
-        };
-        self.publish(&heartbeat);
+        let mut state = self.locked();
+        state.heartbeat.phase = phase;
+        state.heartbeat.current_partition = current_partition.map(str::to_string);
+        state.unchanged_reemits = 0;
+        self.publish_locked(&mut state);
     }
 
     /// Re-publishes the last observation, while the budget for doing so lasts.
@@ -330,20 +346,17 @@ impl HeartbeatReporter {
     /// [`KEEPALIVE_BUDGET_TIMEOUTS`]. An observation that *has* changed since the last publish is
     /// progress, is published, and resets the count.
     pub fn reemit(&self) -> KeepaliveTick {
-        let heartbeat = {
-            let mut state = self.locked();
-            let unchanged = state.published.as_ref() == Some(&state.heartbeat);
-            if unchanged {
-                if state.unchanged_reemits >= self.keepalive_budget {
-                    return KeepaliveTick::BudgetSpent;
-                }
-                state.unchanged_reemits += 1;
-            } else {
-                state.unchanged_reemits = 0;
+        let mut state = self.locked();
+        let unchanged = state.published.as_ref() == Some(&state.heartbeat);
+        if unchanged {
+            if state.unchanged_reemits >= self.keepalive_budget {
+                return KeepaliveTick::BudgetSpent;
             }
-            state.heartbeat.clone()
-        };
-        self.record(&heartbeat);
+            state.unchanged_reemits += 1;
+        } else {
+            state.unchanged_reemits = 0;
+        }
+        self.publish_locked(&mut state);
         KeepaliveTick::Published
     }
 
@@ -351,15 +364,25 @@ impl HeartbeatReporter {
         self.channel.is_cancelled()
     }
 
-    /// Publishes real progress: the keepalive budget is restored.
-    fn publish(&self, heartbeat: &IngestionHeartbeat) {
-        self.locked().unchanged_reemits = 0;
-        self.record(heartbeat);
-    }
-
-    fn record(&self, heartbeat: &IngestionHeartbeat) {
-        self.locked().published = Some(heartbeat.clone());
-        self.channel.record(heartbeat);
+    /// Marks `state.heartbeat` as published and hands it to the channel, all while `state`'s lock
+    /// guard stays held.
+    ///
+    /// This closes a publish-ordering window that used to exist here: `emit` and `reemit` each
+    /// snapshotted the heartbeat under the lock, released it, and only *then* called
+    /// `channel.record`. Two callers racing that way — the main task's `emit` and the keepalive's
+    /// `reemit` are exactly such a pair — can have their `channel.record` calls land in the
+    /// opposite order from the mutations that produced them: the keepalive snapshots
+    /// `EXPORTING_PARQUET`, is overtaken by `emit(Finalizing)`, and then records its stale
+    /// snapshot *after* the real one, publishing precisely the `FINALIZING → UPLOADING_PARTITION`
+    /// regression `assertPhasesNeverRegress` (the integration test) exists to catch. Holding the
+    /// guard from the snapshot straight through the call to `channel.record` makes wire order
+    /// match lock-acquisition order, which matches the order the underlying mutations actually
+    /// happened in. `channel.record` (`ActivityContext::record_heartbeat` in production, a plain
+    /// counter in tests) does not call back into this reporter, so holding the lock across it
+    /// cannot deadlock.
+    fn publish_locked(&self, state: &mut ReporterState) {
+        state.published = Some(state.heartbeat.clone());
+        self.channel.record(&state.heartbeat);
     }
 
     /// A poisoned heartbeat mutex means another thread panicked mid-update. The recorded numbers
@@ -377,9 +400,16 @@ impl HeartbeatReporter {
 /// at this boundary, and [`crate::artifact::build_artifact`] answers with `Ok(None)`.
 impl ProgressSink for HeartbeatReporter {
     fn report(&self, event: &ProgressEvent) -> ControlFlow<()> {
-        self.absorb(event);
-        let heartbeat = self.locked().heartbeat.clone();
-        self.publish(&heartbeat);
+        {
+            let mut state = self.locked();
+            state.heartbeat.phase = projected_phase(event.phase);
+            state.heartbeat.processed_bytes = event.processed_bytes;
+            state.heartbeat.processed_variants = event.processed_variants;
+            state.heartbeat.current_partition = event.current_partition.clone();
+            state.heartbeat.completed_files = event.completed_files;
+            state.unchanged_reemits = 0;
+            self.publish_locked(&mut state);
+        }
         if self.is_cancelled() {
             ControlFlow::Break(())
         } else {
