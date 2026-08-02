@@ -16,6 +16,7 @@ import {
 
 import {
   CHECKSUM_METADATA_KEY,
+  ConditionalWriteIndeterminateError,
   type ConditionalPutOutcome,
   DEFAULT_HEAD_CONCURRENCY,
   type HeadManyOptions,
@@ -99,27 +100,41 @@ function statusOf(error: unknown): number | undefined {
   return (error as { $metadata?: { httpStatusCode?: number } } | null)?.$metadata?.httpStatusCode;
 }
 
-function isNotFound(error: unknown): boolean {
+/**
+ * Exported for unit testing (see `s3-object-store.test.ts`); not part of the adapter's public
+ * surface otherwise.
+ */
+export function isNotFound(error: unknown): boolean {
   const name = (error as { name?: string } | null)?.name;
   return statusOf(error) === 404 || name === 'NotFound' || name === 'NoSuchKey';
 }
 
-function isPreconditionFailed(error: unknown): boolean {
+/**
+ * S3's ordinary lost `If-None-Match: *` race: the key is confirmed present. Distinct from
+ * {@link isConditionalWriteIndeterminate} (409) — see that function's doc comment for why the
+ * two must never be merged. Exported for unit testing.
+ */
+export function isPreconditionFailed(error: unknown): boolean {
   return (
     statusOf(error) === 412 || (error as { name?: string } | null)?.name === 'PreconditionFailed'
   );
 }
 
 /**
- * S3 documents two distinct HTTP statuses for a lost `If-None-Match: *` race: 412
- * `PreconditionFailed` (the common case) and 409 `ConditionalRequestConflict`, returned when a
- * concurrent conditional write to the same key is in flight. Both mean the same thing for
- * manifest publication — someone else's write is (or will be) present — so both are treated as
- * `{ outcome: 'exists' }` rather than letting 409 escape as a raw SDK error.
+ * S3 returns HTTP 409 `ConditionalRequestConflict` when a *different* conditional write to the
+ * same key is in flight at the same time. AWS documents this as "a conflicting conditional
+ * operation is in progress against this resource" — it means the outcome is indeterminate and
+ * the request should be retried, not that the object is now present. That is a different claim
+ * from 412 `PreconditionFailed` (the ordinary lost race, where presence is confirmed), so this
+ * predicate is intentionally disjoint from {@link isPreconditionFailed}: `putJsonConditional`
+ * must not report `{ outcome: 'exists' }` for a 409, because a caller that immediately reads the
+ * key back (as `publishDataset` does) can race the still-in-flight writer and observe a missing
+ * or stale body, turning a retryable race into what looks like a permanent conflict.
+ *
+ * Exported for unit testing.
  */
-function isConditionalWriteConflict(error: unknown): boolean {
+export function isConditionalWriteIndeterminate(error: unknown): boolean {
   return (
-    isPreconditionFailed(error) ||
     statusOf(error) === 409 ||
     (error as { name?: string } | null)?.name === 'ConditionalRequestConflict'
   );
@@ -213,6 +228,13 @@ export class S3ObjectStore implements ObjectStore {
   /**
    * `If-None-Match: *` makes the write succeed only when the key is absent, so concurrent or
    * retried publications cannot overwrite an existing manifest.
+   *
+   * A failed conditional put is mapped by HTTP status, and the two statuses S3 documents for it
+   * are handled differently on purpose (see `isPreconditionFailed` /
+   * `isConditionalWriteIndeterminate` above): 412 confirms the key is present and resolves to
+   * `{ outcome: 'exists' }`; 409 means a concurrent write raced this one and the outcome is
+   * unknown, so it is rejected with `ConditionalWriteIndeterminateError` instead of being
+   * reported as `exists` — the caller (not this adapter) decides whether/how to retry.
    */
   async putJsonConditional(
     location: ObjectLocation,
@@ -234,7 +256,10 @@ export class S3ObjectStore implements ObjectStore {
         versionId: response.VersionId ?? null,
       };
     } catch (error) {
-      if (isConditionalWriteConflict(error)) return { outcome: 'exists' };
+      if (isPreconditionFailed(error)) return { outcome: 'exists' };
+      if (isConditionalWriteIndeterminate(error)) {
+        throw new ConditionalWriteIndeterminateError(location);
+      }
       throw error;
     }
   }

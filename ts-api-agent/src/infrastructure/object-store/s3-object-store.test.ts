@@ -1,19 +1,32 @@
 /**
- * Unit tests for the pure, synchronous parts of the S3 adapter: environment configuration and
- * ETag canonicalization. Neither needs MinIO or the AWS SDK — `s3ObjectStoreConfigFromEnv`
- * already takes the env object as a parameter, and `canonicalEtag` is a pure string function.
+ * Unit tests for the pure, synchronous parts of the S3 adapter: environment configuration,
+ * ETag canonicalization, and the SDK-error-shape predicates that classify a failed conditional
+ * put. None of these need MinIO or a real AWS SDK error — `s3ObjectStoreConfigFromEnv` already
+ * takes the env object as a parameter, `canonicalEtag` is a pure string function, and the
+ * predicates take a plain object shaped like the SDK's `$metadata`/`name` error surface.
  *
- * These regression-protect the two things `s3-object-store.ts` uniquely owns:
+ * These regression-protect what `s3-object-store.ts` uniquely owns:
  *
  * - the global constraint "never form public HTTP URLs from `s3://` strings" (an `s3://`
  *   endpoint must be rejected, never rewritten to `http(s)://`);
  * - the canonical (unquoted) ETag form, one of the two cross-language conventions frozen in
- *   `contracts/ingestion-v1.md` ("S3 storage conventions").
+ *   `contracts/ingestion-v1.md` ("S3 storage conventions");
+ * - that HTTP 412 (`PreconditionFailed`, an ordinary lost race — `{ outcome: 'exists' }`) and
+ *   HTTP 409 (`ConditionalRequestConflict`, an in-flight concurrent write whose outcome is
+ *   indeterminate) are recognised by two disjoint predicates and never conflated: a status must
+ *   be accepted by exactly one of `isPreconditionFailed`/`isConditionalWriteIndeterminate`, not
+ *   both and not neither.
  */
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { canonicalEtag, s3ObjectStoreConfigFromEnv } from './s3-object-store.ts';
+import {
+  canonicalEtag,
+  isConditionalWriteIndeterminate,
+  isNotFound,
+  isPreconditionFailed,
+  s3ObjectStoreConfigFromEnv,
+} from './s3-object-store.ts';
 
 /** Every variable `s3ObjectStoreConfigFromEnv` requires, as a valid baseline. */
 const BASE_ENV: NodeJS.ProcessEnv = {
@@ -143,5 +156,85 @@ describe('canonicalEtag', () => {
 
   it('does not strip a single stray quote character (too short to be a quoted pair)', () => {
     assert.equal(canonicalEtag('"'), '"');
+  });
+});
+
+/**
+ * The AWS SDK v3 surfaces a failed request two ways at once: `$metadata.httpStatusCode` (always
+ * present when the service responded) and a `name` matching the modeled exception (present when
+ * the SDK could parse one). A real error carries both; these tests feed each predicate every
+ * shape it must recognise plus at least one shape it must reject, so a predicate that stops
+ * matching its status is caught here rather than only reachable through async I/O.
+ */
+describe('isNotFound', () => {
+  it('recognises an HTTP 404 status alone', () => {
+    assert.equal(isNotFound({ $metadata: { httpStatusCode: 404 } }), true);
+  });
+
+  it('recognises the NotFound error name alone', () => {
+    assert.equal(isNotFound({ name: 'NotFound' }), true);
+  });
+
+  it('recognises the NoSuchKey error name alone', () => {
+    assert.equal(isNotFound({ name: 'NoSuchKey' }), true);
+  });
+
+  it('rejects an unrelated error', () => {
+    assert.equal(isNotFound({ name: 'InternalError', $metadata: { httpStatusCode: 500 } }), false);
+  });
+
+  it('rejects null and undefined without throwing', () => {
+    assert.equal(isNotFound(null), false);
+    assert.equal(isNotFound(undefined), false);
+  });
+});
+
+describe('isPreconditionFailed', () => {
+  it('recognises an HTTP 412 status alone', () => {
+    assert.equal(isPreconditionFailed({ $metadata: { httpStatusCode: 412 } }), true);
+  });
+
+  it('recognises the PreconditionFailed error name alone', () => {
+    assert.equal(isPreconditionFailed({ name: 'PreconditionFailed' }), true);
+  });
+
+  it('rejects an HTTP 409 status — must not conflate the two conditional-put outcomes', () => {
+    assert.equal(isPreconditionFailed({ $metadata: { httpStatusCode: 409 } }), false);
+  });
+
+  it('rejects the ConditionalRequestConflict error name', () => {
+    assert.equal(isPreconditionFailed({ name: 'ConditionalRequestConflict' }), false);
+  });
+
+  it('rejects an unrelated error', () => {
+    assert.equal(
+      isPreconditionFailed({ name: 'InternalError', $metadata: { httpStatusCode: 500 } }),
+      false,
+    );
+  });
+});
+
+describe('isConditionalWriteIndeterminate', () => {
+  it('recognises an HTTP 409 status alone', () => {
+    assert.equal(isConditionalWriteIndeterminate({ $metadata: { httpStatusCode: 409 } }), true);
+  });
+
+  it('recognises the ConditionalRequestConflict error name alone', () => {
+    assert.equal(isConditionalWriteIndeterminate({ name: 'ConditionalRequestConflict' }), true);
+  });
+
+  it('rejects an HTTP 412 status — must not conflate the two conditional-put outcomes', () => {
+    assert.equal(isConditionalWriteIndeterminate({ $metadata: { httpStatusCode: 412 } }), false);
+  });
+
+  it('rejects the PreconditionFailed error name', () => {
+    assert.equal(isConditionalWriteIndeterminate({ name: 'PreconditionFailed' }), false);
+  });
+
+  it('rejects an unrelated error', () => {
+    assert.equal(
+      isConditionalWriteIndeterminate({ name: 'InternalError', $metadata: { httpStatusCode: 500 } }),
+      false,
+    );
   });
 });

@@ -59,6 +59,34 @@ export interface HeadManyOptions {
   readonly concurrency?: number;
 }
 
+/**
+ * Thrown by `putJsonConditional` when a *different* conditional write to the same location was
+ * in flight at the same time and the outcome could not be determined from this response alone.
+ * This is distinct from `{ outcome: 'exists' }`, which means the key is confirmed present (the
+ * ordinary lost-race case): here, presence is unconfirmed — a `getJson`/`head` issued
+ * immediately after can race the still-in-flight writer and observe a missing or
+ * not-yet-consistent object, so treating this the same as `exists` can make a transient,
+ * retryable condition look like a permanent conflict.
+ *
+ * The condition is expected to be retryable; this port and its adapters do not retry it
+ * themselves — retry classification is the caller's responsibility (see
+ * `rust-ingestion-worker`'s and the control plane's respective retry-policy owners).
+ */
+export class ConditionalWriteIndeterminateError extends Error {
+  readonly bucket: string;
+  readonly key: string;
+
+  constructor(location: ObjectLocation) {
+    super(
+      `conditional write to '${location.bucket}/${location.key}' raced a concurrent conditional ` +
+        'write to the same key; the outcome is indeterminate and the operation should be retried',
+    );
+    this.name = 'ConditionalWriteIndeterminate';
+    this.bucket = location.bucket;
+    this.key = location.key;
+  }
+}
+
 export interface ObjectStore {
   /** Object identity and metadata, or `null` when the object does not exist. */
   head(location: ObjectLocation): Promise<ObjectHead | null>;
@@ -79,7 +107,9 @@ export interface ObjectStore {
   /**
    * Writes JSON only if the key does not already exist. An existing key is reported as
    * `{ outcome: 'exists' }` and is never overwritten, which is what makes manifest
-   * publication safe to retry.
+   * publication safe to retry. May reject with `ConditionalWriteIndeterminateError` instead of
+   * either outcome when a concurrent conditional write to the same key was in flight and its
+   * result is not yet known — that condition is retryable and must not be treated as `exists`.
    */
   putJsonConditional(location: ObjectLocation, value: unknown): Promise<ConditionalPutOutcome>;
 }

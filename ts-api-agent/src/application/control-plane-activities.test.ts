@@ -35,6 +35,7 @@ import {
 } from './ingestion-contracts.ts';
 import {
   CHECKSUM_METADATA_KEY,
+  ConditionalWriteIndeterminateError,
   type ConditionalPutOutcome,
   type ObjectHead,
   type ObjectLocation,
@@ -94,6 +95,12 @@ class FakeObjectStore implements ObjectStore {
   readonly operations: string[] = [];
   /** Locations whose `head` raises, standing in for a transient store failure. */
   readonly unavailable = new Set<string>();
+  /**
+   * Locations whose `putJsonConditional` raises `ConditionalWriteIndeterminateError`, standing
+   * in for S3's HTTP 409 `ConditionalRequestConflict` — a concurrent conditional write racing
+   * this one, distinct from the ordinary "already exists" (412) case below.
+   */
+  readonly indeterminateOnPut = new Set<string>();
   maxInFlightHeads = 0;
 
   #inFlightHeads = 0;
@@ -166,6 +173,9 @@ class FakeObjectStore implements ObjectStore {
     const id = FakeObjectStore.id(location);
     this.operations.push(`PUT ${id}`);
     await tick();
+    if (this.indeterminateOnPut.has(id)) {
+      throw new ConditionalWriteIndeterminateError(location);
+    }
     if (this.objects.has(id)) {
       return { outcome: 'exists' };
     }
@@ -409,6 +419,22 @@ describe('publishDataset verifies the inventory and writes the manifest last', (
     assert.deepEqual(afterSecond, afterFirst);
     assert.equal(store.operationsMatching('PUT').length, 2, 'both attempts stay conditional');
     assert.deepEqual(await store.getJson(goldenManifestLocation), manifestFixture);
+  });
+
+  it('propagates ConditionalWriteIndeterminateError untouched instead of treating a 409-shaped conflict as `exists`', async () => {
+    const store = new FakeObjectStore();
+    seedGoldenInventory(store);
+    store.indeterminateOnPut.add(FakeObjectStore.id(goldenManifestLocation));
+    const { publishDataset } = activitiesFor(store);
+
+    await assert.rejects(
+      () => publishDataset(goldenInput, goldenResult),
+      ConditionalWriteIndeterminateError,
+    );
+    // The whole point of not treating a 409 as `exists`: publishDataset must not race a
+    // concurrent writer with an immediate read-back. It must propagate the error and stop,
+    // never issuing the GET that only follows the `exists` branch.
+    assert.deepEqual(store.operationsMatching('GET'), []);
   });
 
   it('raises DatasetPublicationConflict when a different manifest is already published', async () => {
