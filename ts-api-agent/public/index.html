@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ru" data-theme="dark">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -106,22 +106,22 @@
     <section x-show="state === 'select'" x-transition>
       <article>
         <header>
-          <h3>🗂 Выбор геномного датасета</h3>
+          <h3>🗂 Choose a genomic dataset</h3>
           <p class="muted">
-            Ингестируется только один из подготовленных датасетов каталога. Загрузка произвольных
-            файлов, URL и путей не поддерживается: источник в S3 определяется на сервере по ключу
-            каталога.
+            Only a dataset from the prepared catalogue can be ingested. Arbitrary files, URLs and
+            paths are not accepted: the S3 source is resolved on the server from the catalogue
+            key.
           </p>
         </header>
 
         <div x-show="catalogError" x-cloak class="notice error">
-          <strong>Каталог недоступен.</strong>
+          <strong>The catalogue is unavailable.</strong>
           <p class="mono" style="margin: 0.4rem 0 0 0;" x-text="catalogError"></p>
         </div>
 
         <form @submit.prevent="startIngestion()">
           <label for="datasetSelect">
-            <strong>Датасет</strong>
+            <strong>Dataset</strong>
             <select id="datasetSelect" x-model="selectedDatasetKey" :disabled="starting || catalog.length === 0">
               <template x-for="entry in catalog" :key="entry.key">
                 <option :value="entry.key" x-text="entry.key + ' — ' + entry.displayName"></option>
@@ -147,7 +147,7 @@
             :disabled="starting || catalog.length === 0"
             style="margin-top: 1rem;"
           >
-            <span x-text="starting ? 'Запуск Workflow…' : '🚀 Запустить ингестию'"></span>
+            <span x-text="starting ? 'Starting the workflow…' : '🚀 Start ingestion'"></span>
           </button>
         </form>
       </article>
@@ -159,10 +159,10 @@
     <section x-show="state === 'ingesting'" x-transition x-cloak>
       <article>
         <header>
-          <h3>⚙️ Ингестия датасета</h3>
+          <h3>⚙️ Ingesting the dataset</h3>
           <p class="muted">
-            Состояние читается запросом <code>getProgress</code> к самому Workflow. Никакой
-            прогресс здесь не моделируется на клиенте.
+            State comes from a <code>getProgress</code> query against the workflow itself. No
+            progress is simulated on the client.
           </p>
         </header>
 
@@ -185,32 +185,35 @@
         <progress x-show="!isTerminal()" style="height: 10px;"></progress>
 
         <p>
-          <strong>Статус:</strong> <code x-text="progress?.state ?? '—'"></code>
+          <strong>State:</strong> <code x-text="progress?.state ?? '—'"></code>
           <span
             x-show="progress && progress.unobservedStates && progress.unobservedStates.length > 0"
             x-cloak
             class="badge"
             style="background: rgba(245,158,11,0.15); color:#fcd34d; border:1px dashed #f59e0b;"
-            x-text="'внутри активности, без отдельного наблюдения: ' + (progress?.unobservedStates ?? []).join(', ')"
+            x-text="'inside an activity, not separately observed: ' + (progress?.unobservedStates ?? []).join(', ')"
           ></span>
         </p>
-        <p x-text="progress?.message ?? 'Ожидание первого ответа Workflow…'"></p>
+        <!-- No apostrophe in this fallback, deliberately: the attribute is parsed as HTML before
+             Alpine ever sees it, so an `&#39;` here is decoded into a bare quote that terminates
+             the string literal early and the expression silently renders nothing. -->
+        <p x-text="progress?.message ?? 'Waiting for the first workflow reply…'"></p>
 
         <div x-show="pollError" x-cloak class="notice error">
           <strong x-text="pollError?.error"></strong>
           <p class="mono" style="margin: 0.4rem 0 0 0;" x-text="pollError?.message"></p>
           <p x-show="pollRetrying" x-cloak style="margin: 0.4rem 0 0 0;">
-            Повтор запроса через <span x-text="Math.round(pollRetryDelayMs / 1000)"></span> с…
+            Retrying in <span x-text="Math.round(pollRetryDelayMs / 1000)"></span> s…
           </p>
           <button class="secondary" style="margin-top: 0.6rem;" @click="backToSelection()">
-            Выбрать датасет заново
+            Choose a dataset again
           </button>
         </div>
 
         <div x-show="progress?.state === 'FAILED'" x-cloak class="notice error">
-          <h4 style="margin-top: 0;">❌ Ингестия не удалась</h4>
-          <p>Манифест не опубликован, датасет не доступен для запросов.</p>
-          <button class="secondary" @click="backToSelection()">Выбрать датасет заново</button>
+          <h4 style="margin-top: 0;">❌ Ingestion failed</h4>
+          <p>No manifest was published, so the dataset is not queryable.</p>
+          <button class="secondary" @click="backToSelection()">Choose a dataset again</button>
         </div>
       </article>
     </section>
@@ -221,38 +224,38 @@
     <section x-show="state === 'chat'" x-transition x-cloak>
 
       <article class="notice ok">
-        <h4 style="margin: 0; color: #34d399;">🎉 Манифест опубликован — датасет доступен для запросов.</h4>
+        <h4 style="margin: 0; color: #34d399;">🎉 Manifest published — the dataset is queryable.</h4>
         <p class="mono" style="margin: 0.5rem 0 0 0;">
           <strong>datasetId:</strong> <span x-text="datasetId"></span>
         </p>
-        <small>Все вопросы этого диалога адресуются именно этому опубликованному датасету.</small>
+        <small>Every question in this conversation is addressed to this published dataset and no other.</small>
       </article>
 
       <article>
         <header style="display: flex; justify-content: space-between; align-items: center; gap: 1rem;">
-          <h3 style="margin: 0;">💬 Биоинформатический чат-агент</h3>
+          <h3 style="margin: 0;">💬 Bioinformatics chat agent</h3>
           <button
             class="outline secondary"
             style="padding: 0.3rem 0.8rem; font-size: 0.8rem; white-space: nowrap;"
             @click="backToSelection()"
           >
-            🔄 Запустить ингестию заново
+            🔄 Run a new ingestion
           </button>
         </header>
 
         <div style="margin: 1rem 0;">
-          <small style="display: block; margin-bottom: 0.5rem;">Примеры вопросов:</small>
-          <button class="secondary quick-btn" @click="askQuickQuestion('Can I drink coffee? Check my CYP1A2 genetic variant and explain what it means.')">☕ Кофе и CYP1A2</button>
-          <button class="secondary quick-btn" @click="askQuickQuestion('Am I at risk for muscle toxicity from statins? Check my SLCO1B1 genotype.')">💊 Статины и SLCO1B1</button>
-          <button class="secondary quick-btn" @click="askQuickQuestion('Am I lactose intolerant? What is my LCT genotype?')">🥛 Лактоза и LCT</button>
-          <button class="secondary quick-btn" @click="askQuickQuestion('What is my warfarin sensitivity risk (VKORC1)?')">💉 Варфарин и VKORC1</button>
+          <small style="display: block; margin-bottom: 0.5rem;">Example questions:</small>
+          <button class="secondary quick-btn" @click="askQuickQuestion('Can I drink coffee? Check my CYP1A2 genetic variant and explain what it means.')">☕ Coffee and CYP1A2</button>
+          <button class="secondary quick-btn" @click="askQuickQuestion('Am I at risk for muscle toxicity from statins? Check my SLCO1B1 genotype.')">💊 Statins and SLCO1B1</button>
+          <button class="secondary quick-btn" @click="askQuickQuestion('Am I lactose intolerant? What is my LCT genotype?')">🥛 Lactose and LCT</button>
+          <button class="secondary quick-btn" @click="askQuickQuestion('What is my warfarin sensitivity risk (VKORC1)?')">💉 Warfarin and VKORC1</button>
         </div>
 
         <div class="chat-container" id="chatWindow">
           <template x-for="(msg, index) in messages" :key="index">
             <div class="chat-msg" :class="msg.sender">
               <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem;">
-                <strong x-text="msg.sender === 'user' ? '🧑 Вы' : '🤖 AI геномный агент'"></strong>
+                <strong x-text="msg.sender === 'user' ? '🧑 You' : '🤖 AI genomic agent'"></strong>
                 <small x-text="msg.time"></small>
               </div>
 
@@ -274,7 +277,7 @@
               <div class="markdown-body" x-html="renderMarkdown(msg.text)"></div>
 
               <details class="provenance" x-show="msg.provenance" x-cloak>
-                <summary>Происхождение ответа</summary>
+                <summary>Where this answer came from</summary>
                 <p class="mono" style="margin: 0.5rem 0 0 0;">
                   datasetChecksumSha256: <span x-text="msg.provenance?.datasetChecksumSha256"></span><br />
                   layoutVersion: <span x-text="msg.provenance?.layoutVersion"></span> ·
@@ -282,7 +285,7 @@
                   artifactVersion: <span x-text="msg.provenance?.artifactVersion"></span><br />
                   reference: <span x-text="msg.provenance?.referenceBuild"></span> /
                   <span x-text="msg.provenance?.referenceVersion"></span><br />
-                  прочитанные объекты (<span x-text="(msg.provenance?.filesScanned || []).length"></span>):
+                  objects read (<span x-text="(msg.provenance?.filesScanned || []).length"></span>):
                 </p>
                 <ul class="mono">
                   <template x-for="file in (msg.provenance?.filesScanned || [])" :key="file">
@@ -290,15 +293,15 @@
                   </template>
                 </ul>
                 <p class="mono" x-show="(msg.provenance?.filesScanned || []).length === 0">
-                  ни один объект не читался.
+                  no object was read.
                 </p>
               </details>
             </div>
           </template>
 
           <div x-show="chatLoading" x-cloak class="chat-msg agent">
-            <strong>🤖 AI геномный агент</strong>
-            <p style="margin: 0.5rem 0 0 0;"><em>⚡ Чтение опубликованного Parquet и поиск по литературе…</em></p>
+            <strong>🤖 AI genomic agent</strong>
+            <p style="margin: 0.5rem 0 0 0;"><em>⚡ Reading the published Parquet and searching the literature…</em></p>
           </div>
         </div>
 
@@ -306,7 +309,7 @@
           <input
             type="text"
             x-model="currentInput"
-            placeholder="Задайте клинический или нутригеномный вопрос…"
+            placeholder="Ask a clinical or nutrigenomic question…"
             :disabled="chatLoading || state !== 'chat'"
             style="flex: 1; margin: 0;"
           />
@@ -317,7 +320,7 @@
             :disabled="chatLoading || state !== 'chat' || !currentInput.trim()"
             style="margin: 0; width: 150px;"
           >
-            Отправить
+            Send
           </button>
         </form>
       </article>
@@ -338,11 +341,11 @@
     function genomicApp() {
       // Canonical pipeline order, matching `domain/datasets.ts`.
       const STEPS = [
-        { state: 'RESOLVING', label: '1. Определение источника в S3' },
-        { state: 'BUILDING', label: '2. Rust: VCF → партиционированный Parquet' },
-        { state: 'VERIFYING_OBJECTS', label: '3. Проверка выгруженных объектов' },
-        { state: 'PUBLISHING_MANIFEST', label: '4. Публикация манифеста' },
-        { state: 'COMPLETED', label: '5. Датасет доступен для запросов' },
+        { state: 'RESOLVING', label: '1. Resolving the source in S3' },
+        { state: 'BUILDING', label: '2. Rust: VCF → partitioned Parquet' },
+        { state: 'VERIFYING_OBJECTS', label: '3. Verifying the uploaded objects' },
+        { state: 'PUBLISHING_MANIFEST', label: '4. Publishing the manifest' },
+        { state: 'COMPLETED', label: '5. Dataset queryable' },
       ];
       const ORDER = STEPS.map((step) => step.state);
 
@@ -380,7 +383,7 @@
           try {
             const res = await fetch('/api/datasets/catalog');
             const data = await res.json();
-            if (!res.ok) throw new Error(data.message || 'не удалось получить каталог');
+            if (!res.ok) throw new Error(data.message || 'could not load the catalogue');
             this.catalog = data.datasets || [];
             this.selectedDatasetKey = this.catalog.length > 0 ? this.catalog[0].key : '';
             this.catalogError = null;
@@ -506,11 +509,11 @@
         },
 
         stepTag(step) {
-          if (!this.progress) return 'ожидается';
+          if (!this.progress) return 'pending';
           if (this.progress.state === 'FAILED') return '—';
-          if (step === this.progress.state) return 'наблюдается';
-          if ((this.progress.unobservedStates || []).includes(step)) return 'выводится';
-          return this.reached(step) ? 'пройдено' : 'ожидается';
+          if (step === this.progress.state) return 'observed';
+          if ((this.progress.unobservedStates || []).includes(step)) return 'inferred';
+          return this.reached(step) ? 'done' : 'pending';
         },
 
         /** True once the workflow has proven it moved past this step. */
@@ -529,9 +532,9 @@
             {
               sender: 'agent',
               text:
-                'Датасет опубликован и доступен для запросов. Спросите о метаболизме кофеина ' +
-                '(**CYP1A2**), чувствительности к статинам (**SLCO1B1**), переносимости лактозы ' +
-                '(**LCT**) или других маркерах.',
+                'This dataset is published and queryable. Ask about caffeine metabolism ' +
+                '(**CYP1A2**), statin sensitivity (**SLCO1B1**), lactose tolerance (**LCT**) ' +
+                'or any other marker in the reference snapshot.',
               time: this.now(),
               toolsUsed: [],
               variants: [],
@@ -588,7 +591,7 @@
             } else {
               this.messages.push({
                 sender: 'agent',
-                text: data.answer || 'Ответ не получен.',
+                text: data.answer || 'No answer was returned.',
                 time: this.now(),
                 toolsUsed: data.toolsUsed || [],
                 variants: data.variants || [],
@@ -598,7 +601,7 @@
           } catch (err) {
             this.messages.push({
               sender: 'error',
-              text: `**Ошибка соединения:** ${err.message}`,
+              text: `**Connection error:** ${err.message}`,
               time: this.now(),
               toolsUsed: [],
               variants: [],
