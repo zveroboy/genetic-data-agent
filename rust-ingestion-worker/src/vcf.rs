@@ -4,7 +4,9 @@
 //! variants. [`VcfRecordReader`] is an `Iterator`, so the caller decides how much to hold.
 //!
 //! A malformed record is data, not an error: it is yielded as [`VcfRecord::Rejected`] and
-//! counted by the caller. Only an I/O failure aborts the stream.
+//! counted by the caller. Only an I/O failure aborts the stream — and one property of the
+//! *file* rather than of a line: a `#CHROM` header that does not declare exactly one sample.
+//! See [`validate_single_sample`] for why that one cannot be a rejected record.
 //!
 //! No Temporal, no S3, no DuckDB.
 
@@ -20,6 +22,16 @@ use crate::models::UserVariant;
 /// Columns a VCF data line must have before it can carry a genotype: the eight fixed
 /// columns, then `FORMAT`, then at least one sample column.
 pub const MIN_DATA_COLUMNS: usize = 10;
+
+/// Index of the first sample column of a `#CHROM` header line: the eight fixed columns, then
+/// `FORMAT`. Tied to [`MIN_DATA_COLUMNS`] rather than spelled out again, because the same layout
+/// is what makes `columns[9]` the first sample on a data line.
+const FIRST_SAMPLE_COLUMN: usize = MIN_DATA_COLUMNS - 1;
+
+/// How many sample names a rejection message spells out before eliding the rest. A 3,202-sample
+/// 1000 Genomes callset must identify itself in the failure an operator reads without putting
+/// 3,202 names into a Temporal failure payload.
+const NAMED_SAMPLES_IN_ERRORS: usize = 3;
 
 /// The highest human autosome accepted as a partition value.
 const MAX_AUTOSOME: u8 = 22;
@@ -105,6 +117,18 @@ pub fn open_vcf(path: &Path, bgzf_workers: usize) -> io::Result<VcfRecordReader<
     Ok(VcfRecordReader::new(reader))
 }
 
+/// How far the stream has got through verifying its own column layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderState {
+    /// No `#CHROM` line has been seen yet. `##` metadata lines leave this alone.
+    Pending,
+    /// `#CHROM` declared exactly one sample column, so `columns[9]` of a data line is that
+    /// sample and nothing else is being discarded.
+    Declared,
+    /// The header fault has been yielded and the stream is over.
+    Failed,
+}
+
 /// An iterator over the data records of a VCF stream.
 pub struct VcfRecordReader<R> {
     reader: R,
@@ -112,6 +136,7 @@ pub struct VcfRecordReader<R> {
     line: String,
     line_number: u64,
     bytes_read: u64,
+    header: HeaderState,
 }
 
 impl<R: BufRead> VcfRecordReader<R> {
@@ -121,6 +146,7 @@ impl<R: BufRead> VcfRecordReader<R> {
             line: String::new(),
             line_number: 0,
             bytes_read: 0,
+            header: HeaderState::Pending,
         }
     }
 
@@ -129,16 +155,38 @@ impl<R: BufRead> VcfRecordReader<R> {
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read
     }
+
+    /// Ends the stream on a header fault and hands the error back to be yielded once.
+    fn fail(&mut self, error: io::Error) -> io::Error {
+        self.header = HeaderState::Failed;
+        error
+    }
+
+    /// End of input. Reaching it while still [`HeaderState::Pending`] means the source never
+    /// declared its columns, which would otherwise be indistinguishable from a legitimate
+    /// header-only VCF and be reported as an empty dataset instead of an unverifiable file.
+    fn finish(&mut self) -> Option<io::Result<VcfRecord>> {
+        if self.header == HeaderState::Pending {
+            return Some(Err(self.fail(missing_chrom_header_error())));
+        }
+        None
+    }
 }
 
 impl<R: BufRead> Iterator for VcfRecordReader<R> {
     type Item = io::Result<VcfRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // The header fault has already been yielded. Every remaining line has an unverified
+        // layout, so carrying on would hand the caller exactly the mis-attributed genotypes the
+        // check exists to prevent.
+        if self.header == HeaderState::Failed {
+            return None;
+        }
         loop {
             self.line.clear();
             match self.reader.read_line(&mut self.line) {
-                Ok(0) => return None,
+                Ok(0) => return self.finish(),
                 Ok(bytes) => {
                     self.bytes_read += bytes as u64;
                     self.line_number += 1;
@@ -147,12 +195,97 @@ impl<R: BufRead> Iterator for VcfRecordReader<R> {
             }
 
             let trimmed = self.line.trim_end_matches(['\n', '\r']);
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            if trimmed.is_empty() {
                 continue;
+            }
+            if let Some(after_hash) = trimmed.strip_prefix('#') {
+                // `##` metadata precedes `#CHROM` and says nothing about the column layout — it
+                // is skipped on its prefix alone, so a `##INFO` description containing tabs
+                // cannot be mistaken for a column declaration. The single-`#` line is the
+                // authoritative one.
+                if after_hash.starts_with('#') {
+                    continue;
+                }
+                match validate_single_sample(trimmed) {
+                    Ok(()) => {
+                        self.header = HeaderState::Declared;
+                        continue;
+                    }
+                    Err(error) => return Some(Err(self.fail(error))),
+                }
+            }
+            if self.header == HeaderState::Pending {
+                return Some(Err(self.fail(missing_chrom_header_error())));
             }
             return Some(Ok(parse_data_line(trimmed, self.line_number)));
         }
     }
+}
+
+/// Accepts a `#CHROM` header line only if it declares exactly one sample column.
+///
+/// The header is the file's own statement of how many genomes it holds: eight fixed columns,
+/// then `FORMAT`, then one column per sample. [`parse_data_line`] reads `columns[9]` and nothing
+/// after it, and [`MIN_DATA_COLUMNS`] is a floor, so without this check a joint callset — a
+/// 1000 Genomes file carries 3,202 samples — ingests the first sample, silently discards the
+/// other 3,201, and publishes a dataset that claims to be one person's genome.
+///
+/// Sample *selection* is deliberately not the fix: [`UserVariant`] has no sample field, the
+/// manifest records no sample identity and the Parquet schema is frozen by a fingerprint, so
+/// "sample N was chosen" could not be written down anywhere. The dataset would claim to be about
+/// a person it cannot name — wrong data presented as right data, which is worse than a failure.
+/// One dataset is one genome; a joint callset is out of scope and the honest answer is a refusal
+/// that tells the operator how to proceed.
+///
+/// Zero samples is rejected for a different reason: a sites-only VCF stops at `INFO` (or carries
+/// `FORMAT` with no sample after it) and holds no genotypes at all, so there is nothing here for
+/// this pipeline to ingest.
+///
+/// The failure is an [`io::Error`] with [`io::ErrorKind::InvalidData`] rather than a new error
+/// type because that is the seam the caller already has: the reader is an
+/// `Iterator<Item = io::Result<VcfRecord>>` and `crate::artifact::staging` funnels both
+/// `open_vcf` and per-record errors through one classifier that already treats `InvalidData` as
+/// deterministic content — mapping it onto the non-retryable
+/// `crate::contracts::FailureType::InvalidVcfFormat`. A bespoke error would need a second
+/// classification path to reach the same verdict. A [`VcfRecord::Rejected`] is not an option at
+/// all: those only increment a counter and let the ingestion succeed.
+fn validate_single_sample(header_line: &str) -> io::Result<()> {
+    let columns: Vec<&str> = header_line.split('\t').collect();
+    let samples = columns.get(FIRST_SAMPLE_COLUMN..).unwrap_or(&[]);
+    if samples.len() == 1 {
+        return Ok(());
+    }
+
+    let named = if samples.is_empty() {
+        "no FORMAT or sample column: a sites-only VCF carries no genotypes".to_string()
+    } else {
+        let listed = samples[..samples.len().min(NAMED_SAMPLES_IN_ERRORS)].join(", ");
+        let elided = if samples.len() > NAMED_SAMPLES_IN_ERRORS { ", ..." } else { "" };
+        format!("{listed}{elided}")
+    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "the #CHROM header declares {} sample columns ({named}); this pipeline ingests \
+             exactly one sample per dataset, because one dataset is one person's genome and \
+             nothing in the schema can record which sample a genotype came from. Extract a \
+             single sample first: `bcftools view -s <SAMPLE> <source> -Oz -o single-sample.vcf.gz`",
+            samples.len()
+        ),
+    ))
+}
+
+/// The refusal for a source with no `#CHROM` line at all: same reasoning, one step earlier.
+/// Without the header the column layout is undeclared, so the single-sample requirement is a
+/// guess about a data line's tenth column rather than a checked property of the file.
+fn missing_chrom_header_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "the VCF has no #CHROM header line, so its column layout is undeclared and the number \
+         of samples it carries cannot be verified: a data line's tenth column might be the only \
+         sample or the first of thousands. Supply a VCF whose #CHROM header names exactly one \
+         sample: `bcftools view -s <SAMPLE> <source> -Oz -o single-sample.vcf.gz`",
+    )
 }
 
 /// Parses one VCF data line. Never panics and never fails: an unusable line becomes a

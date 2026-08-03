@@ -75,7 +75,8 @@ pub(super) fn stage_variants(
 /// Decides whether an I/O failure while reading the source is a property of the *bytes* or of
 /// the *environment*, because the two get opposite retry treatment.
 ///
-/// A corrupt gzip member, a truncated one and a stream that is not valid UTF-8 are
+/// A corrupt gzip member, a truncated one, a stream that is not valid UTF-8 and a `#CHROM`
+/// header that does not declare exactly one sample (see [`crate::vcf`]) are all
 /// deterministic: the same source reproduces them exactly, so they are genuine
 /// [`crate::contracts::FailureType::InvalidVcfFormat`] and must not be retried. Everything
 /// else — the scratch file is missing, the directory is not readable, the disk the download
@@ -90,7 +91,9 @@ fn classify_source_error(path: &Path, error: &io::Error) -> ArtifactError {
     match error.kind() {
         // `flate2` reports a corrupt deflate stream or a bad gzip header as `InvalidInput` and
         // a member that ends early as `UnexpectedEof`; `BufRead::read_line` reports non-UTF-8
-        // input as `InvalidData`. All three are content, not environment.
+        // input as `InvalidData`, and `crate::vcf` reports a header that does not declare
+        // exactly one sample as `InvalidData` for exactly this reason. All are content, not
+        // environment.
         io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {
             ArtifactError::InvalidVcf(format!("cannot decode {}: {error}", path.display()))
         }

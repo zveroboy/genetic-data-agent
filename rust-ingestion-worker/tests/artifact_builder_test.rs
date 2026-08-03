@@ -68,6 +68,28 @@ fn write_vcf(directory: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// Writes a VCF verbatim, header and all, for the tests that are about the header itself.
+fn write_raw_vcf(directory: &Path, name: &str, text: &str) -> PathBuf {
+    let path = directory.join(name);
+    std::fs::write(&path, text).expect("write VCF");
+    path
+}
+
+/// A `#CHROM` header line declaring one column per name in `samples`, or a sites-only header
+/// ending at `INFO` when `samples` is empty.
+fn chrom_header(samples: &[String]) -> String {
+    let mut line = String::from("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO");
+    if !samples.is_empty() {
+        line.push_str("\tFORMAT");
+        for sample in samples {
+            line.push('\t');
+            line.push_str(sample);
+        }
+    }
+    line.push('\n');
+    line
+}
+
 /// A well-formed data line with the ten mandatory columns.
 fn data_line(chrom: &str, pos: u32, rsid: &str, reference: &str, alt: &str, gt: &str) -> String {
     format!("{chrom}\t{pos}\t{rsid}\t{reference}\t{alt}\t99\tPASS\tGENE=TEST\tGT\t{gt}\n")
@@ -94,6 +116,37 @@ fn variants(path: &Path) -> Vec<rust_ingestion_worker::models::UserVariant> {
             VcfRecord::Rejected { .. } => None,
         })
         .collect()
+}
+
+/// The message from a source that must fail the *read* rather than yield rejected records,
+/// having yielded nothing at all first.
+///
+/// The kind is asserted here because it is what `stage_variants` classifies on: an error of any
+/// other kind would be reported as a retryable `ArtifactWriteFailed` and the operator would be
+/// told to try again with bytes that can never work.
+fn read_failure(path: &Path) -> String {
+    let mut yielded = Vec::new();
+    let mut failure = None;
+    for record in open_vcf(path, SEQUENTIAL_DECOMPRESSION).expect("open VCF") {
+        match record {
+            Ok(record) => yielded.push(record),
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    let error = failure.expect("this source must fail the read, not merely reject records");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::InvalidData,
+        "a whole-file fault must carry the deterministic kind staging maps to InvalidVcfFormat"
+    );
+    assert!(
+        yielded.is_empty(),
+        "no record may be yielded before the sample count is verified: {yielded:?}"
+    );
+    error.to_string()
 }
 
 fn rejections(path: &Path) -> Vec<RejectionReason> {
@@ -559,6 +612,172 @@ mod vcf {
         assert_eq!(variants(&misnamed).len(), 4);
     }
 
+    // -----------------------------------------------------------------------------------
+    // The `#CHROM` header is the file's declaration of how many genomes it holds
+    // -----------------------------------------------------------------------------------
+
+    /// The ordinary case: one sample column, and the variants behind it parse exactly as they
+    /// did before the header was looked at.
+    #[test]
+    fn accepts_a_chrom_header_that_declares_exactly_one_sample() {
+        let directory = TempDir::new().expect("temp dir");
+        let body = [
+            data_line("chr1", 100, "rs1", "A", "C", "0/1"),
+            data_line("chrX", 200, ".", "G", "T", "1|1"),
+        ]
+        .concat();
+        let path = write_raw_vcf(
+            directory.path(),
+            "one_sample.vcf",
+            &format!(
+                "##fileformat=VCFv4.2\n{}{body}",
+                chrom_header(&["NA12878".to_string()])
+            ),
+        );
+
+        let parsed = variants(&path);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].chrom, "1");
+        assert_eq!(parsed[0].gt_raw, "0/1");
+        assert_eq!(parsed[1].chrom, "X");
+        assert_eq!(parsed[1].gt_raw, "1|1");
+    }
+
+    /// The defect this check closes, at its smallest: two sample columns used to ingest the
+    /// first and silently discard the second, publishing a dataset that named neither.
+    #[test]
+    fn rejects_a_vcf_whose_chrom_header_declares_two_samples() {
+        let directory = TempDir::new().expect("temp dir");
+        let header = chrom_header(&["NA12878".to_string(), "NA12891".to_string()]);
+        let path = write_raw_vcf(
+            directory.path(),
+            "two_samples.vcf",
+            &format!(
+                "##fileformat=VCFv4.2\n{header}1\t100\trs1\tA\tC\t99\tPASS\tGENE=TEST\tGT\t0/1\t1/1\n"
+            ),
+        );
+
+        let message = read_failure(&path);
+        assert!(message.contains("2 sample columns"), "{message}");
+        assert!(message.contains("NA12878") && message.contains("NA12891"), "{message}");
+        assert!(message.contains("bcftools view -s"), "{message}");
+    }
+
+    /// A joint callset at real scale: the 1000 Genomes phase-3 release is 3,202 samples in one
+    /// file. Generated rather than pasted, so the assertion is about the count the reader
+    /// derived and not about a fixture someone kept in step by hand.
+    #[test]
+    fn rejects_a_joint_callset_sized_chrom_header() {
+        const SAMPLES: usize = 3_202;
+
+        let directory = TempDir::new().expect("temp dir");
+        let names: Vec<String> = (0..SAMPLES).map(|index| format!("HG{index:05}")).collect();
+        let path = write_raw_vcf(
+            directory.path(),
+            "joint_callset.vcf",
+            &format!("##fileformat=VCFv4.2\n{}", chrom_header(&names)),
+        );
+
+        let message = read_failure(&path);
+        assert!(message.contains("3202 sample columns"), "{message}");
+        // The first few names identify the callset without carrying 3,202 of them into a
+        // Temporal failure payload.
+        assert!(message.contains("HG00000, HG00001, HG00002, ..."), "{message}");
+        assert!(!message.contains("HG00003"), "the name list must be elided: {message}");
+        assert!(message.contains("bcftools view -s"), "{message}");
+    }
+
+    /// A sites-only VCF stops at `INFO`. It holds no genotypes at all, so nothing this pipeline
+    /// does is possible with it — and `MIN_DATA_COLUMNS` alone would only have rejected its
+    /// lines one at a time while reporting the ingestion a success.
+    #[test]
+    fn rejects_a_sites_only_chrom_header_with_no_format_column() {
+        let directory = TempDir::new().expect("temp dir");
+        let path = write_raw_vcf(
+            directory.path(),
+            "sites_only.vcf",
+            &format!(
+                "##fileformat=VCFv4.2\n{}1\t100\trs1\tA\tC\t99\tPASS\tGENE=TEST\n",
+                chrom_header(&[])
+            ),
+        );
+
+        let message = read_failure(&path);
+        assert!(message.contains("0 sample columns"), "{message}");
+        assert!(message.contains("sites-only"), "{message}");
+    }
+
+    /// The off-by-one next door: `FORMAT` is present but no sample follows it, which is still
+    /// zero genotypes.
+    #[test]
+    fn rejects_a_chrom_header_with_format_but_no_sample_column() {
+        let directory = TempDir::new().expect("temp dir");
+        let path = write_raw_vcf(
+            directory.path(),
+            "format_only.vcf",
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\n",
+        );
+
+        let message = read_failure(&path);
+        assert!(message.contains("0 sample columns"), "{message}");
+    }
+
+    /// Without `#CHROM` the column layout is unverified, so "the tenth column is the only
+    /// sample" is a guess. Both shapes must refuse: one that goes on to data lines, and one that
+    /// ends after its metadata.
+    #[test]
+    fn rejects_a_vcf_with_no_chrom_header_at_all() {
+        let directory = TempDir::new().expect("temp dir");
+
+        let with_data = write_raw_vcf(
+            directory.path(),
+            "no_chrom_header.vcf",
+            &format!(
+                "##fileformat=VCFv4.2\n##source=SyntheticGenomicsTest\n{}",
+                data_line("1", 100, "rs1", "A", "C", "0/1")
+            ),
+        );
+        let message = read_failure(&with_data);
+        assert!(message.contains("no #CHROM header line"), "{message}");
+        assert!(message.contains("bcftools view -s"), "{message}");
+
+        // Nothing but metadata: the stream ends without ever declaring its columns, which must
+        // not be reported as a legitimately empty single-sample VCF.
+        let metadata_only = write_raw_vcf(
+            directory.path(),
+            "metadata_only.vcf",
+            "##fileformat=VCFv4.2\n##source=SyntheticGenomicsTest\n",
+        );
+        assert!(read_failure(&metadata_only).contains("no #CHROM header line"));
+    }
+
+    /// `##` metadata comes before `#CHROM` and must not be mistaken for it — not even a
+    /// description whose own text contains tab characters, which a column count would read as a
+    /// multi-sample declaration.
+    #[test]
+    fn metadata_lines_before_the_chrom_header_do_not_trip_the_single_sample_check() {
+        let directory = TempDir::new().expect("temp dir");
+        let path = write_raw_vcf(
+            directory.path(),
+            "metadata_then_header.vcf",
+            &format!(
+                "##fileformat=VCFv4.2\n\
+                 ##source=SyntheticGenomicsTest\n\
+                 ##contig=<ID=1,length=248956422>\n\
+                 ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+                 ##INFO=<ID=X,Number=1,Type=String,Description=\"a\tb\tc\td\te\tf\tg\th\ti\tj\">\n\
+                 {}{}",
+                chrom_header(&["DEMO_USER".to_string()]),
+                data_line("12", 300, "rs3", "T", "C", "0/1")
+            ),
+        );
+
+        let parsed = variants(&path);
+        assert_eq!(parsed.len(), 1, "the metadata must be skipped, not counted");
+        assert_eq!(parsed[0].chrom, "12");
+        assert_eq!(parsed[0].pos, 300);
+    }
+
     #[test]
     fn a_header_only_vcf_yields_no_records() {
         let directory = TempDir::new().expect("temp dir");
@@ -873,6 +1092,52 @@ mod artifact_builder {
 
         assert_eq!(error.failure_type(), FailureType::ArtifactWriteFailed);
         assert!(error.failure_type().is_retryable(), "a permission error must be retryable");
+    }
+
+    /// A multi-sample source must fail the whole build as a non-retryable `InvalidVcfFormat`,
+    /// not succeed with the first sample's genotypes and a rejected-record count.
+    ///
+    /// This is the seam that matters: the fault is discovered inside the reader, and it has to
+    /// travel through `classify_source_error` as content rather than as environment, or an
+    /// operator would be told to retry a file whose bytes can never produce a dataset.
+    #[test]
+    fn a_multi_sample_vcf_fails_the_build_as_a_non_retryable_invalid_vcf() {
+        let directory = TempDir::new().expect("temp dir");
+        let names: Vec<String> = (0..3_202).map(|index| format!("HG{index:05}")).collect();
+        let mut text = format!("##fileformat=VCFv4.2\n{}", chrom_header(&names));
+        // Data lines whose tenth column looks perfectly ingestible on its own, which is exactly
+        // how the dataset used to be built.
+        for position in 1..50u32 {
+            text.push_str(&data_line("1", position, ".", "A", "C", "0/1"));
+        }
+        let source = write_raw_vcf(directory.path(), "joint_callset.vcf", &text);
+
+        let error = build_in(&directory, &source, &RecordingProgressSink::default(), 1_000)
+            .expect_err("a joint callset must never be published as one person's genome");
+        assert_eq!(error.failure_type(), FailureType::InvalidVcfFormat);
+        assert!(
+            !error.failure_type().is_retryable(),
+            "the sample count is a property of the bytes; retrying them cannot help"
+        );
+        let message = error.to_string();
+        assert!(message.contains("3202 sample columns"), "{message}");
+        assert!(message.contains("bcftools view -s"), "{message}");
+    }
+
+    /// A source with no `#CHROM` header is the same class of permanent failure.
+    #[test]
+    fn a_vcf_without_a_chrom_header_fails_the_build_as_an_invalid_vcf() {
+        let directory = TempDir::new().expect("temp dir");
+        let source = write_raw_vcf(
+            directory.path(),
+            "headerless.vcf",
+            &format!("##fileformat=VCFv4.2\n{}", data_line("1", 100, "rs1", "A", "C", "0/1")),
+        );
+
+        let error = build_in(&directory, &source, &RecordingProgressSink::default(), 1_000)
+            .expect_err("an undeclared column layout cannot be ingested");
+        assert_eq!(error.failure_type(), FailureType::InvalidVcfFormat);
+        assert!(error.to_string().contains("no #CHROM header line"), "{error}");
     }
 
     /// The other direction: a damaged gzip member is a property of the bytes, so it stays a

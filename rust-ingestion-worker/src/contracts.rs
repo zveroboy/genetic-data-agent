@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(input.source.version_id, None);
         assert_eq!(input.source.content_length, 1024);
         assert_eq!(input.reference.build, "GRCh38");
-        assert_eq!(input.reference.version, "demo-clinvar-grch38-v2");
+        assert_eq!(input.reference.version, "demo-clinvar-grch38-v3");
         assert_eq!(input.target.bucket, "genomic-artifacts");
         assert_eq!(input.target.artifact_version, "iv-test-001");
         assert_eq!(
@@ -438,7 +438,7 @@ mod tests {
         assert_eq!(manifest.schema_fingerprint, PARQUET_SCHEMA_FINGERPRINT);
         assert_eq!(manifest.artifact_version, "iv-test-001");
         assert_eq!(manifest.reference_build, "GRCh38");
-        assert_eq!(manifest.reference_version, "demo-clinvar-grch38-v2");
+        assert_eq!(manifest.reference_version, "demo-clinvar-grch38-v3");
         assert_eq!(manifest.partition_spec, PARTITION_SPEC);
         assert_eq!(manifest.sort_order, SORT_ORDER);
     }
