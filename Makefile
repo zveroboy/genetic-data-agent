@@ -111,17 +111,22 @@ reference-snapshot:
 reference-table:
 	node scripts/generate_clinvar_reference_tsv.ts
 
+# `--env-file-if-exists` rather than `--env-file`: a `.env` is how a developer supplies
+# CEREBRAS_API_KEY, and nothing else in this project read it, so a key placed there silently did
+# nothing and the API answered from the deterministic path with no hint why. `-if-exists` is the
+# variant that does not fail when the file is absent, which is the normal case — the deterministic
+# path needs no key at all.
 api:
-	node ts-api-agent/src/index.ts
+	node --env-file-if-exists=.env ts-api-agent/src/index.ts
 
 worker:
-	node ts-api-agent/src/application/worker.ts
+	node --env-file-if-exists=.env ts-api-agent/src/application/worker.ts
 
 trigger:
-	node ts-api-agent/src/application/trigger_workflow.ts
+	node --env-file-if-exists=.env ts-api-agent/src/application/trigger_workflow.ts
 
 ingest-pubmed:
-	node ts-api-agent/scripts/ingest_pubmed.ts
+	node --env-file-if-exists=.env ts-api-agent/scripts/ingest_pubmed.ts
 
 download-real-data:
 	./scripts/download_na12878.sh

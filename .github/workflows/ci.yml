@@ -1,0 +1,60 @@
+# Runs the tests that already exist, on every push and every pull request.
+#
+# This workflow exists because `deploy.yml` deploys on a push to `main` and runs nothing first.
+# Having 600 tests and no automation that executes them is the same as not having them: the first
+# person to learn a change was broken would be whoever opened the deployed UI.
+#
+# Deliberately not here: the integration suites (`test:integration`, `test:integration:rust`).
+# They start their own Temporal dev server and MinIO and create their own buckets, which is a
+# different kind of job — worth adding when someone actually needs it, not speculatively.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# A second push to the same branch makes the first run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The test runner uses `--experimental-strip-types` to run `.ts` directly, so the major
+      # version is load bearing: an older Node does not have the flag and every suite fails to
+      # start rather than failing a test.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '25'
+          cache: npm
+
+      - run: npm ci
+
+      # Unit tests for both workspaces, then the integration tree's typecheck — a contract rename
+      # there is a compile error rather than a surprise under Docker.
+      - run: npm run test:ts
+      - run: npm run typecheck:integration
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # The worker links DuckDB, which is compiled from source and takes minutes cold. Without a
+      # cache every run pays that again and people stop waiting for CI, which is how a green tick
+      # stops meaning anything.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-ingestion-worker
+
+      - run: cargo test --manifest-path rust-ingestion-worker/Cargo.toml
+      - run: cargo clippy --manifest-path rust-ingestion-worker/Cargo.toml --all-targets -- -D warnings
