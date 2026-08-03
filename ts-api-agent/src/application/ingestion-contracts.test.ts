@@ -447,7 +447,7 @@ describe('seeded dataset catalog', () => {
     );
     for (const entry of entries) {
       assert.equal(entry.expectedReferenceBuild, 'GRCh38');
-      assert.equal(entry.referenceVersion, 'demo-clinvar-grch38-v2');
+      assert.equal(entry.referenceVersion, 'demo-clinvar-grch38-v3');
       assert.ok(entry.displayName.length > 0);
     }
   });

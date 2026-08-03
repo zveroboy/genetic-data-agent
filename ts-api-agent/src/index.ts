@@ -286,6 +286,9 @@ export function createApp(dependencies: AppDependencies): Hono {
         answer: response.answer,
         toolsUsed: response.toolsUsed ?? [],
         variants: response.evidence ?? [],
+        // Machine-readable form of the warning already appended to `answer`, so a client can
+        // present "the prose contradicts `variants`" as something other than a paragraph.
+        groundingFindings: response.groundingFindings ?? [],
         literatureHits: response.literatureHits ?? [],
         provenance: provenanceEnvelope(dataset, response.provenance),
       });

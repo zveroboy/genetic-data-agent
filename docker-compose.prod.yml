@@ -77,6 +77,10 @@ services:
       # no Internet must still answer `/ask` rather than fetching an extension mid-request.
       DUCKDB_ALLOW_EXTENSION_INSTALL: "false"
       CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      # Deliberately lower than the local default: a deployed demo is reachable by people who did
+      # not pay for the key. Exhaustion is not an outage — answers keep coming from the
+      # deterministic path, without the model's prose.
+      CEREBRAS_CALLS_PER_WINDOW: ${CEREBRAS_CALLS_PER_WINDOW:-60}
       OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
     ports: !override
       - "127.0.0.1:3000:3000"

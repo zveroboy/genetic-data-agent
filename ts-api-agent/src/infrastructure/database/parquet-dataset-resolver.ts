@@ -105,11 +105,21 @@ export class DatasetNotPublishedError extends Error {
  */
 export class TargetNotPresentError extends Error {
   readonly datasetId: string;
+  /**
+   * Why nothing could contain the target, in a phrase an answer can quote.
+   *
+   * Kept as its own field rather than left inside `message`: "there is no data here" and "why
+   * there is no data here" are different statements, and the second is the one a user needs.
+   * A whole chromosome missing from the inventory is not the same situation as a chromosome
+   * that is present but stops short of the position, and neither is a checked negative.
+   */
+  readonly detail: string;
 
   constructor(datasetId: string, detail: string) {
     super(`dataset '${datasetId}' declares no Parquet object that can contain ${detail}`);
     this.name = 'TargetNotPresent';
     this.datasetId = datasetId;
+    this.detail = detail;
   }
 }
 
@@ -149,6 +159,13 @@ export interface ParquetDatasetResolver {
   verifyCandidates(
     dataset: Pick<ResolvedParquetDataset, 'datasetId' | 'parquetObjects'>,
     candidates: readonly ParquetObject[],
+    /**
+     * What to say when `candidates` is empty. The caller selected them and is the only party
+     * that still knows which coordinates it was looking for; this resolver sees an empty array
+     * and nothing else. Optional, so the guard keeps working for callers that have no better
+     * phrase than the generic one.
+     */
+    absenceDetail?: string,
   ): Promise<readonly string[]>;
 }
 
@@ -285,9 +302,12 @@ export function createParquetDatasetResolver(
       };
     },
 
-    async verifyCandidates(dataset, candidates): Promise<readonly string[]> {
+    async verifyCandidates(dataset, candidates, absenceDetail): Promise<readonly string[]> {
       if (candidates.length === 0) {
-        throw new TargetNotPresentError(dataset.datasetId, 'the requested coordinates');
+        throw new TargetNotPresentError(
+          dataset.datasetId,
+          absenceDetail ?? 'the requested coordinates',
+        );
       }
 
       const byKey = new Map(dataset.parquetObjects.map((object) => [object.key, object]));

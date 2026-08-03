@@ -195,7 +195,7 @@ describe('serving-path invariants (source sweep)', () => {
 
   it('falls back to no fixture at run time', () => {
     // `reference-bootstrap.ts` names the committed coordinate TSV, which is reference data and
-    // the declared source of `demo-clinvar-grch38-v2` — not a stand-in for absent user data.
+    // the declared source of `demo-clinvar-grch38-v3` — not a stand-in for absent user data.
     const bad = offenders(
       ALL_TS,
       (source, file) =>

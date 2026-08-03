@@ -31,7 +31,6 @@ export const ERROR_STATUS: Readonly<Record<string, ContentfulStatusCode>> = Obje
   DatasetPublicationConflict: 409,
 
   TargetNotResolvable: 422,
-  TargetResolutionLimitExceeded: 422,
   TargetNotPresent: 404,
 
   RemoteDatasetUnavailable: 503,

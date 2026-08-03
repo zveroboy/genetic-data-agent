@@ -6,7 +6,7 @@
   "schemaFingerprint": "89e4e0a61728e9776376f7550d09426acba14bd486c68a918e66fb11d437d7de",
   "artifactVersion": "iv-test-001",
   "referenceBuild": "GRCh38",
-  "referenceVersion": "demo-clinvar-grch38-v2",
+  "referenceVersion": "demo-clinvar-grch38-v3",
   "attemptPrefix": "datasets/ds-test-001/versions/iv-test-001/attempt-1/",
   "datasetChecksumSha256": "524e46eeee672654250c94b3f316937fbc6311fe41829f431b9897fea8d0e923",
   "variantCount": 1500,

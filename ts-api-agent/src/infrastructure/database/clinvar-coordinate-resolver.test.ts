@@ -22,11 +22,11 @@ import {
   MAX_TARGETS_PER_QUERY,
   ReferenceBuildMismatchError,
   TargetNotResolvableError,
-  TargetResolutionLimitExceededError,
   type ClinVarCoordinateResolver,
   normalizeChromosome,
   openClinVarCoordinateResolver,
 } from './clinvar-coordinate-resolver.ts';
+import { FEATURED_TARGETS } from './clinvar-source-records.ts';
 import { ReferenceSnapshotError, buildReferenceDatabase } from './reference-bootstrap.ts';
 
 const FIXTURE_TSV = fileURLToPath(
@@ -62,8 +62,10 @@ describe('clinvar coordinate resolver', () => {
   });
 
   it('resolves a gene symbol to exact GRCh38 coordinates', async () => {
-    const targets = await resolver.resolve('CYP1A2', 'GRCh38');
+    const { targets, coordinatesListed } = await resolver.resolve('CYP1A2', 'GRCh38');
 
+    // One coordinate listed, one read: nothing was capped, so nothing about a cap is reported.
+    assert.equal(coordinatesListed, 1);
     // Every field below is ClinVar's, not a curator's: VariationID 511079,
     // NC_000015.10:g.74749576C>A, classified Likely benign with no condition named. The
     // hand-written table this replaced had the alleles the other way round, which the strict
@@ -124,8 +126,8 @@ describe('clinvar coordinate resolver', () => {
   });
 
   it('resolves an rsID to the same coordinates, keeping the rsID as provenance', async () => {
-    const [byRsid] = await resolver.resolve('rs4149056', 'GRCh38');
-    const [byGene] = await resolver.resolve('SLCO1B1', 'GRCh38');
+    const [byRsid] = (await resolver.resolve('rs4149056', 'GRCh38')).targets;
+    const [byGene] = (await resolver.resolve('SLCO1B1', 'GRCh38')).targets;
 
     assert.ok(byRsid !== undefined && byGene !== undefined);
     assert.equal(byRsid.chrom, '12');
@@ -148,7 +150,7 @@ describe('clinvar coordinate resolver', () => {
       'the fixture must actually store the chr-prefixed form this test normalizes away',
     );
 
-    const [target] = await resolver.resolve('rs4149056', 'GRCh38');
+    const [target] = (await resolver.resolve('rs4149056', 'GRCh38')).targets;
 
     assert.equal(target?.chrom, '12', 'chr12 must resolve to the 12 partition value');
   });
@@ -166,15 +168,35 @@ describe('clinvar coordinate resolver', () => {
     assert.equal(normalizeChromosome(''), null);
   });
 
-  it('resolves a multi-variant gene to every declared target, in coordinate order', async () => {
-    const targets = await resolver.resolve('APOE', 'GRCh38');
+  it('resolves a multi-variant gene to every declared target, featured markers first', async () => {
+    const { targets } = await resolver.resolve('APOE', 'GRCh38');
 
+    // *Every* APOE coordinate the machine-selected table carries, not only the two featured
+    // markers. Pinning the exact list here would make this test a second copy of the ClinVar
+    // release; pinning the ordering and the two markers the demo advertises is what the resolver
+    // actually promises.
+    assert.ok(targets.length >= 2, `APOE resolved to ${targets.length} coordinate(s)`);
+    for (const target of targets) assert.equal(target.chrom, '19');
+
+    const rsids = targets.map((target) => target.rsid);
+    assert.ok(rsids.includes('rs429358'), 'the APOE ε4 marker must resolve');
+    assert.ok(rsids.includes('rs7412'), 'the APOE ε2 marker must resolve');
+    // Both featured markers ahead of every coordinate nobody curated, whatever the positions are:
+    // rs405509 sits 3 kb *earlier* on chr19 than either of them, and under the position ordering
+    // this replaces it was the coordinate an APOE answer led with.
+    const featured = new Set(FEATURED_TARGETS.map((target) => target.rsid));
+    const firstUnfeatured = targets.findIndex((target) => !featured.has(target.rsid ?? ''));
+    assert.equal(firstUnfeatured, 2, 'both APOE markers are featured, so they take the first two slots');
+    assert.ok(
+      targets.slice(firstUnfeatured).every((target) => !featured.has(target.rsid ?? '')),
+      'no featured marker may sit behind an uncurated coordinate',
+    );
+
+    // Within one tier, ascending position — the tie-break that makes a run reproducible.
+    const unfeaturedPositions = targets.slice(firstUnfeatured).map((target) => target.pos);
     assert.deepEqual(
-      targets.map((target) => [target.chrom, target.pos, target.rsid]),
-      [
-        ['19', 44908684, 'rs429358'],
-        ['19', 44908822, 'rs7412'],
-      ],
+      [...unfeaturedPositions].sort((left, right) => left - right),
+      unfeaturedPositions,
     );
   });
 
@@ -182,7 +204,7 @@ describe('clinvar coordinate resolver', () => {
     const upper = await resolver.resolve('RS762551', 'GRCh38');
     const lower = await resolver.resolve('cyp1a2', 'GRCh38');
 
-    assert.equal(upper[0]?.rsid, 'rs762551');
+    assert.equal(upper.targets[0]?.rsid, 'rs762551');
     assert.deepEqual(lower, upper);
   });
 
@@ -216,7 +238,7 @@ describe('clinvar coordinate resolver', () => {
     // The only two outcomes are "at least one coordinate" and "throw". A resolver that could
     // return `[]` would let a downstream candidate-selection step degrade into a full scan.
     const resolved = await resolver.resolve('CYP1A2', 'GRCh38');
-    assert.ok(resolved.length > 0);
+    assert.ok(resolved.targets.length > 0);
 
     await assert.rejects(() => resolver.resolve('NOT_A_GENE', 'GRCh38'), TargetNotResolvableError);
   });
@@ -224,18 +246,73 @@ describe('clinvar coordinate resolver', () => {
   it('rejects an empty target id without querying the snapshot', async () => {
     await assert.rejects(() => resolver.resolve('   ', 'GRCh38'), TargetNotResolvableError);
   });
+
+  it('ranks a featured coordinate ahead of a pathogenic one, and answers a capped gene', async () => {
+    // TP53 is the case the two ranking tiers disagree on, in real ClinVar data. rs1042522 is the
+    // featured marker and is classified *Benign*; the other 71 TP53 rows are Pathogenic or Likely
+    // pathogenic, so on significance alone the featured marker ranks 72nd — outside the cap
+    // entirely, which would make "my TP53 status" unanswerable about the one TP53 variant this
+    // system carries lay terms and a literature corpus for.
+    const { targets, coordinatesListed } = await resolver.resolve('TP53', 'GRCh38');
+
+    assert.equal(coordinatesListed, 72, 'the count is the snapshot\'s, not the capped list\'s');
+    assert.equal(targets.length, MAX_TARGETS_PER_QUERY, 'a gene over the cap answers from the cap');
+    assert.equal(targets[0]?.rsid, 'rs1042522');
+    assert.equal(targets[0]?.clinicalSignificance, 'Benign');
+    assert.equal(targets[1]?.clinicalSignificance, 'Likely pathogenic');
+    // …and the rest of the ranking is significance before position: every pathogenic row precedes
+    // every row that is neither pathogenic nor a drug response.
+    const tiers = targets
+      .slice(1)
+      .map((target) => (/^(Likely p|P)athogenic/.test(target.clinicalSignificance) ? 0 : 1));
+    assert.deepEqual([...tiers].sort(), tiers, `TP53 tiers out of order: ${tiers.join('')}`);
+  });
+
+  it('puts the variant a question is actually about at the head of its gene', async () => {
+    // The two questions the position ordering got wrong, both confirmed against a live answer:
+    // VKORC1 led with rs2359612 and buried rs9923231 — the warfarin dosing variant — fourth, and
+    // CYP2C19 led with rs12777823, whose ClinVar condition is *warfarin* dosage, ahead of
+    // CYP2C19*2 rs4244285, which is what a clopidogrel question means.
+    const warfarin = await resolver.resolve('VKORC1', 'GRCh38');
+    assert.equal(warfarin.targets[0]?.rsid, 'rs9923231');
+    assert.equal(warfarin.coordinatesListed, warfarin.targets.length, 'VKORC1 is under the cap');
+
+    const clopidogrel = await resolver.resolve('CYP2C19', 'GRCh38');
+    assert.equal(clopidogrel.targets[0]?.rsid, 'rs4244285');
+  });
+
+  it('is deterministic: the same target yields the same order every time', async () => {
+    // Determinism is what makes an answer reproducible across runs and machines, and it is not
+    // free: one position can carry two rows (rs4244285 is listed G>A and G>T at 94,781,859), so
+    // an `ORDER BY` stopping at `pos` leaves ties for the engine to break as it pleases.
+    for (const targetId of ['CYP2C19', 'TP53', 'VKORC1', 'BRCA1']) {
+      const first = await resolver.resolve(targetId, 'GRCh38');
+      const second = await resolver.resolve(targetId, 'GRCh38');
+      assert.deepEqual(second, first, `${targetId} resolved differently on a second call`);
+    }
+
+    const cyp2c19 = (await resolver.resolve('CYP2C19', 'GRCh38')).targets;
+    const rs4244285 = cyp2c19.filter((target) => target.rsid === 'rs4244285');
+    assert.equal(rs4244285.length, 2, 'the two-row position this test exists for must be present');
+    assert.deepEqual(
+      rs4244285.map((target) => `${target.ref}>${target.alt}`),
+      ['G>T', 'G>A'],
+      'both are featured and share a position, so the significance tier orders them: ' +
+        'drug response before "Likely benign / other"',
+    );
+  });
 });
 
-describe('target resolution limit', () => {
+describe('the coordinate cap is a bound, not a refusal', () => {
   let workDir: string;
   let resolver: ClinVarCoordinateResolver;
 
   before(async () => {
-    workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clinvar-limit-'));
+    workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clinvar-cap-'));
 
-    // A synthetic gene with one more declared coordinate than `MAX_TARGETS_PER_QUERY` allows,
-    // so the truncation-vs-signal behaviour can be pinned without depending on the demo
-    // snapshot ever containing a gene this large.
+    // Two synthetic genes: one over the cap, one exactly at it. Synthetic rather than borrowed
+    // from the demo snapshot so the boundary stays pinned whatever the next ClinVar release does
+    // to BRCA2's row count.
     const header = [
       'reference_version',
       'reference_build',
@@ -262,20 +339,19 @@ describe('target resolution limit', () => {
           gene,
           'Synthetic phenotype',
           'Uncertain Significance',
-          'Synthetic row for the target-resolution-limit test.',
+          'Synthetic row for the coordinate-cap test.',
         ].join('\t'),
       );
-    // One gene one row over the cap (must signal), one gene at exactly the cap (must not).
     const rows = [
       ...geneRows('MANYVAR', MAX_TARGETS_PER_QUERY + 1, 'chr1'),
       ...geneRows('EXACTLIMIT', MAX_TARGETS_PER_QUERY, 'chr2'),
     ];
-    const tsvPath = path.join(workDir, 'overflow_coordinates.tsv');
+    const tsvPath = path.join(workDir, 'capped_coordinates.tsv');
     fs.writeFileSync(tsvPath, [header, ...rows].join('\n') + '\n');
 
     const snapshot = await buildReferenceDatabase({
       tsvPath,
-      databasePath: path.join(workDir, 'overflow.duckdb'),
+      databasePath: path.join(workDir, 'capped.duckdb'),
       referenceVersion: REFERENCE_VERSION,
       referenceBuild: REFERENCE_BUILD,
     });
@@ -288,36 +364,43 @@ describe('target resolution limit', () => {
     if (workDir) fs.rmSync(workDir, { recursive: true, force: true });
   });
 
-  it('signals overflow instead of silently truncating to the limit', async () => {
-    const error = await resolver.resolve('MANYVAR', 'GRCh38').then(
-      () => null,
-      (thrown: unknown) => thrown as Error,
-    );
+  it('answers a gene over the cap from the ranked cap, reporting how many exist', async () => {
+    const { targets, coordinatesListed } = await resolver.resolve('MANYVAR', 'GRCh38');
 
-    assert.ok(error instanceof TargetResolutionLimitExceededError, `unexpected error: ${error}`);
-    assert.equal(error.name, 'TargetResolutionLimitExceeded');
-    assert.equal(error.targetId, 'MANYVAR');
-    assert.equal(error.limit, MAX_TARGETS_PER_QUERY);
-    assert.equal(error.referenceVersion, REFERENCE_VERSION);
+    // The regression this replaces: this call used to throw `TargetResolutionLimitExceeded`, which
+    // the HTTP layer mapped to a 422 — so "What about the BRCA1 gene?" was an error rather than an
+    // answer. The subset is still bounded; what changed is that it is reported instead of refused.
+    assert.equal(targets.length, MAX_TARGETS_PER_QUERY);
+    assert.equal(coordinatesListed, MAX_TARGETS_PER_QUERY + 1);
+    // Ranked, so which coordinates were dropped is a decision and not an accident: these rows all
+    // share a tier, so position orders them and the last one is the one left out.
+    assert.equal(targets[0]?.pos, 1_000_000);
+    assert.equal(targets.at(-1)?.pos, 1_000_000 + MAX_TARGETS_PER_QUERY - 1);
   });
 
-  it('still resolves a gene at exactly the limit, without signalling overflow', async () => {
-    const targets = await resolver.resolve('EXACTLIMIT', 'GRCh38');
-    assert.equal(targets.length, MAX_TARGETS_PER_QUERY, 'a gene at exactly the cap must answer in full');
+  it('reports a gene under the cap as fully read, so no answer claims a cap it did not hit', async () => {
+    const { targets, coordinatesListed } = await resolver.resolve('EXACTLIMIT', 'GRCh38');
+
+    assert.equal(targets.length, MAX_TARGETS_PER_QUERY);
+    assert.equal(
+      coordinatesListed,
+      MAX_TARGETS_PER_QUERY,
+      'a gene at exactly the cap has nothing left over, and must not be described as truncated',
+    );
   });
 });
 
-describe('target resolution limit is counted after normalisation', () => {
+describe('an unplaceable row is dropped, not guessed at', () => {
   let workDir: string;
   let resolver: ClinVarCoordinateResolver;
 
   before(async () => {
-    workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clinvar-limit-normalised-'));
+    workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clinvar-unplaceable-'));
 
-    // One raw row more than the cap, but one of those raw rows carries an unplaceable
-    // chromosome ('ZZ' does not normalize to anything). The overflow check must be counted
-    // after that row is dropped: this gene resolves to exactly MAX_TARGETS_PER_QUERY targets and
-    // must answer in full, not be rejected on the pre-filter raw row count.
+    // One raw row more than the cap, one of which carries an unplaceable chromosome ('ZZ'
+    // normalizes to nothing) and ranks first, so it lands inside the `LIMIT` window and is dropped
+    // afterwards. What must hold is that the count the answer speaks is the surviving one: a
+    // dropped row may cost a slot, but it may never be reported as a coordinate that was read.
     const header = [
       'reference_version',
       'reference_build',
@@ -343,11 +426,11 @@ describe('target resolution limit is counted after normalisation', () => {
         'ONEUNPLACEABLE',
         'Synthetic phenotype',
         'Uncertain Significance',
-        'Synthetic row for the post-normalisation overflow-count test.',
+        'Synthetic row for the unplaceable-row test.',
       ].join('\t');
     const rows = [
-      // The unplaceable row sorts first ('ZZ' precedes 'chr3' lexically), so it is guaranteed to
-      // be within the fetched LIMIT window regardless of fetch order.
+      // Lowest position, so the ranking's third tier puts the unplaceable row first and it is
+      // certain to be inside the fetched window.
       row('ZZ', 0),
       ...Array.from({ length: MAX_TARGETS_PER_QUERY }, (_unused, index) => row('chr3', index + 1)),
     ];
@@ -369,12 +452,18 @@ describe('target resolution limit is counted after normalisation', () => {
     if (workDir) fs.rmSync(workDir, { recursive: true, force: true });
   });
 
-  it('does not signal overflow when one raw row over the cap is unplaceable', async () => {
-    const targets = await resolver.resolve('ONEUNPLACEABLE', 'GRCh38');
+  it('never reports a dropped row as a coordinate that was read', async () => {
+    const { targets, coordinatesListed } = await resolver.resolve('ONEUNPLACEABLE', 'GRCh38');
+
     assert.equal(
       targets.length,
-      MAX_TARGETS_PER_QUERY,
-      'one unplaceable raw row must not count against the cap',
+      MAX_TARGETS_PER_QUERY - 1,
+      'the unplaceable row occupied a slot in the ranked window and was then dropped',
+    );
+    assert.equal(coordinatesListed, MAX_TARGETS_PER_QUERY + 1, 'the snapshot still lists them all');
+    assert.ok(
+      targets.every((target) => target.chrom === '3'),
+      'nothing unplaceable may survive into a target',
     );
   });
 });

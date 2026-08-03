@@ -1,7 +1,7 @@
 ##fileformat=VCFv4.1
 ##source=ClinVar
 ##reference=GRCh38
-##extract=every ClinVar record carrying one of the rsIDs in REFERENCE_TARGETS,
+##extract=every ClinVar record carrying one of the rsIDs in FEATURED_TARGETS,
 ##extract=copied verbatim from data/clinvar.vcf.gz by
 ##extract=scripts/generate_clinvar_reference_tsv.ts --extract.
 ##extract=Rejected candidates (reference-identity records, later duplicate accessions)

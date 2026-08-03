@@ -25,9 +25,9 @@ import { describe, it } from 'node:test';
 
 import { REFERENCE_BUILD, REFERENCE_VERSION } from '../../ts-api-agent/src/domain/datasets.ts';
 import {
-  REFERENCE_TARGETS,
-  collectSourceRecords,
-  deriveTable,
+  FEATURED_TARGETS,
+  collectCoordinateUniverse,
+  deriveCoordinateTable,
   readVcfLines,
   renderCoordinateTsv,
   renderSourceExtract,
@@ -64,27 +64,31 @@ const skip = available
   : `${CLINVAR_VCF} is absent — fetch it with: ${DOWNLOAD_HINT}`;
 
 describe('the committed ClinVar extract matches the authoritative ClinVar VCF', { skip }, () => {
-  it('re-derives the extract and the coordinate table from data/clinvar.vcf.gz', async () => {
-    const sourceRecords = await collectSourceRecords(readVcfLines(CLINVAR_VCF), REFERENCE_TARGETS);
+  it('re-derives the extract and the whole coordinate table from data/clinvar.vcf.gz', async () => {
+    // One pass, both halves — the same call the generator makes, so this suite checks the shipped
+    // ~14,000-row union and not just the featured rows the offline extract covers.
+    const universe = await collectCoordinateUniverse(readVcfLines(CLINVAR_VCF), FEATURED_TARGETS);
 
-    const missing = REFERENCE_TARGETS.filter((target) => !sourceRecords.has(target.rsid));
+    const missing = FEATURED_TARGETS.filter(
+      (target) => !universe.featuredRecords.has(target.rsid),
+    );
     assert.deepEqual(
       missing.map((target) => target.rsid),
       [],
-      'a declared target is no longer in ClinVar; drop it from REFERENCE_TARGETS rather than ' +
+      'a featured target is no longer in ClinVar; drop it from FEATURED_TARGETS rather than ' +
         'leaving a row nothing supports',
     );
 
     assert.equal(
-      renderSourceExtract(sourceRecords),
+      renderSourceExtract(universe.featuredRecords),
       fs.readFileSync(SOURCE_EXTRACT, 'utf8'),
       'tests/fixtures/clinvar_source_records.vcf no longer matches ClinVar; regenerate both ' +
         'fixtures with `node scripts/generate_clinvar_reference_tsv.ts` and bump REFERENCE_VERSION',
     );
 
-    const { rows, dropped } = deriveTable(
-      sourceRecords,
-      REFERENCE_TARGETS,
+    const { rows, dropped } = deriveCoordinateTable(
+      universe,
+      FEATURED_TARGETS,
       REFERENCE_VERSION,
       REFERENCE_BUILD,
     );
@@ -92,7 +96,9 @@ describe('the committed ClinVar extract matches the authoritative ClinVar VCF', 
     assert.equal(
       renderCoordinateTsv(rows),
       fs.readFileSync(COORDINATES_TSV, 'utf8'),
-      'the coordinate table does not match what ClinVar says today',
+      'the coordinate table does not match what ClinVar says today; regenerate it with ' +
+        '`node scripts/generate_clinvar_reference_tsv.ts` and bump REFERENCE_VERSION — the same ' +
+        'version string may never name two different tables',
     );
   });
 

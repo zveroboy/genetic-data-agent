@@ -168,6 +168,10 @@ services:
       QDRANT_HOST: http://qdrant:6333
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
       CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      # Ceiling on paid Cerebras calls per rolling hour, per API process. The key is the only
+      # thing in this stack that costs money, and one question spends up to four calls; past the
+      # ceiling the API keeps answering from the free deterministic path instead of failing.
+      CEREBRAS_CALLS_PER_WINDOW: ${CEREBRAS_CALLS_PER_WINDOW:-120}
     restart: unless-stopped
 
   ts-control-worker:

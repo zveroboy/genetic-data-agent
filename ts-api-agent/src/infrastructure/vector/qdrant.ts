@@ -98,7 +98,14 @@ export class QdrantRepository {
     console.log(`✔ Successfully upserted ${documents.length} points to Qdrant collection '${this.collectionName}'.`);
   }
 
-  async searchVector(queryVector: number[], topK: number = 3): Promise<any[]> {
+  /**
+   * Nearest `topK` points, optionally cut off at `minScore`.
+   *
+   * The cut is applied by Qdrant (`score_threshold`) rather than by the caller: a filter here
+   * would still return `topK` rows and let the caller forget to drop them, and the collection
+   * knows the metric it was built with.
+   */
+  async searchVector(queryVector: number[], topK: number = 3, minScore?: number): Promise<any[]> {
     if (!(await this.isQdrantAlive())) {
       throw new Error(`[QdrantRepository] Qdrant at ${this.qdrantUrl} is unreachable`);
     }
@@ -106,7 +113,12 @@ export class QdrantRepository {
     const res = await fetch(`${this.qdrantUrl}/collections/${this.collectionName}/points/search`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ vector: queryVector, limit: topK, with_payload: true }),
+      body: JSON.stringify({
+        vector: queryVector,
+        limit: topK,
+        with_payload: true,
+        ...(minScore === undefined ? {} : { score_threshold: minScore }),
+      }),
     });
 
     if (!res.ok) {

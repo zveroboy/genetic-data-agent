@@ -49,6 +49,7 @@ import {
   ReferenceBuildMismatchError,
   type ClinVarCoordinateResolver,
   type ReferenceVocabularyEntry,
+  type ResolvedTargets,
   TargetNotResolvableError,
   type VariantTarget,
 } from './infrastructure/database/clinvar-coordinate-resolver.ts';
@@ -205,7 +206,7 @@ class FakeSessionFactory implements DuckDbSessionFactory {
 function variantTarget(): VariantTarget {
   return {
     referenceBuild: 'GRCh38',
-    referenceVersion: 'demo-clinvar-grch38-v2',
+    referenceVersion: 'demo-clinvar-grch38-v3',
     chrom: '12',
     pos: 21_178_615,
     ref: 'T',
@@ -219,13 +220,13 @@ function variantTarget(): VariantTarget {
 }
 
 class FakeCoordinateResolver implements ClinVarCoordinateResolver {
-  readonly referenceVersion = 'demo-clinvar-grch38-v2';
+  readonly referenceVersion = 'demo-clinvar-grch38-v3';
   readonly referenceBuild = 'GRCh38';
   /** Every `vocabulary()` call, so a test can prove the route reads the snapshot's own surface. */
   vocabularyReads = 0;
 
-  async resolve(): Promise<readonly VariantTarget[]> {
-    return [variantTarget()];
+  async resolve(): Promise<ResolvedTargets> {
+    return { targets: [variantTarget()], coordinatesListed: 1 };
   }
 
   async vocabulary(): Promise<readonly ReferenceVocabularyEntry[]> {
@@ -771,17 +772,17 @@ describe('POST /ask', () => {
       new ReferenceSnapshotMismatchError(
         DATASET_ID,
         "it declares reference version 'demo-clinvar-grch38-v1' but the open snapshot is " +
-          "'demo-clinvar-grch38-v2'",
+          "'demo-clinvar-grch38-v3'",
       ),
       409,
     ],
     [new ReferenceBuildMismatchError('GRCh37', {
       path: '/tmp/snapshot.duckdb',
-      referenceVersion: 'demo-clinvar-grch38-v2',
+      referenceVersion: 'demo-clinvar-grch38-v3',
       referenceBuild: 'GRCh38',
       rowCount: 1,
     }), 409],
-    [new TargetNotResolvableError('NOT_A_GENE', 'demo-clinvar-grch38-v2'), 422],
+    [new TargetNotResolvableError('NOT_A_GENE', 'demo-clinvar-grch38-v3'), 422],
     [new TargetNotPresentError(DATASET_ID, 'the requested coordinates'), 404],
     [new RemoteDatasetUnavailableError(DATASET_ID, 'IO Error: connection reset'), 503],
     [new QueryBudgetExceededError(10_000), 504],

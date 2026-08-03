@@ -19,14 +19,19 @@ export const REFERENCE_BUILD = 'GRCh38';
 /**
  * Versioned ClinVar snapshot every seeded dataset resolves coordinates against.
  *
- * `v2` is the first snapshot derived from the authoritative ClinVar VCF rather than typed out by
- * hand (`scripts/generate_clinvar_reference_tsv.ts`). `v1` named a table whose alleles were
- * inverted for several variants and whose VKORC1 and TP53 rows carried GRCh37 positions, so the
- * two are genuinely different datasets and must not share a version string: a dataset ingested
- * against `v1` is rejected by `ReferenceSnapshotMismatch` at `/ask` until it is re-ingested,
- * which is the check doing its job.
+ * `v3` is the first machine-selected table: ~14,000 coordinates chosen from ClinVar by
+ * classification and review status (`clinvar-source-records.ts`), rather than the 14 rows the
+ * featured target list produces. `v2` was that 14-row table, and `v1` a hand-typed one whose
+ * alleles were inverted for several variants and whose VKORC1 and TP53 rows carried GRCh37
+ * positions.
+ *
+ * All three are genuinely different datasets and must not share a version string: a dataset
+ * ingested against an older one is rejected by `ReferenceSnapshotMismatch` at `/ask` until it is
+ * re-ingested, which is the check doing its job. Re-ingestion is the agreed cost of this bump —
+ * there is deliberately no compatibility shim, because a shim would mean one version string
+ * naming two tables and that is the failure the check exists to catch.
  */
-export const REFERENCE_VERSION = 'demo-clinvar-grch38-v2';
+export const REFERENCE_VERSION = 'demo-clinvar-grch38-v3';
 
 /** Immutable S3 identity of a seeded source object. Never derived from API input. */
 export interface DatasetSourceObject {

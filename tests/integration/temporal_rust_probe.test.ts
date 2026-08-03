@@ -361,7 +361,7 @@ function artifactInputFor(
       versionId: null,
       contentLength: source.contentLength,
     },
-    reference: { build: 'GRCh38', version: 'demo-clinvar-grch38-v2' },
+    reference: { build: 'GRCh38', version: 'demo-clinvar-grch38-v3' },
     target: {
       bucket: artifactBucket,
       artifactVersion: ARTIFACT_VERSION,

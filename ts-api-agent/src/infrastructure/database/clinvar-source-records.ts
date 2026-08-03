@@ -9,9 +9,29 @@
  * variant data found".
  *
  * Nothing in this module asserts where a variant is. It reads what ClinVar says, and the only
- * hand-authored input is the list of rsIDs the demo is interested in plus the gene symbol the
- * question router uses to reach each one. Coordinates, alleles, disease names and clinical
- * significance are all copied from the source record.
+ * hand-authored input is the list of rsIDs the demo *features* plus the gene symbol the question
+ * router uses to reach each one. Coordinates, alleles, disease names and clinical significance
+ * are all copied from the source record.
+ *
+ * ## Two concepts, deliberately not one list
+ *
+ * The table used to be exactly the featured list, and so one name covered both. It no longer
+ * does, and conflating them again is how either half breaks:
+ *
+ * - **The coordinate universe** (`isPathogenicExpertReviewed` / `isDrugResponse`, collected by
+ *   `collectCoordinateUniverse`) is what this system can *place*: every coordinate a question may
+ *   name by gene symbol or rsID and get a real genotype for. It is machine-selected from ClinVar
+ *   by classification and review status, so it is tens of thousands of rows and nobody curates it.
+ * - **The featured targets** (`FEATURED_TARGETS`) are what this system can answer *from a
+ *   symptom*: the handful of variants that carry hand-written lay vocabulary ("coffee", "milk",
+ *   "blood thinner") and drive the PubMed corpus. That layer is per-variant editorial work, it
+ *   cannot be derived from ClinVar's prose, and it does not scale — which is exactly why it is a
+ *   short list and not the table.
+ *
+ * The featured rows are also in the universe unconditionally, whatever ClinVar classifies them
+ * as: CYP1A2 rs762551 is `Likely_benign`, LCT rs4988235 is `association`, SLCO1B1 rs4149056 and
+ * CYP2C19 rs4244285 are `drug_response`, so any pathogenicity-based rule alone would delete most
+ * of what the demo can answer today.
  *
  * The module is deliberately dependency-free (node builtins only) so the same code can be used
  * by the generator script, by the unit test that re-derives the committed table from a committed
@@ -39,7 +59,7 @@ export const COORDINATE_TSV_COLUMNS = [
   'evidence_note',
 ] as const;
 
-/** One variant the demo wants to be able to answer about. */
+/** One variant the demo features: curated lay vocabulary, and a literature corpus of its own. */
 export interface ReferenceTarget {
   /** dbSNP identifier, `rs` + digits. ClinVar records the numeric part in INFO `RS=`. */
   readonly rsid: string;
@@ -78,14 +98,24 @@ export interface ReferenceTarget {
 }
 
 /**
- * The variants the demo advertises, as rsIDs — not as coordinates.
+ * The variants the demo *features*, as rsIDs — not as coordinates.
+ *
+ * These are not the variants the system can place; the coordinate table is (see the module
+ * comment). They are the variants a plain-language question can reach: each one carries lay
+ * vocabulary ClinVar's own prose cannot contain, and each one gets its own PubMed queries. Both
+ * of those are hand-written per variant, so this list grows one editorial decision at a time
+ * while the coordinate table grows with every ClinVar release.
+ *
+ * Every rsID here is also in the coordinate table unconditionally, whatever ClinVar classifies it
+ * as. Without that rule the machine selection would drop CYP1A2, LCT, SLCO1B1 and CYP2C19 — the
+ * four the demo is most often asked about — and the product would silently stop answering.
  *
  * rs2187668 (HLA-DQA1, celiac susceptibility) was in the hand-written table and is **not** in
  * ClinVar under any record, so it is not listed here: an rsID the source does not carry cannot
  * be derived from the source, and inventing a row is the exact failure this module exists to
  * prevent.
  */
-export const REFERENCE_TARGETS: readonly ReferenceTarget[] = Object.freeze([
+export const FEATURED_TARGETS: readonly ReferenceTarget[] = Object.freeze([
   {
     rsid: 'rs762551',
     gene: 'CYP1A2',
@@ -143,7 +173,7 @@ export const REFERENCE_TARGETS: readonly ReferenceTarget[] = Object.freeze([
  * which coordinates that gene has.
  */
 export function layTermsByGene(
-  targets: readonly ReferenceTarget[] = REFERENCE_TARGETS,
+  targets: readonly ReferenceTarget[] = FEATURED_TARGETS,
 ): ReadonlyMap<string, readonly string[]> {
   const byGene = new Map<string, string[]>();
   for (const target of targets) {
@@ -153,6 +183,21 @@ export function layTermsByGene(
     else for (const term of target.layTerms) if (!bucket.includes(term)) bucket.push(term);
   }
   return byGene;
+}
+
+/**
+ * The genes a plain-language question can reach, de-duplicated, in a stable order.
+ *
+ * Not "the genes this system knows": the coordinate table carries hundreds more, and every one of
+ * them answers when a question names it. These are the ones a *symptom* reaches, because these are
+ * the ones somebody wrote lay vocabulary and literature queries for.
+ */
+export function featuredGenes(
+  targets: readonly ReferenceTarget[] = FEATURED_TARGETS,
+): readonly string[] {
+  return [...new Set(targets.map((target) => target.gene))].sort((left, right) =>
+    left.localeCompare(right, 'en'),
+  );
 }
 
 /** One parsed ClinVar VCF record, with the verbatim line kept for the committed extract. */
@@ -253,7 +298,7 @@ export async function* readVcfLines(vcfPath: string): AsyncGenerator<string> {
  */
 export async function collectSourceRecords(
   lines: AsyncIterable<string>,
-  targets: readonly ReferenceTarget[] = REFERENCE_TARGETS,
+  targets: readonly ReferenceTarget[] = FEATURED_TARGETS,
 ): Promise<Map<string, ClinVarRecord[]>> {
   const wanted = new Set(targets.map((target) => target.rsid));
   const found = new Map<string, ClinVarRecord[]>();
@@ -295,6 +340,221 @@ export function selectCanonicalRecord(records: readonly ClinVarRecord[]): ClinVa
   return alterations.reduce((best, candidate) =>
     candidate.variationId < best.variationId ? candidate : best,
   );
+}
+
+/**
+ * The contigs a coordinate may sit on, in ClinVar's own unprefixed spelling.
+ *
+ * Declared here rather than imported from `parquet-dataset-resolver.ts` on purpose: that module
+ * reaches the object store and the manifest contracts, and this one is node-builtins-only so the
+ * generator script and the offline tests can use it. The two lists describe the same domain, and
+ * a divergence cannot produce a wrong answer — the serving path drops any snapshot row whose
+ * contig it cannot normalize (`normalizeChromosome`), so at worst a row is unreachable.
+ *
+ * ClinVar also publishes records on unplaced scaffolds (`NW_009646201.1`). A scaffold coordinate
+ * has no partition to prune to, so a row for one would be dead weight the resolver silently drops.
+ */
+const CANONICAL_CONTIGS: ReadonlySet<string> = new Set([
+  ...Array.from({ length: 22 }, (_unused, index) => String(index + 1)),
+  'X',
+  'Y',
+  'MT',
+]);
+
+/** Whether a record sits on a chromosome this system partitions by. */
+export function isCanonicalContig(chrom: string): boolean {
+  return CANONICAL_CONTIGS.has(chrom);
+}
+
+/**
+ * Whether a record describes an alteration, as opposed to an assertion about the reference.
+ *
+ * `.` is ClinVar's ALT for an identity record (`NC_000016.10:g.31096368=`), and an empty REF or
+ * ALT is a malformed line. Neither can ever match user Parquet on
+ * `(build, chrom, pos, ref, alt)`, so a row for one would resolve and then always answer "not
+ * present" — a target that looks answerable and is not.
+ */
+export function describesAlteration(record: ClinVarRecord): boolean {
+  return (
+    record.ref.length > 0 && record.alt.length > 0 && record.ref !== '.' && record.alt !== '.'
+  );
+}
+
+/** `CLNREVSTAT` values that mean a panel or a guideline reviewed the assertion, not one submitter. */
+const EXPERT_REVIEW_STATUSES: ReadonlySet<string> = new Set([
+  'reviewed_by_expert_panel',
+  'practice_guideline',
+]);
+
+/**
+ * Set 1 of the coordinate universe: pathogenic, and reviewed by somebody with a name.
+ *
+ * `Pathogenic` is matched **case-sensitively**, and that is not a style choice:
+ * `Conflicting_classifications_of_pathogenicity` contains a lower-case `pathogenicity`, and a
+ * case-insensitive test would pull every conflicting record into a table this system presents as
+ * pathogenic findings. `Likely_pathogenic` is listed separately for the same reason — its `p` is
+ * lower-case, so `includes('Pathogenic')` alone does not see it.
+ *
+ * The review-status gate is what keeps the table at ~12k rows rather than ~3M: a single-submitter
+ * assertion with no criteria is still ClinVar content, but it is not something this demo should
+ * place on a person's genome.
+ */
+export function isPathogenicExpertReviewed(record: ClinVarRecord): boolean {
+  const significance = record.info.CLNSIG ?? '';
+  const pathogenic =
+    significance.includes('Pathogenic') || significance.includes('Likely_pathogenic');
+  if (!pathogenic) return false;
+  return EXPERT_REVIEW_STATUSES.has(record.info.CLNREVSTAT ?? '');
+}
+
+/**
+ * Set 2 of the coordinate universe: every pharmacogenomic record, at any review level.
+ *
+ * This set is the demo's actual subject. `drug_response` records are mostly *not* pathogenic and
+ * mostly *not* expert-reviewed — SLCO1B1 rs4149056 and CYP2C19 rs4244285 are exactly this shape —
+ * so set 1 excludes almost all of them, and a table built from set 1 alone would answer clinical
+ * risk questions while having nothing to say about any drug.
+ *
+ * Matched per value, not as a substring: `CLNSIG` is `|`-separated, and a record classified
+ * `Likely_benign|drug_response|other` (CYP2D6 rs3892097) is a drug-response record.
+ */
+export function isDrugResponse(record: ClinVarRecord): boolean {
+  const significance = record.info.CLNSIG ?? '';
+  return significance.split('|').includes('drug_response');
+}
+
+/** What a full pass over ClinVar selected, and what it deliberately passed over. */
+export interface CoordinateUniverseStats {
+  readonly dataLines: number;
+  readonly withoutRsid: number;
+  readonly pathogenicExpertReviewed: number;
+  readonly drugResponse: number;
+  readonly inBothSets: number;
+  readonly skippedNonCanonicalContig: number;
+  readonly skippedEmptyAllele: number;
+  readonly skippedNoGeneSymbol: number;
+  readonly duplicateCoordinates: number;
+}
+
+/** The two halves of the table, plus the accounting that explains the row count. */
+export interface CoordinateUniverse {
+  /**
+   * Every record carrying a featured rsID, grouped and unfiltered — the committed extract's
+   * content, and the input `deriveTable` chooses the featured rows from.
+   */
+  readonly featuredRecords: ReadonlyMap<string, ClinVarRecord[]>;
+  /** One record per machine-selected coordinate, the lowest VariationID at each. */
+  readonly selectedRecords: readonly ClinVarRecord[];
+  readonly stats: CoordinateUniverseStats;
+}
+
+/** `(chrom, pos, ref, alt)` — the identity a coordinate row has, before it is labelled. */
+function coordinateKey(chrom: string, pos: number, ref: string, alt: string): string {
+  return `${chrom}\t${pos}\t${ref}\t${alt}`;
+}
+
+/**
+ * One streaming pass over ClinVar that collects both halves of the table.
+ *
+ * One pass, not two, because the source is a 193 MB gzip stream and reading it twice doubles a
+ * minute of I/O for nothing. The featured records are collected unfiltered (the extract has to
+ * keep the rejected candidates, or `selectCanonicalRecord` stops being testable offline) while the
+ * machine selection is reduced to one record per coordinate as it goes, so peak memory is the size
+ * of the table and not the size of ClinVar.
+ *
+ * Duplicate coordinates are resolved by lowest VariationID, the same rule
+ * `selectCanonicalRecord` applies to a contested rsID, so the two halves cannot disagree about
+ * which record describes a position.
+ */
+export async function collectCoordinateUniverse(
+  lines: AsyncIterable<string>,
+  targets: readonly ReferenceTarget[] = FEATURED_TARGETS,
+): Promise<CoordinateUniverse> {
+  const wanted = new Set(targets.map((target) => target.rsid));
+  const featuredRecords = new Map<string, ClinVarRecord[]>();
+  const selected = new Map<string, ClinVarRecord>();
+
+  let dataLines = 0;
+  let withoutRsid = 0;
+  let pathogenicExpertReviewed = 0;
+  let drugResponse = 0;
+  let inBothSets = 0;
+  let skippedNonCanonicalContig = 0;
+  let skippedEmptyAllele = 0;
+  let skippedNoGeneSymbol = 0;
+  let duplicateCoordinates = 0;
+
+  for await (const line of lines) {
+    if (line.length === 0 || line.charCodeAt(0) === 35 /* '#' */) continue;
+    dataLines += 1;
+    // Cheap pre-filter, and a real selection rule: all three sets require an `RS=`, because an
+    // rsID is the handle a question names and the provenance a row is read back with.
+    if (!line.includes('RS=')) {
+      withoutRsid += 1;
+      continue;
+    }
+    const record = parseClinVarLine(line);
+    if (record === null) continue;
+    const rsid = rsidOf(record);
+    if (rsid === null) {
+      withoutRsid += 1;
+      continue;
+    }
+
+    if (wanted.has(rsid)) {
+      const bucket = featuredRecords.get(rsid);
+      if (bucket === undefined) featuredRecords.set(rsid, [record]);
+      else bucket.push(record);
+    }
+
+    const pathogenic = isPathogenicExpertReviewed(record);
+    const drug = isDrugResponse(record);
+    if (!pathogenic && !drug) continue;
+
+    if (!isCanonicalContig(record.chrom)) {
+      skippedNonCanonicalContig += 1;
+      continue;
+    }
+    if (!describesAlteration(record)) {
+      skippedEmptyAllele += 1;
+      continue;
+    }
+    // A row with no `GENEINFO` has no gene cell that is not invented, and the vocabulary would
+    // advertise the empty symbol as answerable. Dropped rather than labelled with a guess.
+    if (geneInfoSymbol(record) === null) {
+      skippedNoGeneSymbol += 1;
+      continue;
+    }
+
+    if (pathogenic) pathogenicExpertReviewed += 1;
+    if (drug) drugResponse += 1;
+    if (pathogenic && drug) inBothSets += 1;
+
+    const key = coordinateKey(record.chrom, record.pos, record.ref, record.alt);
+    const existing = selected.get(key);
+    if (existing === undefined) {
+      selected.set(key, record);
+    } else {
+      duplicateCoordinates += 1;
+      if (record.variationId < existing.variationId) selected.set(key, record);
+    }
+  }
+
+  return {
+    featuredRecords,
+    selectedRecords: [...selected.values()],
+    stats: {
+      dataLines,
+      withoutRsid,
+      pathogenicExpertReviewed,
+      drugResponse,
+      inBothSets,
+      skippedNonCanonicalContig,
+      skippedEmptyAllele,
+      skippedNoGeneSymbol,
+      duplicateCoordinates,
+    },
+  };
 }
 
 /** ClinVar's placeholders for "a submitter gave no disease name". */
@@ -447,10 +707,10 @@ function compareRows(left: CoordinateRow, right: CoordinateRow): number {
   );
 }
 
-/** Turns collected source records into the table, dropping nothing silently. */
+/** Turns collected source records into the featured rows, dropping nothing silently. */
 export function deriveTable(
   sourceRecords: ReadonlyMap<string, ClinVarRecord[]>,
-  targets: readonly ReferenceTarget[] = REFERENCE_TARGETS,
+  targets: readonly ReferenceTarget[] = FEATURED_TARGETS,
   referenceVersion: string = REFERENCE_VERSION,
   referenceBuild: string = REFERENCE_BUILD,
 ): DerivedTable {
@@ -474,6 +734,69 @@ export function deriveTable(
   }
   rows.sort(compareRows);
   return { rows, dropped };
+}
+
+/** What a union derivation produced, on top of the featured rows it started from. */
+export interface DerivedCoordinateTable extends DerivedTable {
+  /** Rows contributed by the featured list. */
+  readonly featuredRowCount: number;
+  /** Rows contributed by the machine selection, after the featured rows won their coordinates. */
+  readonly selectedRowCount: number;
+  /** Machine-selected coordinates a featured row already described. */
+  readonly supersededByFeatured: number;
+}
+
+/**
+ * The whole coordinate table: the machine selection, plus the featured rows, deduplicated by
+ * `(build, chrom, pos, ref, alt)` with the featured row winning.
+ *
+ * The featured row has to win rather than merely be present. The two derivations disagree about
+ * two cells on purpose: rs4988235's gene is `LCT` here and `MCM6` in ClinVar's `GENEINFO` (the
+ * variant sits in an MCM6 intron and regulates LCT), and its evidence note says so. A machine row
+ * at the same coordinate would spell that gene `MCM6`, and the lactose question — which routes to
+ * `LCT` — would stop resolving. Same rule, same reason, for anything else a target declares about
+ * itself: `geneNote` and the queried symbol are editorial claims, and the featured list is where
+ * they are made.
+ *
+ * `dropped` still carries any featured target the source cannot place. A featured target that
+ * silently vanished into a 14,000-row table is the one failure this whole file exists to prevent.
+ */
+export function deriveCoordinateTable(
+  universe: CoordinateUniverse,
+  targets: readonly ReferenceTarget[] = FEATURED_TARGETS,
+  referenceVersion: string = REFERENCE_VERSION,
+  referenceBuild: string = REFERENCE_BUILD,
+): DerivedCoordinateTable {
+  const featured = deriveTable(universe.featuredRecords, targets, referenceVersion, referenceBuild);
+  const claimed = new Set(
+    featured.rows.map((row) => coordinateKey(row.chrom, row.pos, row.ref, row.alt)),
+  );
+
+  const rows: CoordinateRow[] = [...featured.rows];
+  let supersededByFeatured = 0;
+  for (const record of universe.selectedRecords) {
+    const gene = geneInfoSymbol(record);
+    const rsid = rsidOf(record);
+    // Both were required for selection; re-checked because this function is also called with
+    // hand-built records by the test that pins the union rule.
+    if (gene === null || rsid === null) continue;
+    const row = deriveCoordinateRow({ rsid, gene }, record, referenceVersion, referenceBuild);
+    if (claimed.has(coordinateKey(row.chrom, row.pos, row.ref, row.alt))) {
+      supersededByFeatured += 1;
+      continue;
+    }
+    claimed.add(coordinateKey(row.chrom, row.pos, row.ref, row.alt));
+    rows.push(row);
+  }
+
+  rows.sort(compareRows);
+  return {
+    rows,
+    dropped: featured.dropped,
+    featuredRowCount: featured.rows.length,
+    selectedRowCount: rows.length - featured.rows.length,
+    supersededByFeatured,
+  };
 }
 
 /** A TSV cell may not contain the delimiters that would silently re-shape the table. */
@@ -501,7 +824,7 @@ export const SOURCE_EXTRACT_HEADER: readonly string[] = Object.freeze([
   '##fileformat=VCFv4.1',
   '##source=ClinVar',
   '##reference=GRCh38',
-  '##extract=every ClinVar record carrying one of the rsIDs in REFERENCE_TARGETS,',
+  '##extract=every ClinVar record carrying one of the rsIDs in FEATURED_TARGETS,',
   '##extract=copied verbatim from data/clinvar.vcf.gz by',
   '##extract=scripts/generate_clinvar_reference_tsv.ts --extract.',
   '##extract=Rejected candidates (reference-identity records, later duplicate accessions)',
@@ -515,6 +838,11 @@ export const SOURCE_EXTRACT_HEADER: readonly string[] = Object.freeze([
  * Verbatim matters. The extract is only trustworthy as a stand-in for the 193 MB download if
  * re-deriving the table from it and from the full file give the same answer, and that is exactly
  * what `tests/integration/clinvar_reference_source.test.ts` checks.
+ *
+ * Scope: the *featured* half only. Committing the machine-selected half verbatim would mean
+ * committing several MB of ClinVar a second time, so the offline tests check that half by its
+ * rule (`clinvar-source-records.test.ts` pins the union against hand-built records) and by the
+ * shape of the committed table, rather than against a copy of the source.
  */
 export function renderSourceExtract(sourceRecords: ReadonlyMap<string, ClinVarRecord[]>): string {
   const all: ClinVarRecord[] = [];

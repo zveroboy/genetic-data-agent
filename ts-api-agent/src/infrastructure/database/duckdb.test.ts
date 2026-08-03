@@ -29,6 +29,7 @@ import {
 import {
   type ClinVarCoordinateResolver,
   type ReferenceVocabularyEntry,
+  type ResolvedTargets,
   TargetNotResolvableError,
   type VariantTarget,
 } from './clinvar-coordinate-resolver.ts';
@@ -50,6 +51,7 @@ import {
   ReferenceSnapshotMismatchError,
   RemoteDatasetUnavailableError,
   createGenotypeRepositoryFactory,
+  describeAbsence,
 } from './duckdb.ts';
 
 const ARTIFACT_BUCKET = 'genomic-artifacts';
@@ -163,6 +165,11 @@ class FakeSessionFactory implements DuckDbSessionFactory {
   openCount = 0;
   closeCount = 0;
   rows: Record<string, unknown>[] = [];
+  /**
+   * Rows per query rather than per session, when a test needs the two chromosome groups of one
+   * target to answer differently — which is the only way the merge across groups is observable.
+   */
+  rowsPerQuery: Record<string, unknown>[][] | null = null;
   failWith: Error | null = null;
 
   async open(): Promise<DuckDbSession> {
@@ -172,6 +179,9 @@ class FakeSessionFactory implements DuckDbSessionFactory {
       async query(sql, values = []) {
         owner.queries.push({ sql, values: [...values] });
         if (owner.failWith !== null) throw owner.failWith;
+        if (owner.rowsPerQuery !== null) {
+          return owner.rowsPerQuery[owner.queries.length - 1] ?? [];
+        }
         return owner.rows;
       },
       async readTraffic() {
@@ -187,7 +197,7 @@ class FakeSessionFactory implements DuckDbSessionFactory {
 function variantTarget(overrides: Partial<VariantTarget> = {}): VariantTarget {
   return {
     referenceBuild: 'GRCh38',
-    referenceVersion: 'demo-clinvar-grch38-v2',
+    referenceVersion: 'demo-clinvar-grch38-v3',
     chrom: '12',
     pos: 21_178_615,
     ref: 'T',
@@ -206,23 +216,27 @@ class FakeCoordinateResolver implements ClinVarCoordinateResolver {
   readonly referenceVersion: string;
   readonly referenceBuild: string;
   readonly #targets: readonly VariantTarget[];
+  readonly #coordinatesListed: number;
 
   constructor(
-    referenceVersion = 'demo-clinvar-grch38-v2',
+    referenceVersion = 'demo-clinvar-grch38-v3',
     referenceBuild = 'GRCh38',
     targets: readonly VariantTarget[] = [variantTarget()],
+    /** Defaults to "nothing was capped"; raise it to stand in for a gene over the cap. */
+    coordinatesListed = targets.length,
   ) {
     this.referenceVersion = referenceVersion;
     this.referenceBuild = referenceBuild;
     this.#targets = targets;
+    this.#coordinatesListed = coordinatesListed;
   }
 
-  async resolve(targetId: string, referenceBuild: string): Promise<readonly VariantTarget[]> {
+  async resolve(targetId: string, referenceBuild: string): Promise<ResolvedTargets> {
     this.calls.push({ targetId, referenceBuild });
     if (this.#targets.length === 0) {
       throw new TargetNotResolvableError(targetId, this.referenceVersion);
     }
-    return this.#targets;
+    return { targets: this.#targets, coordinatesListed: this.#coordinatesListed };
   }
 
   async vocabulary(): Promise<readonly ReferenceVocabularyEntry[]> {
@@ -265,7 +279,13 @@ function harness(options: {
   return { store, sessions, coordinates, factory };
 }
 
-/** One row as DuckDB returns it: the physical, snake_case column names. */
+/**
+ * One row as DuckDB returns it: the physical, snake_case column names.
+ *
+ * `target_rank` included, because the generated query selects it: it is the resolver's ranking
+ * carried through the scan so the answer's headline is the highest-ranked coordinate rather than
+ * the lowest-positioned one. It is not part of the wire payload.
+ */
 const PARQUET_ROW = {
   rsid: 'rs4149056',
   gene: 'SLCO1B1',
@@ -273,6 +293,7 @@ const PARQUET_ROW = {
   phenotype: 'Statins myopathy risk',
   clinical_significance: 'Risk Factor',
   evidence_note: 'Intermediate OATP1B1 function.',
+  target_rank: 0,
 };
 
 /** The same row as it leaves the repository: a camelCase wire payload. */
@@ -285,6 +306,37 @@ const SYNTHESIZED_VARIANT: SynthesizedVariant = {
   evidenceNote: 'Intermediate OATP1B1 function.',
 };
 
+describe('describeAbsence — why nothing could hold the target', () => {
+  it('distinguishes a chromosome the dataset never covered from one that stops short', () => {
+    // The distinction is the whole point. NA12878's published dataset has chr1–chr22 and no
+    // chrX, so "no G6PD variant" there is a fact about the callset's extent; reported the same
+    // way as a scanned-and-empty position, it reads as a clean bill of health for an X-linked
+    // gene that was never looked at.
+    const uncovered = describeAbsence({ parquetObjects: INVENTORY }, [
+      variantTarget({ chrom: 'X', pos: 154_536_002 }),
+    ]);
+    assert.match(uncovered, /chromosome X, which this dataset does not cover at all/);
+
+    const outOfRange = describeAbsence({ parquetObjects: INVENTORY }, [
+      variantTarget({ chrom: '12', pos: 90_000_000 }),
+    ]);
+    assert.match(outOfRange, /position range does not reach that coordinate/);
+    assert.doesNotMatch(outOfRange, /does not cover at all/);
+  });
+
+  it('names the covered chromosomes in genomic order, not string order', () => {
+    // `parquetObjects` carries partition values, which sort as strings: left alone the answer
+    // advertises coverage as "1, 10, 11, … 2, 20", which reads as a corrupted inventory.
+    const inventory = Array.from({ length: 22 }, (_, index) =>
+      parquetObject(String(index + 1), 0, 10_000, 250_000_000),
+    );
+
+    const detail = describeAbsence({ parquetObjects: inventory }, [variantTarget({ chrom: 'X' })]);
+
+    assert.match(detail, /it covers 1–22/);
+  });
+});
+
 describe('genotype repository', () => {
   it('refuses to open a dataset with no published manifest, opening no session', async () => {
     const { factory, sessions } = harness({ manifest: null });
@@ -295,9 +347,10 @@ describe('genotype repository', () => {
 
   it('refuses a reference snapshot that disagrees with the manifest', async () => {
     for (const mismatched of [
-      // A stale snapshot (the manifest names v2) and a wrong-build one. Both must be refused:
-      // v1 placed several variants at different coordinates than v2 does.
-      new FakeCoordinateResolver('demo-clinvar-grch38-v1', 'GRCh38'),
+      // A stale snapshot (the manifest names v3) and a wrong-build one. Both must be refused:
+      // v2 named a 14-row table and v3 names a ~14,000-row one, so a coordinate resolved against
+      // one is not a coordinate the other agrees on.
+      new FakeCoordinateResolver('demo-clinvar-grch38-v2', 'GRCh38'),
       new FakeCoordinateResolver('demo-clinvar-grch38-v3', 'GRCh37'),
     ]) {
       const { factory, sessions } = harness({ coordinates: mismatched });
@@ -349,7 +402,7 @@ describe('genotype repository', () => {
   });
 
   it('groups candidates per chromosome so each scan carries its own literal partition value', async () => {
-    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v2', 'GRCh38', [
+    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v3', 'GRCh38', [
       variantTarget(),
       variantTarget({ chrom: '15', pos: 74_749_576, ref: 'A', alt: 'C', rsid: 'rs762551', gene: 'CYP1A2' }),
     ]);
@@ -369,6 +422,74 @@ describe('genotype repository', () => {
     assert.equal(sessions.closeCount, 1);
   });
 
+  it('reads the coordinates in the resolver\'s ranked order, not in position order', async () => {
+    // The ranking is decided once, by the resolver, and every layer below has to preserve it: the
+    // answer's headline is the first row of this list. The SQL orders by the rank the candidate
+    // rows carry, so a coordinate ranked first is first even when it sits last on the chromosome.
+    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v3', 'GRCh38', [
+      variantTarget({ pos: 21_178_615, rsid: 'rs4149056' }),
+      variantTarget({ pos: 20_000_100, rsid: 'rs2306283' }),
+    ]);
+    const { factory, sessions } = harness({ coordinates, rows: [PARQUET_ROW] });
+    const repository = await factory.open(DATASET_ID);
+
+    await repository.synthesizeVariant('SLCO1B1');
+
+    const { sql, values } = sessions.queries[0]!;
+    assert.match(sql, /ORDER BY c\.target_rank/);
+    assert.ok(
+      !/ORDER BY c\.pos/.test(sql),
+      'position ordering is what made a gene\'s answer lead with its lowest coordinate',
+    );
+    // Rank 0 is the first target the resolver returned, whatever its position.
+    assert.deepEqual(
+      [values.indexOf(21_178_615) >= 0, values.includes(0), values.includes(1)],
+      [true, true, true],
+      `the rank must be bound alongside each candidate: ${values}`,
+    );
+  });
+
+  it('merges the chromosome groups back into one ranked list', async () => {
+    // A target whose coordinates span two partitions is two scans, appended in inventory order.
+    // Without the merge, the answer would lead with whichever chromosome was read first — here
+    // chr12, holding the coordinate the resolver ranked *second*.
+    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v3', 'GRCh38', [
+      variantTarget({ chrom: '15', pos: 74_749_576, ref: 'A', alt: 'C', rsid: 'rs762551', gene: 'CYP1A2' }),
+      variantTarget(),
+    ]);
+    const { factory, sessions } = harness({ coordinates });
+    sessions.rowsPerQuery = [
+      [{ ...PARQUET_ROW, target_rank: 1 }],
+      [{ ...PARQUET_ROW, rsid: 'rs762551', gene: 'CYP1A2', user_genotype: 'A/A', target_rank: 0 }],
+    ];
+    const repository = await factory.open(DATASET_ID);
+
+    const result = await repository.synthesizeVariant('multi');
+
+    assert.equal(sessions.queries.length, 2, 'chr12 is scanned first, holding the second-ranked row');
+    assert.deepEqual(
+      result.variants.map((variant) => variant.rsid),
+      ['rs762551', 'rs4149056'],
+    );
+  });
+
+  it('reports how many coordinates the reference listed and how many were read', async () => {
+    // The pair the answer speaks: without `listed`, a subset of BRCA1 is indistinguishable from
+    // all of it, which is the silent truncation the removed refusal used to prevent by refusing.
+    const coordinates = new FakeCoordinateResolver(
+      'demo-clinvar-grch38-v3',
+      'GRCh38',
+      [variantTarget()],
+      2271,
+    );
+    const { factory } = harness({ coordinates, rows: [PARQUET_ROW] });
+    const repository = await factory.open(DATASET_ID);
+
+    const result = await repository.synthesizeVariant('BRCA1');
+
+    assert.deepEqual(result.coordinateCoverage, { listed: 2271, read: 1 });
+  });
+
   it('returns provenance naming the dataset content, reference snapshot and files scanned', async () => {
     const { factory } = harness({ rows: [PARQUET_ROW] });
     const repository = await factory.open(DATASET_ID);
@@ -382,7 +503,7 @@ describe('genotype repository', () => {
       datasetId: DATASET_ID,
       datasetChecksumSha256: computeDatasetChecksumSha256(ATTEMPT_PREFIX, INVENTORY),
       referenceBuild: 'GRCh38',
-      referenceVersion: 'demo-clinvar-grch38-v2',
+      referenceVersion: 'demo-clinvar-grch38-v3',
       filesScanned: [`s3://${ARTIFACT_BUCKET}/${CHROM_12.key}`],
       targetsResolved: 1,
     });
@@ -390,7 +511,7 @@ describe('genotype repository', () => {
   });
 
   it('propagates an unresolvable target without opening a session or heading an object', async () => {
-    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v2', 'GRCh38', []);
+    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v3', 'GRCh38', []);
     const { factory, sessions, store } = harness({ coordinates });
     const repository = await factory.open(DATASET_ID);
     store.requests.length = 0;
@@ -406,7 +527,7 @@ describe('genotype repository', () => {
   });
 
   it('reports a target outside every declared position range as TargetNotPresent', async () => {
-    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v2', 'GRCh38', [
+    const coordinates = new FakeCoordinateResolver('demo-clinvar-grch38-v3', 'GRCh38', [
       variantTarget({ pos: 1 }),
     ]);
     const { factory, sessions } = harness({ coordinates });

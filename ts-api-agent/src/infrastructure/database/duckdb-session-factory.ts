@@ -291,6 +291,21 @@ export async function configureSession(
     SET enable_http_metadata_cache = true;
   `);
 
+  // `httpfs` seeds its `http_proxy` setting from the ambient environment variable of the same
+  // name, and it expects a bare `host:port`. A developer machine or CI runner that exports the
+  // ordinary `http://user:password@host:port` form therefore does not merely route S3 through a
+  // proxy — every `read_parquet('s3://…')` in the process fails to parse it before any request
+  // is made, and the API answers "Invalid Input Error" to a question about a genome. Observed
+  // exactly that way. The endpoint this session talks to is configured explicitly in the secret
+  // below, so the setting is pinned empty rather than inherited: reaching the object store is
+  // this deployment's decision, not an environment variable's. A deployment that genuinely needs
+  // a proxy configures it here, in the `host:port` form httpfs accepts.
+  await connection.run(`
+    SET http_proxy = '';
+    SET http_proxy_username = '';
+    SET http_proxy_password = '';
+  `);
+
   // Engine-sourced request accounting. All four statements are load bearing on DuckDB 1.5.5:
   //
   // - `logging_mode = 'ENABLE_SELECTED'` must be set *explicitly*. Setting `enabled_log_types`

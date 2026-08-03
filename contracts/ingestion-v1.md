@@ -155,7 +155,7 @@ Activity `buildDatasetArtifact` on task queue `genomic-ingestion-rust`. Golden p
 | `source.versionId`     | string \| null  | `null` when the bucket is unversioned.            |
 | `source.contentLength` | number          | Bytes.                                            |
 | `reference.build`      | string          | `"GRCh38"` for both seeded datasets.              |
-| `reference.version`    | string          | `"demo-clinvar-grch38-v2"`.                       |
+| `reference.version`    | string          | `"demo-clinvar-grch38-v3"`.                       |
 | `target.bucket`        | string          | Artifact bucket.                                  |
 | `target.artifactVersion` | string        | Single safe path segment.                         |
 | `target.allowedPrefix` | string          | Ends with `/`; the only writable prefix.          |

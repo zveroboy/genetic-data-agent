@@ -225,7 +225,7 @@ describe('parquet dataset resolver', () => {
     assert.equal(dataset.datasetId, DATASET_ID);
     assert.equal(dataset.bucket, ARTIFACT_BUCKET);
     assert.equal(dataset.referenceBuild, 'GRCh38');
-    assert.equal(dataset.referenceVersion, 'demo-clinvar-grch38-v2');
+    assert.equal(dataset.referenceVersion, 'demo-clinvar-grch38-v3');
     assert.equal(
       dataset.datasetChecksumSha256,
       computeDatasetChecksumSha256(ATTEMPT_PREFIX, INVENTORY),

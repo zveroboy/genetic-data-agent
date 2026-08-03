@@ -187,7 +187,7 @@ describe what the engine actually put on the wire:
 
 ```
 [serving-metrics] {"datasetId":"demo-small-…","datasetChecksumSha256":"…",
-  "referenceVersion":"demo-clinvar-grch38-v2","selectedFileCount":1,"inventorySize":4,
+  "referenceVersion":"demo-clinvar-grch38-v3","selectedFileCount":1,"inventorySize":4,
   "s3RequestCount":6,"bytesRead":384647,"queryLatencyMs":29}
 ```
 
@@ -201,7 +201,7 @@ somebody's clinical profile.
 | 400 | `UnknownDatasetKey`, `MissingDatasetId`, `MissingQuestion`, `MalformedRequestBody`, `UnrecognizedRequestField`, `DatasetResolutionFailed` (`DATASET_ID_UNSAFE`) | the request named something the API does not accept — including a dataset id that is not a single safe path segment, which never named a dataset in the first place |
 | 404 | `IngestionRunNotFound`, `TargetNotPresent` | no such run; or the dataset provably does not contain the target |
 | 409 | `DatasetNotPublished`, `ObjectVerificationFailed`, `ReferenceSnapshotMismatch`, `ReferenceBuildMismatch`, `DatasetPublicationConflict`, `DatasetResolutionFailed` (any other code) | the dataset exists as an id but cannot be served as published |
-| 422 | `TargetNotResolvable`, `TargetResolutionLimitExceeded` | the reference snapshot cannot place the gene or rsID, or resolves it to more coordinates than one query may return |
+| 422 | `TargetNotResolvable` | the reference snapshot cannot place the gene or rsID. A gene it places with more coordinates than one query may read is *not* an error: the highest-ranked 64 are read and the answer says how many were listed |
 | 503 | `IngestionServiceUnavailable`, `RemoteDatasetUnavailable`, `ReferenceSnapshotUnavailable`, `HttpfsExtensionUnavailable` | an upstream gave out; retryable |
 | 504 | `QueryBudgetExceeded`, `SessionConfigurationTimedOut` | the query deadline fired |
 

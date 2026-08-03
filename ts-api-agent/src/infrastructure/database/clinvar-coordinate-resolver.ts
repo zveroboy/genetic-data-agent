@@ -14,6 +14,11 @@
  * merged, retired and re-pointed between dbSNP releases, so joining user data on rsID alone
  * would silently mix builds.
  *
+ * A gene symbol is not one coordinate either. `demo-clinvar-grch38-v3` places 2,714 coordinates
+ * under BRCA2 and 72 under TP53, so "which coordinates" is a ranking question, and the ranking
+ * — not the storage order, and not position order — is what decides both which ones fit under
+ * `MAX_TARGETS_PER_QUERY` and which one an answer leads with. See `TARGET_RANKING_SQL`.
+ *
  * Out of scope, deliberately: liftover between builds and full indel left-normalization. A
  * build the snapshot does not describe is a `ReferenceBuildMismatch`, never a best-effort
  * translation.
@@ -28,9 +33,77 @@ import {
   openReferenceSnapshot,
 } from './reference-bootstrap.ts';
 import { CANONICAL_CHROMOSOMES } from './parquet-dataset-resolver.ts';
+import { FEATURED_TARGETS } from './clinvar-source-records.ts';
 
-/** Upper bound on the coordinates one target may expand to; a gene, not a chromosome. */
+/**
+ * Upper bound on the coordinates one target may expand to; a gene, not a chromosome.
+ *
+ * A bound, not a refusal. It used to be both: a gene resolving past it threw
+ * `TargetResolutionLimitExceeded` rather than answer from a subset, which was right while the
+ * table held 14 hand-picked rows and no gene could reach it. Against the 13,853-row machine
+ * selection it refused 35 of 238 genes outright — "What about the BRCA1 gene?" became an HTTP 422
+ * where it had returned an honest "the reference places it, the dataset reports no matching call".
+ * A question that used to work and now errors is a regression, so the bound stayed and the
+ * refusal went: the highest-ranked `MAX_TARGETS_PER_QUERY` are read and the answer says how many
+ * were left, which is the same thing this codebase already does with the five-target routing cap.
+ */
 export const MAX_TARGETS_PER_QUERY = 64;
+
+/**
+ * The rsIDs the demo features, lower-cased, as the ranking's first tier.
+ *
+ * Derived from `FEATURED_TARGETS` rather than from a column, because being featured is an
+ * editorial property of this product and not a property of any ClinVar release — and because
+ * adding a column would rename the table's content, which forces a reference-version bump and a
+ * re-ingestion of every published dataset to answer a question about ordering.
+ */
+const FEATURED_RSIDS: readonly string[] = Object.freeze([
+  ...new Set(FEATURED_TARGETS.map((target) => target.rsid.toLowerCase())),
+]);
+
+/**
+ * How the coordinates of one target are ranked, as a SQL fragment.
+ *
+ * In SQL and not in TypeScript because the cap is applied by `LIMIT`: ranking after the fetch
+ * would rank the 64 rows with the lowest positions against each other, and BRCA1's featured
+ * marker sits at 43,057,062 — 11 kb past the 64th-lowest row. The tier that decides which
+ * coordinates are even readable has to be visible to the same `ORDER BY` the `LIMIT` applies to.
+ *
+ * The three tiers, in order, each answering a different question:
+ *
+ * 1. **Featured first** (`FEATURED_RSIDS`). This is what the featured concept is *for*: the
+ *    variant the product carries lay terms and a literature corpus for is the variant the
+ *    question was about. It is what puts VKORC1 rs9923231 — the warfarin dosing variant — at the
+ *    head of a warfarin answer instead of rs2359612, which merely sits 4 kb earlier on chr16, and
+ *    CYP2C19*2 rs4244285 at the head of a clopidogrel answer instead of rs12777823, whose ClinVar
+ *    condition is *warfarin* dosage. It also survives the cap: TP53's rs1042522 is classified
+ *    Benign and would rank behind all 71 pathogenic TP53 rows on significance alone.
+ * 2. **Then clinical significance**: pathogenic and likely pathogenic, then drug response, then
+ *    everything else. For a gene nobody curated — 225 of the 238 — this is the only signal the
+ *    table carries about which coordinate a reader would want first.
+ * 3. **Then position ascending**, so the answer is the same on every run and every machine.
+ *    `chrom`, `ref` and `alt` follow it to make the order total: one position carries two rows
+ *    for rs4244285 (G>A and G>T), and an `ORDER BY` with ties in it is not deterministic.
+ *
+ * The significance tiers match whole `/`-separated components, never a substring: ClinVar spells
+ * "Conflicting classifications of pathogenicity", which contains "pathogenic" and is emphatically
+ * not a pathogenic classification, and a `LIKE '%pathogenic%'` test would rank 5 such rows ahead
+ * of every real drug-response variant in the table.
+ */
+const TARGET_RANKING_SQL = (featuredPlaceholders: string): string => `
+  CASE WHEN lower(rsid) IN (${featuredPlaceholders}) THEN 0 ELSE 1 END,
+  CASE
+    WHEN list_has_any(
+           list_transform(str_split(lower(clinical_significance), '/'), part -> trim(part)),
+           ['pathogenic', 'likely pathogenic']
+         ) THEN 0
+    WHEN list_contains(
+           list_transform(str_split(lower(clinical_significance), '/'), part -> trim(part)),
+           'drug response'
+         ) THEN 1
+    ELSE 2
+  END,
+  pos, chrom, ref, alt`;
 
 /** One resolved variant coordinate plus the clinical context that goes with it. */
 export interface VariantTarget {
@@ -84,27 +157,18 @@ export class TargetNotResolvableError extends Error {
 }
 
 /**
- * Raised when a target resolves to more coordinates than `MAX_TARGETS_PER_QUERY` allows.
+ * What one target resolved to: the coordinates that will be read, and how many exist.
  *
- * The limit exists so one gene cannot expand into an unbounded scan; silently truncating to the
- * limit would instead yield a quietly partial answer for a reference gene with more declared
- * variants than the cap. This is signalled instead.
+ * Both halves are returned together, from the one query that knows both, because the pair is what
+ * makes the cap speakable. `targets` alone cannot distinguish a gene with exactly
+ * `MAX_TARGETS_PER_QUERY` coordinates from BRCA2's 2,714 truncated to the same 64, and a caller
+ * that cannot tell them apart is the silent truncation this design set out to remove.
  */
-export class TargetResolutionLimitExceededError extends Error {
-  readonly targetId: string;
-  readonly referenceVersion: string;
-  readonly limit: number;
-
-  constructor(targetId: string, referenceVersion: string, limit: number) {
-    super(
-      `'${targetId}' resolves to more than ${limit} coordinates in reference snapshot ` +
-        `'${referenceVersion}'; refusing to answer with a silently truncated subset`,
-    );
-    this.name = 'TargetResolutionLimitExceeded';
-    this.targetId = targetId;
-    this.referenceVersion = referenceVersion;
-    this.limit = limit;
-  }
+export interface ResolvedTargets {
+  /** Ranked best first, at most `MAX_TARGETS_PER_QUERY` long, never empty. */
+  readonly targets: readonly VariantTarget[];
+  /** How many coordinates the snapshot lists for the target, cap or no cap. */
+  readonly coordinatesListed: number;
 }
 
 /**
@@ -130,7 +194,7 @@ export interface ClinVarCoordinateResolver {
   readonly referenceVersion: string;
   readonly referenceBuild: string;
   /** At least one coordinate, or a throw. Never an empty list. */
-  resolve(targetId: string, referenceBuild: string): Promise<readonly VariantTarget[]>;
+  resolve(targetId: string, referenceBuild: string): Promise<ResolvedTargets>;
   /** Every gene/rsID the snapshot can place, with the text the snapshot carries for it. */
   vocabulary(): Promise<readonly ReferenceVocabularyEntry[]>;
   close(): Promise<void>;
@@ -197,7 +261,7 @@ export async function openClinVarCoordinateResolver(
     referenceVersion: snapshot.referenceVersion,
     referenceBuild: snapshot.referenceBuild,
 
-    async resolve(targetId: string, referenceBuild: string): Promise<readonly VariantTarget[]> {
+    async resolve(targetId: string, referenceBuild: string): Promise<ResolvedTargets> {
       if (closed) {
         throw new ReferenceSnapshotError(options.databasePath, 'has already been closed');
       }
@@ -211,25 +275,36 @@ export async function openClinVarCoordinateResolver(
       }
 
       // Gene symbol *or* rsID, both case-insensitively, both as bound parameters — the target
-      // id is the one value on this path that came from outside.
+      // id is the one value on this path that came from outside. The featured rsIDs are bound
+      // too, from `$4` on: they are module constants and could be interpolated safely, but a
+      // query with one interpolation habit is a query somebody extends with a second one.
       //
-      // Fetches one row past the limit so overflow can be detected: capping the SQL `LIMIT` at
-      // exactly `MAX_TARGETS_PER_QUERY` would make "there were 64" and "there were 6,400"
-      // indistinguishable, and the latter would be answered as if it were the former.
+      // `COUNT(*) OVER ()` is what makes "the 64 read" distinguishable from "the 64 there are":
+      // the window is computed over every matching row, before `LIMIT` discards any, so it costs
+      // one pass over a local, read-only reference table and no second round trip that a
+      // concurrent writer could make disagree with the first.
+      const featuredPlaceholders = FEATURED_RSIDS.map((_unused, index) => `$${index + 4}`).join(
+        ', ',
+      );
       const rows = (
         await connection.runAndReadAll(
           `
-            SELECT chrom, pos, rsid, ref, alt, gene, phenotype, clinical_significance, evidence_note
+            SELECT chrom, pos, rsid, ref, alt, gene, phenotype, clinical_significance,
+                   evidence_note, COUNT(*) OVER () AS coordinates_listed
             FROM ${REFERENCE_COORDINATES_TABLE}
             WHERE reference_version = $1
               AND reference_build = $2
               AND (upper(gene) = upper($3) OR lower(rsid) = lower($3))
-            ORDER BY chrom, pos, ref, alt
-            LIMIT ${MAX_TARGETS_PER_QUERY + 1};
+            ORDER BY ${TARGET_RANKING_SQL(featuredPlaceholders)}
+            LIMIT ${MAX_TARGETS_PER_QUERY};
           `,
-          [snapshot.referenceVersion, snapshot.referenceBuild, trimmed],
+          [snapshot.referenceVersion, snapshot.referenceBuild, trimmed, ...FEATURED_RSIDS],
         )
       ).getRowObjects();
+
+      // Read off the first row and not off `rows.length`, which the `LIMIT` caps, and before the
+      // filtering below, which can drop the row it was read from.
+      const coordinatesListed = rows.length === 0 ? 0 : Number(rows[0]!.coordinates_listed);
 
       const targets: VariantTarget[] = [];
       const seen = new Set<string>();
@@ -261,33 +336,21 @@ export async function openClinVarCoordinateResolver(
         });
       }
 
-      // Counted after unplaceable rows are dropped and duplicates are collapsed: the raw row
-      // count fetched above is what the SQL `LIMIT` capped, not what the target actually
-      // resolves to, and those two only coincide when every fetched row survives filtering. A
-      // gene with `MAX_TARGETS_PER_QUERY + 1` raw rows of which one is unplaceable resolves to
-      // exactly `MAX_TARGETS_PER_QUERY` targets and must answer in full, not be rejected with a
-      // message asserting it resolves to more coordinates than it does.
-      if (targets.length > MAX_TARGETS_PER_QUERY) {
-        throw new TargetResolutionLimitExceededError(
-          targetId,
-          snapshot.referenceVersion,
-          MAX_TARGETS_PER_QUERY,
-        );
-      }
-
       if (targets.length === 0) {
         throw new TargetNotResolvableError(targetId, snapshot.referenceVersion);
       }
 
-      // Coordinate order, not the snapshot's storage order: '1' < '12' < '2' byte-wise, the
-      // same ordering the manifest inventory uses.
-      return targets.sort(
-        (left, right) =>
-          left.chrom.localeCompare(right.chrom, 'en') ||
-          left.pos - right.pos ||
-          left.ref.localeCompare(right.ref, 'en') ||
-          left.alt.localeCompare(right.alt, 'en'),
-      );
+      // Returned in the order the ranking produced, never re-sorted here. Re-sorting by
+      // coordinate is precisely the defect this replaces: it made the answer's headline whichever
+      // coordinate happened to sit lowest on the chromosome, so a warfarin question led with
+      // rs2359612 and buried rs9923231 fourth.
+      //
+      // `coordinatesListed` counts the snapshot's rows; `targets.length` counts what survived
+      // normalisation, so a fetched row this system cannot place spends its slot rather than
+      // being backfilled by a second query. The two numbers are reported side by side in the
+      // answer, so the gap is stated rather than hidden — which is the only property that matters
+      // here, and one an extra round trip per question would not improve.
+      return { targets, coordinatesListed };
     },
 
     async vocabulary(): Promise<readonly ReferenceVocabularyEntry[]> {
